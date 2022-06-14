@@ -1,0 +1,21 @@
+{
+    "name": "Grepolis JamBot",
+    "description": "A grepolis bot",
+    "version": "0.1.0",
+    "manifest_version": 3,
+    "permissions": ["storage", "activeTab", "contextMenus"],
+    "host_permissions": ["*://*.grepolis.com/*"],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": ["*://*.grepolis.com/*"],
+            "js": ["contentScript.js"]
+        }
+    ],
+    "action": {
+        "default_title": "Grepolis JamBot",
+        "default_popup": "popup.html"
+    }
+  }
