@@ -3,7 +3,7 @@
     "description": "A grepolis bot",
     "version": "0.1.0",
     "manifest_version": 3,
-    "permissions": ["storage", "activeTab", "contextMenus"],
+    "permissions": ["storage", "activeTab", "contextMenus", "tabs", "scripting"],
     "host_permissions": ["*://*.grepolis.com/*"],
     "background": {
         "service_worker": "background.js"
@@ -17,5 +17,11 @@
     "action": {
         "default_title": "Grepolis JamBot",
         "default_popup": "popup.html"
-    }
-  }
+    },
+    "web_accessible_resources": [
+        {
+          "resources": [ "data.json" ],
+          "matches": ["*://*.grepolis.com/*"]
+        }
+    ]
+}
