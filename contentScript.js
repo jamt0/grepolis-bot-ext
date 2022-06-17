@@ -1,5 +1,5 @@
 (async () => {
-  
+
   let data = await fetch(chrome.runtime.getURL('/data.json'));
   data = await data.json();
   
@@ -46,10 +46,10 @@
   }
 
   const recolectarRecursosAldea = async (ciudad, index) => {
-    const { codigoAldeaInicial, codigoCiudad, active } = ciudad;
+    const { codigoAldeaInicial, codigoCiudad, active, recursosLlenos } = ciudad;
     const { opcionRecoleccion } = data;
 
-    if (!active) {
+    if (!active || recursosLlenos) {
       return;
     }
 
@@ -72,7 +72,7 @@
 
     datos.append("json", JSON.stringify(json));
 
-    await fetch(
+    let response = await fetch(
       `https://es108.grepolis.com/game/frontend_bridge?town_id=${codigoCiudad}&action=execute&h=${data.h}`,
       {
         method: "POST",
@@ -84,6 +84,28 @@
         body: datos,
       }
     );
+
+    response =  await response.json();
+
+    if (!response.json["success"]) {
+      return;
+    }
+
+    //Parseo response
+    response = response.json.notifications.find(element => element.subject == "Town");
+
+    response = response.param_str.replaceAll(/\//g, "");
+    
+    response = JSON.parse(response);
+
+    response = response["Town"];
+
+    const {storage, last_wood, last_iron, last_stone} = response;
+
+    const indexCiudadActual = data.ciudadesConAldeas.findIndex(ciudadData => ciudadData.codigoCiudad == codigoCiudad);
+
+    data.ciudadesConAldeas[indexCiudadActual].recursosLlenos = storage == last_wood && storage == last_iron && storage == last_stone;
+
   };
 
   //TODO: Hacer que actualice la interfaz
