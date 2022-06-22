@@ -1,21 +1,45 @@
 (async () => {
+  //Importar save token
+  injectScript(chrome.runtime.getURL("/js/saveToken.js"), "body");
+  let hToken;
+  let worldId;
 
-  let data = await fetch(chrome.runtime.getURL('/data.json'));
+  //Importar json data
+  let data = await fetch(chrome.runtime.getURL("/data.json"));
   data = await data.json();
-  
-  //Insetar boton en la interfaz
-  const injectElement = document.createElement("button");
-  injectElement.innerHTML = "Recolectar aldeas";
-  injectElement.id = "botonIniciarRecoleccion";
-  injectElement.style.cssText +=
-    "position:absolute;bottom:80px;left:10px;z-index:1000";
-  document.body.appendChild(injectElement);
 
-  injectElement.addEventListener("click", recolectarRecursos);
+  //Esperando que se carge la variables de saveToken para insertar el boton
+  window.addEventListener(
+    "message",
+    (event) => {
+      if (event.source != window) {
+        return;
+      }
+
+      if (event.data.type && event.data.type == "FROM_PAGE") {
+        worldId = event.data.world_id;
+        hToken = event.data.h_token;
+        insertarBotonDeRecolectarRecursos();
+      }
+    },
+    false
+  );
+
+  function insertarBotonDeRecolectarRecursos(params) {
+    const botonRecolectarRecursos = document.createElement("button");
+    botonRecolectarRecursos.innerHTML = "Recolectar aldeas nuevo mundo";
+    botonRecolectarRecursos.id = "botonRecolectarRecursos";
+    botonRecolectarRecursos.style.cssText +=
+      "position:absolute;bottom:140px;left:10px;z-index:1000";
+    document.body.appendChild(botonRecolectarRecursos);
+    botonRecolectarRecursos.addEventListener("click", recolectarRecursos);
+
+  }
 
   async function recolectarRecursos() {
     const { ciudadesConAldeas, tiempoRecoleccion } = data;
-    document.getElementById("botonIniciarRecoleccion").innerHTML = "Recolectando aldeas...";
+    document.getElementById("botonRecolectarRecursos").innerHTML =
+      "Recolectando aldeas nuevo mundo...";
     // El tiempo que se pierde esperando entre recoleccion para evitar ban
     let tiempoGastado = ciudadesConAldeas.length * 6 * 60;
     await recolectarRecursosCiudades();
@@ -37,13 +61,6 @@
       await recolectarRecursosAldea(ciudad, index);
     }
   };
-
-  //TODO: LLevar a coolfunctions
-  function delaySeconds(seconds) {
-    return new Promise(function (resolve) {
-      setTimeout(resolve, seconds * 1000);
-    });
-  }
 
   const recolectarRecursosAldea = async (ciudad, index) => {
     const { codigoAldeaInicial, codigoCiudad, active, recursosLlenos } = ciudad;
@@ -73,7 +90,7 @@
     datos.append("json", JSON.stringify(json));
 
     let response = await fetch(
-      `https://es108.grepolis.com/game/frontend_bridge?town_id=${codigoCiudad}&action=execute&h=${data.h}`,
+      `https://${worldId}.grepolis.com/game/frontend_bridge?town_id=${codigoCiudad}&action=execute&h=${hToken}`,
       {
         method: "POST",
         headers: {
@@ -85,30 +102,48 @@
       }
     );
 
-    response =  await response.json();
+    response = await response.json();
 
     if (!response.json["success"]) {
       return;
     }
 
     //Parseo response
-    response = response.json.notifications.find(element => element.subject == "Town");
+    response = response.json.notifications.find(
+      (element) => element.subject == "Town"
+    );
 
     response = response.param_str.replaceAll(/\//g, "");
-    
+
     response = JSON.parse(response);
 
     response = response["Town"];
 
-    const {storage, last_wood, last_iron, last_stone} = response;
+    const { storage, last_wood, last_iron, last_stone } = response;
 
-    const indexCiudadActual = data.ciudadesConAldeas.findIndex(ciudadData => ciudadData.codigoCiudad == codigoCiudad);
+    const indexCiudadActual = data.ciudadesConAldeas.findIndex(
+      (ciudadData) => ciudadData.codigoCiudad == codigoCiudad
+    );
 
-    data.ciudadesConAldeas[indexCiudadActual].recursosLlenos = storage == last_wood && storage == last_iron && storage == last_stone;
-
+    data.ciudadesConAldeas[indexCiudadActual].recursosLlenos =
+      storage == last_wood && storage == last_iron && storage == last_stone;
   };
 
   //TODO: Hacer que actualice la interfaz
   //TODO: Obtner datos (codigo ciudad y aldeas) desde solicitudes o interfaz
-  //TODO: poner limite para las noches
 })();
+
+//Cool functions
+function injectScript(file, node) {
+  var th = document.getElementsByTagName(node)[0];
+  var s = document.createElement("script");
+  s.setAttribute("type", "text/javascript");
+  s.setAttribute("src", file);
+  th.appendChild(s);
+}
+
+function delaySeconds(seconds) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, seconds * 1000);
+  });
+}

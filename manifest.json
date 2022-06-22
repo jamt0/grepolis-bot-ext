@@ -1,5 +1,5 @@
 {
-    "name": "Grepolis JamBot",
+    "name": "Grepolis JamBot New World",
     "description": "A grepolis bot",
     "version": "0.1.0",
     "manifest_version": 3,
@@ -11,16 +11,17 @@
     "content_scripts": [
         {
             "matches": ["*://*.grepolis.com/*"],
-            "js": ["contentScript.js"]
+            "js": ["contentScript.js"],
+            "run_at": "document_end"
         }
     ],
     "action": {
-        "default_title": "Grepolis JamBot",
+        "default_title": "Grepolis JamBot New World",
         "default_popup": "popup.html"
     },
     "web_accessible_resources": [
         {
-          "resources": [ "data.json" ],
+          "resources": [ "data.json", "/js/saveToken.js" ],
           "matches": ["*://*.grepolis.com/*"]
         }
     ]
