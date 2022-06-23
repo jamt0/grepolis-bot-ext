@@ -37,10 +37,10 @@
 
   function insertarBotonDeRecolectarRecursos() {
     const botonRecolectarRecursos = document.createElement("button");
-    botonRecolectarRecursos.innerHTML = "Recolectar aldeas nuevo mundo";
+    botonRecolectarRecursos.innerHTML = "-Jam-";
     botonRecolectarRecursos.id = "botonRecolectarRecursos";
     botonRecolectarRecursos.style.cssText +=
-      "position:absolute;bottom:140px;left:10px;z-index:1000";
+      "position:absolute;bottom:80px;left:10px;z-index:1000";
     document.body.appendChild(botonRecolectarRecursos);
     botonRecolectarRecursos.addEventListener("click", recolectarRecursos);
   }
@@ -49,7 +49,7 @@
     //Cambiar texto boton recolectando
     const { ciudadesConAldeas, tiempoRecoleccion } = data;
     document.getElementById("botonRecolectarRecursos").innerHTML =
-      "Recolectando aldeas nuevo mundo...";
+      "...";
     // El tiempo que se pierde esperando entre recoleccion para evitar ban
     let tiempoGastado = ciudadesConAldeas.length * 6 * 60;
     await recolectarCiudades();
@@ -159,6 +159,7 @@
     //Obtener aldeas por ciudad
     for (const ciudadJugador of ciudadesJugador) {
       const ciudad = ciudadJugador.d;
+      await delaySeconds(0.2);
       let aldeasCiudad = await fetch(
         `https://${worldId}.grepolis.com/game/island_info?town_id=${ciudad.id}&action=index&h=${hToken}&json={"island_id":${ciudad.island_id},"fetch_tmpl":1,"town_id":${ciudad.id},"nl_init":true}`,
         {
