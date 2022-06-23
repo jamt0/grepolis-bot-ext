@@ -1,4 +1,6 @@
+//TODO: Hacer que actualice la interfaz
 (async () => {
+  console.log("Welcome JamBot");
   //Importar save token
   injectScript(chrome.runtime.getURL("/js/saveToken.js"), "body");
 
@@ -7,33 +9,20 @@
   data = await data.json();
 
   //Variables
-  let hToken;
-  let worldId;
-  let townIdInitial;
   let ciudadesConAldeas = [];
 
-  //Esperando que se carge la variables de Game
-  window.addEventListener(
-    "message",
-    async (event) => {
-      if (event.source != window) {
-        return;
-      }
+  const game = JSON.parse(window.localStorage.getItem("game"));
+  console.log({ game });
+  const { csrfToken, world_id, townId } = game;
 
-      if (event.data.type && event.data.type == "FROM_PAGE") {
-        worldId = event.data.world_id;
-        hToken = event.data.h_token;
-        townIdInitial = event.data.townId;
+  console.log({ world_id, csrfToken, townId });
+  console.log("Obteniendo informacion...");
+  await obtenerCiudadesConAldeas();
 
-        await obtenerCiudadesConAldeas();
+  console.log({ ciudadesConAldeas });
+  console.log("Carga exitosa");
 
-        console.log({ ciudadesConAldeas });
-
-        insertarBotonDeRecolectarRecursos();
-      }
-    },
-    false
-  );
+  insertarBotonDeRecolectarRecursos();
 
   function insertarBotonDeRecolectarRecursos() {
     const botonRecolectarRecursos = document.createElement("button");
@@ -48,12 +37,22 @@
   async function recolectarRecursos() {
     //Cambiar texto boton recolectando
     const { ciudadesConAldeas, tiempoRecoleccion } = data;
-    document.getElementById("botonRecolectarRecursos").innerHTML =
-      "...";
+    document.getElementById("botonRecolectarRecursos").innerHTML = "...";
     // El tiempo que se pierde esperando entre recoleccion para evitar ban
-    let tiempoGastado = ciudadesConAldeas.length * 6 * 60;
+    let tiempoGastado = ciudadesConAldeas.length * 6 * 1000;
+
     await recolectarCiudades();
-    setInterval(recolectarCiudades, tiempoRecoleccion - tiempoGastado);
+
+    //se suman diez segundos de margen de error y asegurar recoleccion
+    const tiempoEspera =
+      tiempoRecoleccion * 60 * 1000 - tiempoGastado + 10 * 1000;
+
+    console.log(`Tiempo Gastado por antiban ${tiempoGastado} en milisegundos`);
+    console.log(
+      `Tiempo de espera hasta proxima recoleccion ${tiempoEspera} en milisegundos`
+    );
+
+    setInterval(recolectarCiudades, tiempoEspera);
   }
 
   async function recolectarCiudades() {
@@ -67,7 +66,7 @@
   const recolectarCiudad = async (ciudad) => {
     const { aldeas } = ciudad;
 
-    for (const aldea of  aldeas) {
+    for (const aldea of aldeas) {
       await recolectarAldea(ciudad, aldea.id);
     }
   };
@@ -100,7 +99,7 @@
     datos.append("json", JSON.stringify(json));
 
     let response = await fetch(
-      `https://${worldId}.grepolis.com/game/frontend_bridge?town_id=${codigoCiudad}&action=execute&h=${hToken}`,
+      `https://${world_id}.grepolis.com/game/frontend_bridge?town_id=${codigoCiudad}&action=execute&h=${csrfToken}`,
       {
         method: "POST",
         headers: {
@@ -142,7 +141,7 @@
   async function obtenerCiudadesConAldeas() {
     //Obtiene lista de ciudades con su isla
     let ciudadesJugador = await fetch(
-      `https://${worldId}.grepolis.com/game/frontend_bridge?town_id=${townIdInitial}&action=refetch&h=${hToken}&json={"collections":{"Towns":[]},"town_id":${townIdInitial},"nl_init":false}`,
+      `https://${world_id}.grepolis.com/game/frontend_bridge?town_id=${townId}&action=refetch&h=${csrfToken}&json={"collections":{"Towns":[]},"town_id":${townId},"nl_init":false}`,
       {
         method: "GET",
         headers: {
@@ -154,14 +153,17 @@
 
     ciudadesJugador = await ciudadesJugador.json();
 
+    console.log({ciudadesJugador});
     ciudadesJugador = ciudadesJugador.json.collections.Towns.data;
+
+    console.log({ciudadesJugador});
 
     //Obtener aldeas por ciudad
     for (const ciudadJugador of ciudadesJugador) {
       const ciudad = ciudadJugador.d;
       await delaySeconds(0.2);
       let aldeasCiudad = await fetch(
-        `https://${worldId}.grepolis.com/game/island_info?town_id=${ciudad.id}&action=index&h=${hToken}&json={"island_id":${ciudad.island_id},"fetch_tmpl":1,"town_id":${ciudad.id},"nl_init":true}`,
+        `https://${world_id}.grepolis.com/game/island_info?town_id=${ciudad.id}&action=index&h=${csrfToken}&json={"island_id":${ciudad.island_id},"fetch_tmpl":1,"town_id":${ciudad.id},"nl_init":true}`,
         {
           method: "GET",
           headers: {
@@ -179,11 +181,8 @@
       });
 
       data.ciudadesConAldeas = ciudadesConAldeas;
-      
     }
   }
-
-  //TODO: Hacer que actualice la interfaz
 })();
 
 //Cool functions
