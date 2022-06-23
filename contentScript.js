@@ -12,7 +12,6 @@
   let ciudadesConAldeas = [];
 
   const game = JSON.parse(window.localStorage.getItem("game"));
-  console.log({ game });
   const { csrfToken, world_id, townId } = game;
 
   console.log({ world_id, csrfToken, townId });
@@ -153,10 +152,7 @@
 
     ciudadesJugador = await ciudadesJugador.json();
 
-    console.log({ciudadesJugador});
     ciudadesJugador = ciudadesJugador.json.collections.Towns.data;
-
-    console.log({ciudadesJugador});
 
     //Obtener aldeas por ciudad
     for (const ciudadJugador of ciudadesJugador) {
