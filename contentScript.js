@@ -44,7 +44,7 @@
 
     //se suman diez segundos de margen de error y asegurar recoleccion
     const tiempoEspera =
-      tiempoRecoleccion * 60 * 1000 - tiempoGastado + 10 * 1000;
+      tiempoRecoleccion * 60 * 1000 - tiempoGastado + 20 * 1000;
 
     console.log(`Tiempo Gastado por antiban ${tiempoGastado} en milisegundos`);
     console.log(
@@ -56,6 +56,10 @@
 
   async function recolectarCiudades() {
     const { ciudadesConAldeas } = data;
+
+    let horaActual = new Date();
+
+    console.log(`Recolectando aldeas - Time: ${horaActual.getHours()}:${horaActual.getMinutes()}:${horaActual.getSeconds()}`)
 
     for (const ciudad of ciudadesConAldeas) {
       await recolectarCiudad(ciudad);
