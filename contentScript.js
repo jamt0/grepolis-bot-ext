@@ -17,8 +17,9 @@
   console.log({ world_id, csrfToken, townId, player_id });
   console.log("Obteniendo informacion...");
   await obtenerCiudadesConAldeas();
+  data.relacionPorAldea = await obtenerMapaRelaciones();
 
-  console.log({ ciudadesConAldeas });
+  console.log({ ciudadesConAldeas, relacionPorAldea: data.relacionPorAldea });
   console.log("Carga exitosa");
 
   insertarBotonDeRecolectarRecursos();
@@ -71,14 +72,14 @@
 
     for (const aldea of aldeas) {
       try {
-        await recolectarAldea(ciudad, aldea.id);
+        await recolectarAldea(ciudad, aldea);
       } catch (e) {
-        console.error("Falló aldea", aldea.id, e);
+        console.error("Falló aldea", aldea && aldea.id, e);
       }
     }
   };
 
-  const recolectarAldea = async (ciudad, aldeaId) => {
+  const recolectarAldea = async (ciudad, aldea) => {
     const { recursosLlenos, codigoCiudad } = ciudad;
     const { opcionRecoleccion } = data;
 
@@ -86,14 +87,22 @@
       return;
     }
 
+    const farmTownId = aldea.id;
+    const relationId = data.relacionPorAldea && data.relacionPorAldea[farmTownId];
+    if (relationId == null) {
+      console.warn("Sin relation_id para farm_town_id", farmTownId, "— saltada");
+      return;
+    }
+
     //Espera entre recoleccion, para evitar ban
     await delaySeconds(1);
 
     const json = {
-      model_url: `FarmTownPlayerRelation/${player_id}`,
+      model_url: `FarmTownPlayerRelation/${relationId}`,
       action_name: "claim",
+      captcha: null,
       arguments: {
-        farm_town_id: aldeaId,
+        farm_town_id: farmTownId,
         type: "resources",
         option: opcionRecoleccion,
       },
@@ -130,13 +139,11 @@
     );
 
     if (!townNotification) {
-      console.warn("Sin notificación 'Town' para aldea", aldeaId, response.json.notifications);
+      console.warn("Sin notificación 'Town' para aldea", farmTownId, response.json.notifications);
       return;
     }
 
-    response = townNotification.param_str.replaceAll(/\//g, "");
-
-    response = JSON.parse(response);
+    response = JSON.parse(townNotification.param_str);
 
     response = response["Town"];
 
@@ -149,6 +156,36 @@
     data.ciudadesConAldeas[indexCiudadActual].recursosLlenos =
       storage == last_wood && storage == last_iron && storage == last_stone;
   };
+
+  async function obtenerMapaRelaciones() {
+    const json = `{"collections":{"FarmTownPlayerRelations":[]},"town_id":${townId},"nl_init":false}`;
+    const url = `https://${world_id}.grepolis.com/game/frontend_bridge?town_id=${townId}&action=refetch&h=${csrfToken}&json=${encodeURIComponent(json)}`;
+
+    let res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        accept: "text/plain, */*; q=0.01",
+      },
+    });
+    res = await res.json();
+
+    const items =
+      (res.json &&
+        res.json.collections &&
+        res.json.collections.FarmTownPlayerRelations &&
+        res.json.collections.FarmTownPlayerRelations.data) ||
+      [];
+
+    const mapa = {};
+    for (const item of items) {
+      const rel = item.d || item;
+      if (rel && rel.farm_town_id != null && rel.id != null) {
+        mapa[rel.farm_town_id] = rel.id;
+      }
+    }
+    return mapa;
+  }
 
   async function obtenerCiudadesConAldeas() {
     //Obtiene lista de ciudades con su isla
