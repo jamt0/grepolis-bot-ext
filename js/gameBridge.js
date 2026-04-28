@@ -54,4 +54,38 @@
     const notifications = e && e.detail && e.detail.notifications;
     dispatchNotifications(notifications);
   });
+
+  /**
+   * Vigila Game.bot_check. En estado normal vale null; cuando Grepolis exige
+   * un challenge anti-bot pasa a un objeto con la info del CAPTCHA. Cualquier
+   * cambio se notifica al content script vía postMessage para que pause el
+   * scheduler y avise al usuario.
+   */
+  let lastBotCheck = null;
+  function leerBotCheck() {
+    return window.Game ? window.Game.bot_check : undefined;
+  }
+  lastBotCheck = leerBotCheck() || null;
+
+  setInterval(function () {
+    const actual = leerBotCheck();
+    const ahoraActivo = actual != null;
+    const antesActivo = lastBotCheck != null;
+    if (ahoraActivo !== antesActivo) {
+      lastBotCheck = actual || null;
+      window.postMessage(
+        {
+          type: "JamBot:captchaState",
+          active: ahoraActivo,
+        },
+        "*"
+      );
+      console.log(
+        "[JamBot bridge] cambio bot_check:",
+        antesActivo ? "ACTIVO" : "limpio",
+        "→",
+        ahoraActivo ? "ACTIVO" : "limpio"
+      );
+    }
+  }, 2000);
 })();

@@ -24,6 +24,18 @@
   console.log({ ciudadesConAldeas, relacionPorAldea: data.relacionPorAldea });
   console.log("Carga exitosa");
 
+  //Estado del bot — afectado por el CAPTCHA
+  let captchaActive = false;
+
+  //Escuchar señales del bridge (vigilancia de Game.bot_check)
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    const msg = e.data;
+    if (!msg || msg.type !== "JamBot:captchaState") return;
+    if (msg.active) onCaptchaDetectado();
+    else onCaptchaResuelto();
+  });
+
   insertarBotonDeRecolectarRecursos();
 
   function insertarBotonDeRecolectarRecursos() {
@@ -31,40 +43,149 @@
     botonRecolectarRecursos.innerHTML = "-Jam-";
     botonRecolectarRecursos.id = "botonRecolectarRecursos";
     botonRecolectarRecursos.style.cssText +=
-      "position:absolute;bottom:80px;left:10px;z-index:1000";
+      "position:absolute;bottom:80px;left:10px;z-index:1000;padding:6px 10px;font-weight:bold";
     document.body.appendChild(botonRecolectarRecursos);
     botonRecolectarRecursos.addEventListener("click", recolectarRecursos);
   }
 
+  function pintarEstadoBoton(estado, msEspera) {
+    const boton = document.getElementById("botonRecolectarRecursos");
+    if (!boton) return;
+    switch (estado) {
+      case "recolectando":
+        boton.innerHTML = "...";
+        boton.style.background = "#f5d36b";
+        boton.style.color = "#000";
+        break;
+      case "esperando": {
+        const min = msEspera ? Math.round(msEspera / 60000) : null;
+        boton.innerHTML = min ? `-Jam- (${min}m)` : "-Jam-";
+        boton.style.background = "";
+        boton.style.color = "";
+        break;
+      }
+      case "captcha":
+        boton.innerHTML = "⚠ CAPTCHA";
+        boton.style.background = "#c0392b";
+        boton.style.color = "#fff";
+        break;
+      default:
+        boton.innerHTML = "-Jam-";
+        boton.style.background = "";
+        boton.style.color = "";
+    }
+  }
+
+  let tituloOriginal = null;
+  let tituloFlashId = null;
+
+  function onCaptchaDetectado() {
+    if (captchaActive) return; //ya estaba activo, ignorar duplicados
+    captchaActive = true;
+    console.warn("[JamBot] CAPTCHA detectado — pausando bot");
+    pintarEstadoBoton("captcha");
+    iniciarFlashTitulo();
+    sonarAlerta();
+    chrome.runtime.sendMessage({ type: "JamBot:badge", text: "!", color: "#c0392b" });
+  }
+
+  function onCaptchaResuelto() {
+    if (!captchaActive) return;
+    captchaActive = false;
+    console.log("[JamBot] CAPTCHA resuelto — reanudando bot");
+    pararFlashTitulo();
+    pintarEstadoBoton("esperando");
+    chrome.runtime.sendMessage({ type: "JamBot:badge", text: "" });
+  }
+
+  function iniciarFlashTitulo() {
+    if (tituloFlashId) return;
+    if (tituloOriginal == null) tituloOriginal = document.title;
+    let mostrandoAlerta = false;
+    tituloFlashId = setInterval(() => {
+      mostrandoAlerta = !mostrandoAlerta;
+      document.title = mostrandoAlerta ? "⚠ CAPTCHA — JamBot" : tituloOriginal;
+    }, 1000);
+  }
+
+  function pararFlashTitulo() {
+    if (!tituloFlashId) return;
+    clearInterval(tituloFlashId);
+    tituloFlashId = null;
+    if (tituloOriginal != null) document.title = tituloOriginal;
+  }
+
+  function sonarAlerta() {
+    try {
+      const ctx = new AudioContext();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.type = "sine";
+      o.frequency.value = 880;
+      g.gain.value = 0.1;
+      o.start();
+      setTimeout(() => {
+        o.stop();
+        ctx.close();
+      }, 400);
+    } catch (e) {
+      //sonido es nice-to-have, no bloqueamos por esto
+    }
+  }
+
+  let proximoTickId = null;
+
   async function recolectarRecursos() {
-    //Cambiar texto boton recolectando
-    const { ciudadesConAldeas, tiempoRecoleccion } = data;
-    document.getElementById("botonRecolectarRecursos").innerHTML = "...";
-    // El tiempo que se pierde esperando entre recoleccion para evitar ban
-    let tiempoGastado = ciudadesConAldeas.length * 6 * 1000;
+    const { tiempoRecoleccion } = data;
+    pintarEstadoBoton("recolectando");
 
     await recolectarCiudades();
 
-    //se suman diez segundos de margen de error y asegurar recoleccion
-    const tiempoEspera =
-      tiempoRecoleccion * 60 * 1000 - tiempoGastado + 20 * 1000;
+    //tiempoRecoleccion en minutos + 20s de margen para asegurar el cooldown
+    const tiempoEspera = tiempoRecoleccion * 60 * 1000 + 20 * 1000;
 
-    console.log(`Tiempo Gastado por antiban ${tiempoGastado} en milisegundos`);
     console.log(
       `Tiempo de espera hasta proxima recoleccion ${tiempoEspera} en milisegundos`
     );
 
-    setInterval(recolectarCiudades, tiempoEspera);
+    pintarEstadoBoton(captchaActive ? "captcha" : "esperando", tiempoEspera);
+    programarSiguienteTick(tiempoEspera);
+  }
+
+  function programarSiguienteTick(ms) {
+    if (proximoTickId) clearTimeout(proximoTickId);
+    proximoTickId = setTimeout(async () => {
+      proximoTickId = null;
+      if (captchaActive) {
+        // Reposponer en bucle corto hasta que se resuelva el CAPTCHA.
+        console.warn("[JamBot] CAPTCHA activo, salto este ciclo y reintento en 30s");
+        programarSiguienteTick(30 * 1000);
+        return;
+      }
+      await recolectarRecursos();
+    }, ms);
   }
 
   async function recolectarCiudades() {
     const { ciudadesConAldeas } = data;
 
-    let horaActual = new Date();
+    if (captchaActive) {
+      console.warn("[JamBot] CAPTCHA activo — no se recolecta este ciclo");
+      return;
+    }
 
-    console.log(`Recolectando aldeas - Time: ${horaActual.getHours()}:${horaActual.getMinutes()}:${horaActual.getSeconds()}`)
+    let horaActual = new Date();
+    console.log(
+      `Recolectando aldeas - Time: ${horaActual.getHours()}:${horaActual.getMinutes()}:${horaActual.getSeconds()}`
+    );
 
     for (const ciudad of ciudadesConAldeas) {
+      if (captchaActive) {
+        console.warn("[JamBot] CAPTCHA detectado en mitad del ciclo, abortando");
+        return;
+      }
       await recolectarCiudad(ciudad);
     }
   }
