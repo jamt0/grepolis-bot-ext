@@ -6,6 +6,7 @@ window.postMessage(
     csrfToken: Game.csrfToken,
     world_id: Game.world_id,
     townId: Game.townId,
+    player_id: Game.player_id,
   },
   "*"
 );
@@ -16,6 +17,7 @@ window.localStorage.setItem(
     csrfToken: Game.csrfToken,
     world_id: Game.world_id,
     townId: Game.townId,
+    player_id: Game.player_id,
   })
 );
 

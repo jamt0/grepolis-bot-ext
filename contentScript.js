@@ -12,9 +12,9 @@
   let ciudadesConAldeas = [];
 
   const game = JSON.parse(window.localStorage.getItem("game"));
-  const { csrfToken, world_id, townId } = game;
+  const { csrfToken, world_id, townId, player_id } = game;
 
-  console.log({ world_id, csrfToken, townId });
+  console.log({ world_id, csrfToken, townId, player_id });
   console.log("Obteniendo informacion...");
   await obtenerCiudadesConAldeas();
 
@@ -70,7 +70,11 @@
     const { aldeas } = ciudad;
 
     for (const aldea of aldeas) {
-      await recolectarAldea(ciudad, aldea.id);
+      try {
+        await recolectarAldea(ciudad, aldea.id);
+      } catch (e) {
+        console.error("Falló aldea", aldea.id, e);
+      }
     }
   };
 
@@ -86,7 +90,7 @@
     await delaySeconds(1);
 
     const json = {
-      model_url: "FarmTownPlayerRelation/52287",
+      model_url: `FarmTownPlayerRelation/${player_id}`,
       action_name: "claim",
       arguments: {
         farm_town_id: aldeaId,
@@ -121,11 +125,16 @@
     }
 
     //Parseo response
-    response = response.json.notifications.find(
+    const townNotification = response.json.notifications.find(
       (element) => element.subject == "Town"
     );
 
-    response = response.param_str.replaceAll(/\//g, "");
+    if (!townNotification) {
+      console.warn("Sin notificación 'Town' para aldea", aldeaId, response.json.notifications);
+      return;
+    }
+
+    response = townNotification.param_str.replaceAll(/\//g, "");
 
     response = JSON.parse(response);
 
