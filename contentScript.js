@@ -27,6 +27,9 @@
   //Estado del bot — afectado por el CAPTCHA
   let captchaActive = false;
 
+  //Snapshot de recursos por ciudad para calcular cuánto se ganó en cada claim
+  const recursosPrevPorCiudad = {};
+
   //Escuchar señales del bridge (vigilancia de Game.bot_check)
   window.addEventListener("message", (e) => {
     if (e.source !== window) return;
@@ -275,7 +278,25 @@
     }
 
     const town = JSON.parse(townNotification.param_str)["Town"];
-    const { storage, last_wood, last_iron, last_stone } = town;
+    const { storage, last_wood, last_iron, last_stone, resources } = town;
+
+    //Log: cuánto se ganó (diff con snapshot anterior) y total resultante
+    const nombreCiudad = ciudad.nombreCiudad || codigoCiudad;
+    const nombreAldea = aldea.name || `farm_${farmTownId}`;
+    const prev = recursosPrevPorCiudad[codigoCiudad];
+    if (prev && resources) {
+      const dW = resources.wood - prev.wood;
+      const dS = resources.stone - prev.stone;
+      const dI = resources.iron - prev.iron;
+      console.log(
+        `[JamBot] ${nombreCiudad} ← ${nombreAldea} (id ${farmTownId}): +${dW} madera, +${dS} piedra, +${dI} plata · total ${resources.wood}/${resources.stone}/${resources.iron}`
+      );
+    } else if (resources) {
+      console.log(
+        `[JamBot] ${nombreCiudad} ← ${nombreAldea} (id ${farmTownId}): recolectada · total ${resources.wood}/${resources.stone}/${resources.iron}`
+      );
+    }
+    if (resources) recursosPrevPorCiudad[codigoCiudad] = { ...resources };
 
     const indexCiudadActual = data.ciudadesConAldeas.findIndex(
       (ciudadData) => ciudadData.codigoCiudad == codigoCiudad
@@ -351,6 +372,7 @@
 
       ciudadesConAldeas.push({
         codigoCiudad: ciudad.id,
+        nombreCiudad: ciudad.name,
         aldeas: aldeasCiudad,
       });
 
