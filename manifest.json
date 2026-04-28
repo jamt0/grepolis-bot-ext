@@ -21,7 +21,7 @@
     },
     "web_accessible_resources": [
         {
-          "resources": [ "data.json", "/js/saveToken.js" ],
+          "resources": [ "data.json", "/js/saveToken.js", "/js/gameBridge.js" ],
           "matches": ["*://*.grepolis.com/*"]
         }
     ]

@@ -3,6 +3,8 @@
   console.log("Welcome JamBot");
   //Importar save token
   injectScript(chrome.runtime.getURL("/js/saveToken.js"), "body");
+  //Bridge para refrescar la UI tras claims (dispatch de notifications a Backbone)
+  injectScript(chrome.runtime.getURL("/js/gameBridge.js"), "body");
 
   //Importar json data
   let data = await fetch(chrome.runtime.getURL("/data.json"));
@@ -133,7 +135,15 @@
       return;
     }
 
-    //Parseo response
+    //Despachar notifications al bridge para que actualice los modelos
+    //Backbone (Town, FarmTownPlayerRelation) y la UI se refresque sola.
+    window.dispatchEvent(
+      new CustomEvent("JamBot:dispatchNotifications", {
+        detail: { notifications: response.json.notifications },
+      })
+    );
+
+    //Parseo response (para detectar almacén lleno y cachear el flag)
     const townNotification = response.json.notifications.find(
       (element) => element.subject == "Town"
     );
@@ -143,11 +153,8 @@
       return;
     }
 
-    response = JSON.parse(townNotification.param_str);
-
-    response = response["Town"];
-
-    const { storage, last_wood, last_iron, last_stone } = response;
+    const town = JSON.parse(townNotification.param_str)["Town"];
+    const { storage, last_wood, last_iron, last_stone } = town;
 
     const indexCiudadActual = data.ciudadesConAldeas.findIndex(
       (ciudadData) => ciudadData.codigoCiudad == codigoCiudad
