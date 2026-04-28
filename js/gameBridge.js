@@ -56,6 +56,29 @@
   });
 
   /**
+   * Permite al content script preguntar los recursos actuales de un Town
+   * cargado en MM. Útil para refrescar el baseline del diff al inicio de
+   * cada ciclo y evitar que el primer claim arrastre 5 minutos de
+   * producción + acciones del jugador.
+   */
+  window.addEventListener("JamBot:queryTownResources", function (e) {
+    const townId = e && e.detail && e.detail.townId;
+    let resources = null;
+    if (window.MM && typeof window.MM.getModels === "function") {
+      const towns = window.MM.getModels().Town;
+      const town = towns && (towns[townId] || towns[String(townId)]);
+      const r = town && town.attributes && town.attributes.resources;
+      if (r) {
+        resources = { wood: r.wood, stone: r.stone, iron: r.iron };
+      }
+    }
+    window.postMessage(
+      { type: "JamBot:townResources", townId, resources },
+      "*"
+    );
+  });
+
+  /**
    * Vigila Game.bot_check. En estado normal vale null; cuando Grepolis exige
    * un challenge anti-bot pasa a un objeto con la info del CAPTCHA. Cualquier
    * cambio se notifica al content script vía postMessage para que pause el

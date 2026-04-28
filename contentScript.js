@@ -30,6 +30,32 @@
   //Snapshot de recursos por ciudad para calcular cuánto se ganó en cada claim
   const recursosPrevPorCiudad = {};
 
+  /**
+   * Pregunta al bridge los recursos actuales del Town cargado en MM. Devuelve
+   * { wood, stone, iron } o null si el Town no está cargado o no respondió.
+   */
+  function queryTownResources(townId) {
+    return new Promise((resolve) => {
+      const handler = (e) => {
+        if (e.source !== window) return;
+        const msg = e.data;
+        if (!msg || msg.type !== "JamBot:townResources") return;
+        if (msg.townId != townId) return;
+        window.removeEventListener("message", handler);
+        clearTimeout(timeoutId);
+        resolve(msg.resources || null);
+      };
+      window.addEventListener("message", handler);
+      const timeoutId = setTimeout(() => {
+        window.removeEventListener("message", handler);
+        resolve(null);
+      }, 1000);
+      window.dispatchEvent(
+        new CustomEvent("JamBot:queryTownResources", { detail: { townId } })
+      );
+    });
+  }
+
   //Escuchar señales del bridge (vigilancia de Game.bot_check)
   window.addEventListener("message", (e) => {
     if (e.source !== window) return;
@@ -180,6 +206,14 @@
     //Reset por ciclo: si en un ciclo previo se cacheó "recursos llenos",
     //volvemos a intentar — quizá el jugador construyó cosas y bajaron.
     for (const c of ciudadesConAldeas) c.recursosLlenos = false;
+
+    //Refresca el baseline del diff con el estado actual del Town en MM.
+    //Sin esto, el primer claim del ciclo arrastra los 5 minutos transcurridos
+    //(producción + acciones del jugador) y el diff sale absurdo.
+    for (const c of ciudadesConAldeas) {
+      const fresco = await queryTownResources(c.codigoCiudad);
+      if (fresco) recursosPrevPorCiudad[c.codigoCiudad] = fresco;
+    }
 
     //Acumulador por ciudad para el resumen al final del ciclo.
     const acumuladoCiclo = {};
