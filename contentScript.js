@@ -142,15 +142,19 @@
 
   async function recolectarRecursos() {
     const { tiempoRecoleccion } = data;
-    pintarEstadoBoton("recolectando");
+    pintarEstadoBoton(captchaActive ? "captcha" : "recolectando");
 
     await recolectarCiudades();
 
-    //tiempoRecoleccion en minutos + 20s de margen para asegurar el cooldown
-    const tiempoEspera = tiempoRecoleccion * 60 * 1000 + 20 * 1000;
+    //Si el ciclo terminó con captcha activo, probamos en 30s para detectar
+    //la resolución rápido en cuanto el jugador resuelva el modal. Si no,
+    //ciclo normal: tiempoRecoleccion + 20s de margen.
+    const tiempoEspera = captchaActive
+      ? 30 * 1000
+      : tiempoRecoleccion * 60 * 1000 + 20 * 1000;
 
     console.log(
-      `Tiempo de espera hasta proxima recoleccion ${tiempoEspera} en milisegundos`
+      `Tiempo de espera hasta proxima recoleccion ${tiempoEspera} en milisegundos${captchaActive ? " (modo CAPTCHA)" : ""}`
     );
 
     pintarEstadoBoton(captchaActive ? "captcha" : "esperando", tiempoEspera);
@@ -161,23 +165,12 @@
     if (proximoTickId) clearTimeout(proximoTickId);
     proximoTickId = setTimeout(async () => {
       proximoTickId = null;
-      if (captchaActive) {
-        // Reposponer en bucle corto hasta que se resuelva el CAPTCHA.
-        console.warn("[JamBot] CAPTCHA activo, salto este ciclo y reintento en 30s");
-        programarSiguienteTick(30 * 1000);
-        return;
-      }
       await recolectarRecursos();
     }, ms);
   }
 
   async function recolectarCiudades() {
     const { ciudadesConAldeas } = data;
-
-    if (captchaActive) {
-      console.warn("[JamBot] CAPTCHA activo — no se recolecta este ciclo");
-      return;
-    }
 
     let horaActual = new Date();
     console.log(
@@ -191,16 +184,20 @@
     //Acumulador por ciudad para el resumen al final del ciclo.
     const acumuladoCiclo = {};
 
+    //Importante: NO hacer early-skip aquí aunque captchaActive sea true.
+    //Necesitamos hacer al menos un claim de "probe" para detectar si el
+    //CAPTCHA ya se resolvió. La detección post-claim cortará el ciclo si
+    //sigue activo.
     for (const ciudad of ciudadesConAldeas) {
-      if (captchaActive) {
-        console.warn("[JamBot] CAPTCHA detectado en mitad del ciclo, abortando");
-        break;
-      }
       acumuladoCiclo[ciudad.codigoCiudad] = { wood: 0, stone: 0, iron: 0, claims: 0 };
       await recolectarCiudad(ciudad, acumuladoCiclo[ciudad.codigoCiudad]);
+      if (captchaActive) {
+        console.warn("[JamBot] CAPTCHA activo — abortando ciclo");
+        break;
+      }
     }
 
-    //Resumen por ciudad
+    //Resumen por ciudad (solo las que tuvieron al menos un claim contado)
     for (const ciudad of ciudadesConAldeas) {
       const acc = acumuladoCiclo[ciudad.codigoCiudad];
       if (!acc || acc.claims === 0) continue;
@@ -220,6 +217,7 @@
       } catch (e) {
         console.error("Falló aldea", aldea && aldea.id, e);
       }
+      if (captchaActive) break; //tras el primer claim que detecte captcha, paramos
     }
   };
 
@@ -291,9 +289,17 @@
     );
 
     if (!townNotification) {
-      console.warn("Sin notificación 'Town' para aldea", farmTownId, response.json.notifications);
+      console.warn(
+        "[JamBot] Sin notificación 'Town' para aldea", farmTownId,
+        "— probable CAPTCHA activo. Notifications:", response.json.notifications
+      );
+      onCaptchaDetectado();
       return;
     }
+
+    //Town presente → claim aplicado → si veníamos marcados como CAPTCHA, ya
+    //está resuelto.
+    if (captchaActive) onCaptchaResuelto();
 
     const town = JSON.parse(townNotification.param_str)["Town"];
     const { storage, last_wood, last_iron, last_stone, resources } = town;
