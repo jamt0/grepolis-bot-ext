@@ -184,28 +184,46 @@
       `Recolectando aldeas - Time: ${horaActual.getHours()}:${horaActual.getMinutes()}:${horaActual.getSeconds()}`
     );
 
+    //Reset por ciclo: si en un ciclo previo se cacheó "recursos llenos",
+    //volvemos a intentar — quizá el jugador construyó cosas y bajaron.
+    for (const c of ciudadesConAldeas) c.recursosLlenos = false;
+
+    //Acumulador por ciudad para el resumen al final del ciclo.
+    const acumuladoCiclo = {};
+
     for (const ciudad of ciudadesConAldeas) {
       if (captchaActive) {
         console.warn("[JamBot] CAPTCHA detectado en mitad del ciclo, abortando");
-        return;
+        break;
       }
-      await recolectarCiudad(ciudad);
+      acumuladoCiclo[ciudad.codigoCiudad] = { wood: 0, stone: 0, iron: 0, claims: 0 };
+      await recolectarCiudad(ciudad, acumuladoCiclo[ciudad.codigoCiudad]);
+    }
+
+    //Resumen por ciudad
+    for (const ciudad of ciudadesConAldeas) {
+      const acc = acumuladoCiclo[ciudad.codigoCiudad];
+      if (!acc || acc.claims === 0) continue;
+      const nombre = ciudad.nombreCiudad || ciudad.codigoCiudad;
+      console.log(
+        `[JamBot] === ${nombre} (tanda): ${acc.claims} aldeas → +${acc.wood} madera, +${acc.stone} piedra, +${acc.iron} plata ===`
+      );
     }
   }
 
-  const recolectarCiudad = async (ciudad) => {
+  const recolectarCiudad = async (ciudad, acumulador) => {
     const { aldeas } = ciudad;
 
     for (const aldea of aldeas) {
       try {
-        await recolectarAldea(ciudad, aldea);
+        await recolectarAldea(ciudad, aldea, acumulador);
       } catch (e) {
         console.error("Falló aldea", aldea && aldea.id, e);
       }
     }
   };
 
-  const recolectarAldea = async (ciudad, aldea) => {
+  const recolectarAldea = async (ciudad, aldea, acumulador) => {
     const { recursosLlenos, codigoCiudad } = ciudad;
     const { opcionRecoleccion } = data;
 
@@ -291,10 +309,17 @@
       console.log(
         `[JamBot] ${nombreCiudad} ← ${nombreAldea} (id ${farmTownId}): +${dW} madera, +${dS} piedra, +${dI} plata · total ${resources.wood}/${resources.stone}/${resources.iron}`
       );
+      if (acumulador) {
+        acumulador.wood += dW;
+        acumulador.stone += dS;
+        acumulador.iron += dI;
+        acumulador.claims += 1;
+      }
     } else if (resources) {
       console.log(
         `[JamBot] ${nombreCiudad} ← ${nombreAldea} (id ${farmTownId}): recolectada · total ${resources.wood}/${resources.stone}/${resources.iron}`
       );
+      if (acumulador) acumulador.claims += 1;
     }
     if (resources) recursosPrevPorCiudad[codigoCiudad] = { ...resources };
 
