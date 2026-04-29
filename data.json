@@ -1,4 +1,6 @@
 {
   "opcionRecoleccion": 1,
-  "tiempoRecoleccion": 10
+  "tiempoRecoleccion": 5,
+  "finalizarGratis": true,
+  "tiempoRestanteMaxSegundos": 290
 }
