@@ -25,6 +25,17 @@
     return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
   }
 
+  //Formatea una duración en segundos como "Xs" si es <60, o "Xm YYs" si es ≥60.
+  //Acepta number (segundos). Pensado para logs y UI: cuando los ciclos crecen
+  //a varios minutos, "613s" se vuelve ilegible vs "10m 13s".
+  function formatDuracion(segundos) {
+    const s = Math.max(0, Math.round(segundos));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}m ${String(r).padStart(2, "0")}s`;
+  }
+
   //—— Estado de CAPTCHA ——————————————————————————————————————————————————
 
   let captchaActive = false;
@@ -202,7 +213,9 @@
     const game = JSON.parse(window.localStorage.getItem("game") || "{}");
     const { csrfToken, world_id, townId, player_id } = game;
     if (!csrfToken || !world_id || !townId) {
-      console.warn("[JamBot/core] localStorage.game incompleto — abortando init");
+      //Esperado en subdominios que no sean la app del juego (foro, wiki,
+      //landings de marketing): saveToken solo persiste en localStorage si
+      //existe `window.Game`. Salimos en silencio para no spamear consola.
       return null;
     }
     console.log({ world_id, csrfToken, townId, player_id });
@@ -226,6 +239,7 @@
         onCaptchaResuelto,
         registrarBoton,
         delaySeconds,
+        formatDuracion,
         isPaused,
         onPlayPauseChange,
         setPaused,
@@ -242,6 +256,7 @@
     onCaptchaResuelto,
     registrarBoton,
     delaySeconds,
+    formatDuracion,
     isPaused,
     onPlayPauseChange,
     setPaused,

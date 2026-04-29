@@ -21,9 +21,12 @@
 
     const ciudadesConAldeas = [];
     const recursosPrevPorCiudad = {};
-    //Última vez que cada ciudad completó al menos un claim. Se usa como gate
-    //de cooldown 5/10min antes de volver a procesarla en un tick.
-    const lastClaimAtPorCiudad = {};
+    //Última vez que cada ALDEA individual fue claimada con éxito. Clave =
+    //farm_town_id (aldea.id). El cooldown server es por aldea, no por
+    //ciudad: si un ciclo se corta a mitad por CAPTCHA, las aldeas que
+    //quedaron sin claimar se retoman en el próximo ciclo (no esperan a que
+    //la ciudad entera vuelva a estar disponible).
+    const lastClaimAtPorAldea = {};
     let proximoTickId = null;
     //Timestamp del próximo tick programado — el panel lo usa para mostrar
     //un countdown. null cuando no hay tick programado (pausado o en curso).
@@ -202,6 +205,13 @@
     function renderPanelConfig(panel) {
       panel.innerHTML = "";
 
+      //Título de la extensión
+      const tituloExt = document.createElement("div");
+      tituloExt.textContent = "JamBot";
+      tituloExt.style.cssText =
+        "font-weight:bold;font-size:14px;text-align:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #555;letter-spacing:0.5px";
+      panel.appendChild(tituloExt);
+
       //Header con estado del bot y countdown del próximo ciclo
       const header = document.createElement("div");
       header.id = "panelHeaderEstado";
@@ -292,10 +302,7 @@
 
       let proximoTexto = "—";
       if (proximoTickAt) {
-        const restanteSeg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
-        const min = Math.floor(restanteSeg / 60);
-        const seg = restanteSeg % 60;
-        proximoTexto = `${min}m ${String(seg).padStart(2, "0")}s`;
+        proximoTexto = core.formatDuracion((proximoTickAt - Date.now()) / 1000);
       }
 
       header.innerHTML =
@@ -443,7 +450,7 @@
         : Math.max(30 * 1000, baseMs - duracionCiclo + jitter(3 * 1000, 30 * 1000));
 
       console.log(
-        `[JamBot/recoleccion] ciclo duró ${Math.round(duracionCiclo / 1000)}s, siguiente en ${Math.round(tiempoEspera / 1000)}s${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`
+        `[JamBot/recoleccion] ciclo duró ${core.formatDuracion(duracionCiclo / 1000)}, siguiente en ${core.formatDuracion(tiempoEspera / 1000)}${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`
       );
 
       //Warning si el ciclo se está acercando al cooldown — a partir del 70%
@@ -453,7 +460,7 @@
       if (duracionCiclo > baseMs * 0.7) {
         const pct = Math.round((duracionCiclo / baseMs) * 100);
         console.warn(
-          `[JamBot/recoleccion] ⚠ ciclo (${Math.round(duracionCiclo / 1000)}s) ocupa el ${pct}% del cooldown (${Math.round(baseMs / 1000)}s). Riesgo de rechazo del server — subí ciudades a 10min.`
+          `[JamBot/recoleccion] ⚠ ciclo (${core.formatDuracion(duracionCiclo / 1000)}) ocupa el ${pct}% del cooldown (${core.formatDuracion(baseMs / 1000)}). Riesgo de rechazo del server — subí ciudades a 10min.`
         );
       }
 
@@ -489,29 +496,24 @@
       //sigue activo.
       //Shuffle del orden de ciudades en cada ciclo — un humano no farmea
       //siempre A→B→C→D, varía el orden naturalmente.
-      const ahora = Date.now();
+      //
+      //El cooldown gating se hace por ALDEA dentro de recolectarCiudad.
+      //Antes era por ciudad y eso perdía aldeas cuando el CAPTCHA cortaba
+      //un ciclo a mitad: la ciudad quedaba marcada como "ya procesada"
+      //aunque le faltaran aldeas. Ahora cada aldea respeta su propio
+      //cooldown server, así que las pendientes se retoman en el próximo
+      //ciclo sin esperar 10min.
+      const cicloState = { probeCaptchaUsado: false };
       for (const ciudad of shuffle(ciudadesConAldeas)) {
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
-        const last = lastClaimAtPorCiudad[ciudad.codigoCiudad] || 0;
-        const transcurrido = ahora - last;
-        //Margen de 30s para no saltar una ciudad "casi vencida" por jitter
-        //del setTimeout. No mandamos request si aún está en cooldown — el
-        //server lo rechazaría sin notification 'Town' y dispararía falso
-        //positivo de CAPTCHA.
-        const cooldownMs = cfg.minutos * 60 * 1000 - 30 * 1000;
-        if (last > 0 && transcurrido < cooldownMs) {
-          const restante = Math.round((cooldownMs - transcurrido) / 1000);
-          console.log(
-            `[JamBot/recoleccion] ${ciudad.nombreCiudad || ciudad.codigoCiudad}: en cooldown (${cfg.minutos}min) — ${restante}s restantes, saltando`
-          );
-          continue;
-        }
-
         acumuladoCiclo[ciudad.codigoCiudad] = { wood: 0, stone: 0, iron: 0, claims: 0 };
-        await recolectarCiudad(ciudad, acumuladoCiclo[ciudad.codigoCiudad], cfg.opcion);
-        if (acumuladoCiclo[ciudad.codigoCiudad].claims > 0) {
-          lastClaimAtPorCiudad[ciudad.codigoCiudad] = Date.now();
-        }
+        await recolectarCiudad(
+          ciudad,
+          acumuladoCiclo[ciudad.codigoCiudad],
+          cfg.opcion,
+          cfg.minutos,
+          cicloState
+        );
         if (core.isCaptchaActive()) {
           console.warn("[JamBot/recoleccion] CAPTCHA activo — abortando ciclo");
           break;
@@ -529,30 +531,75 @@
       }
     }
 
-    async function recolectarCiudad(ciudad, acumulador, opcion) {
+    async function recolectarCiudad(ciudad, acumulador, opcion, minutos, cicloState) {
       const { aldeas } = ciudad;
-      //Shuffle del orden de aldeas dentro de la ciudad — mismo argumento
-      //que ciudades: rompe el patrón "siempre claim 1, después 2, después 3…".
+      //Margen de 30s sobre el cooldown server real (5 o 10min). Cubre el
+      //jitter del setTimeout para no saltar una aldea "casi vencida".
+      const cooldownMs = minutos * 60 * 1000 - 30 * 1000;
+
+      let saltadasPorCooldown = 0;
+      let restanteMinSeg = Infinity;
+
+      //Shuffle del orden de aldeas — mismo argumento que ciudades: rompe el
+      //patrón "siempre claim 1, después 2, después 3…".
       for (const aldea of shuffle(aldeas)) {
+        const last = lastClaimAtPorAldea[aldea.id] || 0;
+        const transcurrido = Date.now() - last;
+        if (last > 0 && transcurrido < cooldownMs) {
+          //Cuando estamos en modo CAPTCHA y todas las aldeas están en
+          //cooldown, sin probe el bot quedaría atascado: nunca claim →
+          //nunca detecta resolución. Forzamos UN probe por ciclo (a nivel
+          //global, compartido entre ciudades vía cicloState). Si el probe
+          //sale OK (Town presente), recolectarAldea llama a
+          //onCaptchaResuelto y el ciclo continúa normal.
+          if (core.isCaptchaActive() && !cicloState.probeCaptchaUsado) {
+            cicloState.probeCaptchaUsado = true;
+            console.log(
+              `[JamBot/recoleccion] aldea ${aldea.id} (${ciudad.nombreCiudad || ciudad.codigoCiudad}): probe de CAPTCHA (cooldown ignorado)`
+            );
+            //cae al procesamiento normal abajo
+          } else {
+            saltadasPorCooldown += 1;
+            const restante = Math.round((cooldownMs - transcurrido) / 1000);
+            if (restante < restanteMinSeg) restanteMinSeg = restante;
+            continue;
+          }
+        }
+
         try {
-          await recolectarAldea(ciudad, aldea, acumulador, opcion);
+          const ok = await recolectarAldea(ciudad, aldea, acumulador, opcion);
+          if (ok) lastClaimAtPorAldea[aldea.id] = Date.now();
         } catch (e) {
           console.error("[JamBot/recoleccion] falló aldea", aldea && aldea.id, e);
         }
         if (core.isCaptchaActive()) break;
       }
+
+      //Log agregado: si hubo aldeas saltadas por cooldown, reportar a nivel
+      //de ciudad (en vez de loguear cada aldea individualmente).
+      if (saltadasPorCooldown > 0) {
+        console.log(
+          `[JamBot/recoleccion] ${ciudad.nombreCiudad || ciudad.codigoCiudad}: ${saltadasPorCooldown}/${aldeas.length} aldeas en cooldown (${minutos}min) — próxima en ${core.formatDuracion(restanteMinSeg)}`
+        );
+      }
     }
 
+    /**
+     * Reclama una aldea. Retorna true si el server confirmó el claim
+     * (response trae notification 'Town'), false en cualquier otro caso
+     * (almacén lleno, sin relation_id, success:false, sin Town/CAPTCHA).
+     * El caller usa el boolean para actualizar lastClaimAtPorAldea.
+     */
     async function recolectarAldea(ciudad, aldea, acumulador, opcion) {
       const { recursosLlenos, codigoCiudad } = ciudad;
 
-      if (recursosLlenos) return;
+      if (recursosLlenos) return false;
 
       const farmTownId = aldea.id;
       const relationId = data.relacionPorAldea && data.relacionPorAldea[farmTownId];
       if (relationId == null) {
         console.warn("[JamBot/recoleccion] sin relation_id para farm_town_id", farmTownId, "— saltada");
-        return;
+        return false;
       }
 
       //Jitter 1.0-1.5s entre claims. Variabilidad mínima necesaria para
@@ -590,7 +637,7 @@
       );
       response = await response.json();
 
-      if (!response.json["success"]) return;
+      if (!response.json["success"]) return false;
 
       window.dispatchEvent(
         new CustomEvent("JamBot:dispatchNotifications", {
@@ -608,7 +655,7 @@
           "— probable CAPTCHA. Notifications:", response.json.notifications
         );
         core.onCaptchaDetectado();
-        return;
+        return false;
       }
 
       if (core.isCaptchaActive()) core.onCaptchaResuelto();
@@ -645,6 +692,7 @@
         ciudadesConAldeas[idx].recursosLlenos =
           storage == last_wood && storage == last_iron && storage == last_stone;
       }
+      return true;
     }
 
     //—— Loaders ————————————————————————————————————————————————————————

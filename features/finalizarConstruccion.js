@@ -159,7 +159,7 @@
         const msEspera = core.isCaptchaActive() ? 30 * 1000 : segundosHastaProximo * 1000;
 
         console.log(
-          `[JamBot/finalizar] ciclo OK: ${colas.length} órdenes en cola, ${finalizadas}/${aFinalizar.length} finalizadas. Próximo tick en ${Math.round(msEspera / 1000)}s${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`
+          `[JamBot/finalizar] ciclo OK: ${colas.length} órdenes en cola, ${finalizadas}/${aFinalizar.length} finalizadas. Próximo tick en ${core.formatDuracion(msEspera / 1000)}${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`
         );
         //Respetar pausa/deshabilitación que pudo ocurrir durante el ciclo.
         if (habilitada && !core.isPaused()) {

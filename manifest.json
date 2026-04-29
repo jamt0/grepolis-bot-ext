@@ -11,6 +11,16 @@
     "content_scripts": [
         {
             "matches": ["*://*.grepolis.com/*"],
+            "exclude_matches": [
+                "*://*.forum.grepolis.com/*",
+                "*://wiki.en.grepolis.com/*",
+                "*://wiki.es.grepolis.com/*",
+                "*://wiki.de.grepolis.com/*",
+                "*://wiki.fr.grepolis.com/*",
+                "*://wiki.it.grepolis.com/*",
+                "*://wiki.pl.grepolis.com/*",
+                "*://wiki.pt.grepolis.com/*"
+            ],
             "js": [
                 "core.js",
                 "features/recoleccion.js",

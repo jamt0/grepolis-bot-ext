@@ -16,12 +16,15 @@
     return;
   }
 
-  console.log("[JamBot/bootstrap] iniciando…");
   const ctx = await JamBot.core.init();
   if (!ctx) {
-    console.warn("[JamBot/bootstrap] core.init() devolvió null — abortando");
+    //core.init() devuelve null en dominios que no son la app del juego
+    //(localStorage.game ausente o incompleto). Salimos en silencio: si
+    //fuera realmente un problema, el usuario va a notar que no aparecen
+    //los botones del bot.
     return;
   }
+  console.log("[JamBot/bootstrap] iniciando…");
 
   for (const [nombre, feature] of Object.entries(JamBot.features)) {
     if (!feature || typeof feature.init !== "function") continue;
