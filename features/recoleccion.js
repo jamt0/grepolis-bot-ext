@@ -35,29 +35,34 @@
     const STORAGE_KEY_LAST_CLAIM = `jambotLastClaimAt_${world_id}`;
     let lastClaimAtPorAldea = {};
 
-    //—— Historial por aldea + último ciclo ——————————————————————————————
+    //—— Historial por aldea + ciclos completos ——————————————————————————
     //
-    //HISTORIAL_MAX = 36 últimos intentos por aldea (FIFO, los obsoletos se
-    //descartan automáticamente en registrarClaim). 36 = ~6 horas a un ciclo
-    //cada 10min: alcanza para revisar la noche/mañana anterior. Para 50
-    //ciudades: 50 × 6 × 36 × ~250 B ≈ 2.7 MB, ≈ 27% de la cuota
+    //HISTORIAL_MAX = 36 últimos intentos por aldea (FIFO). 36 = ~6 horas a
+    //un ciclo cada 10min — alcanza para revisar la noche/mañana anterior.
+    //Para 50 ciudades: 50 × 6 × 36 × ~250 B ≈ 2.7 MB, ≈ 27% de la cuota
     //chrome.storage.local (10 MB) — holgado.
+    //
+    //CICLOS_MAX = 36 ciclos completos persistidos (mismo horizonte que el
+    //historial por aldea). Cada uno guarda el resumen por ciudad — el
+    //panel los muestra en una lista colapsable, el más reciente expandido.
     //
     //Estructuras:
     //  historialPorAldea[aldeaId] = [{ts, ciudadId, ciudadNombre,
     //                                 aldeaNombre, ciclo, status,
     //                                 dW, dS, dI, intentos, errorMsg}]
-    //  ultimoCiclo  = { n, inicio, fin, duracion, captchaDurante,
-    //                   ciudades: { [id]: { nombre, claims, esperado,
-    //                                       wood, stone, iron,
-    //                                       aldeasFalladas: [...] } } }
-    //  cicloActual  = igual a ultimoCiclo pero `fin/duracion` null mientras
-    //                 el ciclo está corriendo. Se promueve a ultimoCiclo al
-    //                 terminar.
+    //  ciclos[]     = [{ n, inicio, fin, duracion, captchaDurante,
+    //                    ciudades: { [id]: { nombre, claims, esperado,
+    //                                        wood, stone, iron,
+    //                                        aldeasFalladas: [...] } } }]
+    //                 (el último elemento es el ciclo más reciente)
+    //  cicloActual  = mismo shape que un ciclo, pero `fin/duracion` null
+    //                 mientras el ciclo está corriendo. Se promueve a
+    //                 ciclos[] cuando termina.
     const HISTORIAL_MAX = 36;
+    const CICLOS_MAX = 36;
     const STORAGE_KEY_HISTORIAL = `jambotHistorial_${world_id}`;
     let historialPorAldea = {};
-    let ultimoCiclo = null;
+    let ciclos = [];
     let cicloActual = null;
     let proximoTickId = null;
     //Timestamp del próximo tick programado — el panel lo usa para mostrar
@@ -92,10 +97,10 @@
     //sin esperar al primer ciclo nuevo.
     const histData = await cargarHistorial();
     historialPorAldea = histData.porAldea;
-    ultimoCiclo = histData.ultimoCiclo;
+    ciclos = histData.ciclos;
     core.log(
       "recoleccion",
-      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · configCiudades=${Object.keys(configPorCiudad).length} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas`,
+      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · configCiudades=${Object.keys(configPorCiudad).length} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas · ciclos persistidos=${ciclos.length}`,
       "ok"
     );
 
@@ -151,9 +156,16 @@
       return new Promise((resolve) => {
         chrome.storage.local.get(STORAGE_KEY_HISTORIAL, (obj) => {
           const blob = (obj && obj[STORAGE_KEY_HISTORIAL]) || {};
+          //Retrocompatibilidad: las versiones previas guardaban solo el
+          //último ciclo en `ultimoCiclo`. Si encontramos ese formato lo
+          //promovemos a un array de un elemento. Las próximas escrituras
+          //ya van a usar el formato nuevo `ciclos`.
+          const ciclos = Array.isArray(blob.ciclos)
+            ? blob.ciclos
+            : (blob.ultimoCiclo ? [blob.ultimoCiclo] : []);
           resolve({
             porAldea: blob.porAldea || {},
-            ultimoCiclo: blob.ultimoCiclo || null,
+            ciclos: ciclos,
           });
         });
       });
@@ -164,7 +176,7 @@
         chrome.storage.local.set({
           [STORAGE_KEY_HISTORIAL]: {
             porAldea: historialPorAldea,
-            ultimoCiclo: ultimoCiclo,
+            ciclos: ciclos,
           },
         });
       } catch (e) {
@@ -194,7 +206,7 @@
 
     function limpiarHistorial() {
       historialPorAldea = {};
-      ultimoCiclo = null;
+      ciclos = [];
       cicloActual = null;
       try {
         chrome.storage.local.remove(STORAGE_KEY_HISTORIAL);
@@ -218,7 +230,7 @@
       const blob = {
         world_id,
         exportadoEn: new Date().toISOString(),
-        ultimoCiclo,
+        ciclos,
         porAldea: historialPorAldea,
       };
       const json = JSON.stringify(blob, null, 2);
@@ -405,15 +417,17 @@
         //Centrado horizontal con left:50% + translate negativo. left:80px
         //antes pegaba el panel al borde izquierdo donde están los botones,
         //pero a 70vw quedaba feo. Ahora queda centrado sobre el mapa.
+        //bottom:160px deja un margen visible entre el panel y la cola de
+        //construcción (antes 110px quedaba pegado).
         //z-index:9999 — el PANEL va por encima de los modales del juego
         //(antes quedaba tapado por ventanas como el reporte de batalla).
         //Los BOTONES siguen en z-index:5 para no recibir clicks accidentales
         //de modales que se cierran encima de ellos (ver core.js).
-        "position:absolute;bottom:110px;left:50%;transform:translateX(-50%);z-index:9999;" +
+        "position:absolute;bottom:160px;left:50%;transform:translateX(-50%);z-index:9999;" +
         "background:#1f2a36;color:#e6e9ee;padding:0;border:1px solid #2c3a4d;" +
         "border-radius:6px;display:none;" +
         "width:70vw;min-width:460px;max-width:900px;" +
-        "height:70vh;max-height:calc(100vh - 140px);" +
+        "height:70vh;max-height:calc(100vh - 190px);" +
         "overflow:hidden;" +  /* el scroll va en el body, no en el contenedor */
         "font-family:'Segoe UI',sans-serif;font-size:12px;line-height:1.45;" +
         "box-shadow:0 4px 16px rgba(0,0,0,0.5);" +
@@ -526,10 +540,15 @@
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
       panel.appendChild(tabs);
 
-      //Body del tab activo
+      //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
+      //que el body absorba el espacio restante del panel (después de
+      //titulo+header+tabs) y muestre scroll vertical cuando el contenido
+      //excede. Sin min-height:0 el flex item nunca achica abajo del
+      //contenido y el scroll no aparece.
       const body = document.createElement("div");
       body.className = "pcj-body";
-      body.style.cssText = "padding:10px 12px";
+      body.style.cssText =
+        "padding:10px 12px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden";
       panel.appendChild(body);
       renderTabActivo(body);
     }
@@ -729,7 +748,8 @@
         ));
       }
 
-      //Sección 2: último ciclo terminado
+      //Sección 2: último ciclo terminado (último elemento de ciclos[])
+      const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       if (ultimoCiclo) {
         const total = (ultimoCiclo.totalAldeas != null) ? ultimoCiclo.totalAldeas
           : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
@@ -741,6 +761,19 @@
           (v) => uiColapso.ciclos.ultimo = v,
           () => renderResumenCiclo(ultimoCiclo, false),
           completo ? "#27ae60" : "#e74c3c"
+        ));
+      }
+
+      //Sección 3: ciclos anteriores (todos menos el último). Cada uno es
+      //una tarjeta colapsable con el mismo formato que "Último ciclo".
+      const anteriores = ciclos.slice(0, -1).reverse(); //más reciente primero
+      if (anteriores.length) {
+        body.appendChild(seccionColapsable(
+          `📜  Ciclos anteriores  (${anteriores.length})`,
+          uiColapso.ciclosAnteriores === true,
+          (v) => uiColapso.ciclosAnteriores = v,
+          () => renderListaCiclosAnteriores(anteriores),
+          "#8a96a6"
         ));
       }
 
@@ -988,6 +1021,29 @@
       return cont;
     }
 
+    function renderListaCiclosAnteriores(anteriores) {
+      const wrap = document.createElement("div");
+      //Estado de colapso por ciclo. Los anteriores arrancan TODOS cerrados
+      //por default — el usuario expande los que le interesan.
+      uiColapso.cicloPorN = uiColapso.cicloPorN || {};
+      for (const c of anteriores) {
+        const total = (c.totalAldeas != null) ? c.totalAldeas
+          : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
+        const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
+        const completo = claims === total;
+        const headerTxt =
+          `${completo ? "✓" : "✗"}  Ciclo #${c.n}  ·  ${claims}/${total} aldeas  ·  ${formatHoraCorta(c.fin)} (${core.formatDuracion((c.duracion || 0) / 1000)})`;
+        wrap.appendChild(seccionColapsable(
+          headerTxt,
+          uiColapso.cicloPorN[c.n] === true,
+          (v) => uiColapso.cicloPorN[c.n] = v,
+          () => renderResumenCiclo(c, false),
+          completo ? "#27ae60" : "#e74c3c"
+        ));
+      }
+      return wrap;
+    }
+
     function renderResumenCiclo(ciclo, enCurso) {
       const wrap = document.createElement("div");
       const ciudadesArr = Object.entries(ciclo.ciudades || {})
@@ -1023,6 +1079,7 @@
 
     function renderListaCiudadesHistorial() {
       const wrap = document.createElement("div");
+      const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       const ciudadesOrden = ciudadesConAldeas.slice().sort((a, b) =>
         (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
       );
@@ -1292,12 +1349,13 @@
       const stats = await recolectarCiudades();
       const duracionCiclo = Date.now() - inicioCiclo;
 
-      //Promover cicloActual → ultimoCiclo y persistir.
+      //Promover cicloActual → ciclos[] (FIFO, cap CICLOS_MAX) y persistir.
       if (cicloActual) {
         cicloActual.fin = Date.now();
         cicloActual.duracion = duracionCiclo;
         cicloActual.captchaDurante = core.isCaptchaActive();
-        ultimoCiclo = cicloActual;
+        ciclos.push(cicloActual);
+        while (ciclos.length > CICLOS_MAX) ciclos.shift();
         cicloActual = null;
         guardarHistorial();
         actualizarIndicadorVivo();
