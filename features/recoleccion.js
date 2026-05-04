@@ -405,7 +405,11 @@
         //Centrado horizontal con left:50% + translate negativo. left:80px
         //antes pegaba el panel al borde izquierdo donde están los botones,
         //pero a 70vw quedaba feo. Ahora queda centrado sobre el mapa.
-        "position:absolute;bottom:110px;left:50%;transform:translateX(-50%);z-index:5;" +
+        //z-index:9999 — el PANEL va por encima de los modales del juego
+        //(antes quedaba tapado por ventanas como el reporte de batalla).
+        //Los BOTONES siguen en z-index:5 para no recibir clicks accidentales
+        //de modales que se cierran encima de ellos (ver core.js).
+        "position:absolute;bottom:110px;left:50%;transform:translateX(-50%);z-index:9999;" +
         "background:#1f2a36;color:#e6e9ee;padding:0;border:1px solid #2c3a4d;" +
         "border-radius:6px;display:none;" +
         "width:70vw;min-width:460px;max-width:900px;" +
