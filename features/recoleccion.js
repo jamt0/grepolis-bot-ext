@@ -1588,13 +1588,35 @@
         const total = (ultimoCiclo.totalAldeas != null) ? ultimoCiclo.totalAldeas
           : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
         const claims = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
-        const completo = claims === total;
+        const sCool = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.saltadasCooldown || 0), 0);
+        //Mismo criterio que renderListaCiclosAnteriores: cubierto cuando
+        //claims + cooldown legítimo ≥ esperado (que ya excluye no-pertenece,
+        //cupo diario y ciudad llena). Sin esto, un ciclo donde todas las
+        //aldeas están en cooldown se pintaba ✗ rojo a pesar de no ser fallo.
+        const cubierto = (claims + sCool) >= total;
         //Ciclos interrumpidos (recuperados del storage tras un corte) se
         //marcan amarillos: no son un fail real, pero tampoco un ciclo
         //completo — el corte sucedió por causas externas (reload, F5).
         const interrumpido = ultimoCiclo.interrumpido === true;
-        const icono = interrumpido ? "⚠" : (completo ? "✓" : "✗");
-        const color = interrumpido ? "#f39c12" : (completo ? "#27ae60" : "#e74c3c");
+        const tieneAdvertencia = Object.values(ultimoCiclo.ciudades || {})
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+
+        let icono, color;
+        if (interrumpido) {
+          icono = "⚠"; color = "#f39c12";
+        } else if (cubierto) {
+          if (tieneAdvertencia) {
+            icono = "⚠"; color = "#f39c12";
+          } else if (claims === 0) {
+            //Todo el ciclo cubierto solo por cooldown — no es fallo, es
+            //estado del juego. Gris ⏱ para distinguirlo del ✓ verde.
+            icono = "⏱"; color = "#8a96a6";
+          } else {
+            icono = "✓"; color = "#27ae60";
+          }
+        } else {
+          icono = "✗"; color = "#e74c3c";
+        }
         const tituloSufijo = interrumpido ? " (interrumpido)" : "";
         body.appendChild(seccionColapsable(
           headerCiclo({
