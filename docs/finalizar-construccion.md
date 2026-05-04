@@ -144,7 +144,7 @@ Cuando se detecta CAPTCHA durante un ciclo:
 |---|---|
 | [features/finalizarConstruccion.js](../features/finalizarConstruccion.js) | Feature completa (sin botón propio: se controla por el play/pause global de core + el toggle del panel ⚙). |
 | [core.js](../core.js) | API global `isPaused / onPlayPauseChange / setPaused / togglePlayPause` que ambas features consumen. |
-| [features/recoleccion.js](../features/recoleccion.js) | Panel ⚙ hospeda el toggle `Finalizar construcción gratis` (lo persiste en `chrome.storage.local.jambotConfig.finalizarHabilitado`). `guardarConfigPorCiudad` hace merge para no pisar la clave del toggle. |
+| [features/recoleccion.js](../features/recoleccion.js) | Panel ⚙ hospeda el toggle `Finalizar construcción gratis` (lo persiste en `chrome.storage.local.jambotConfig.finalizarHabilitado`). El handler hace merge contra el blob existente para no pisar otras keys. |
 | [data.json](../data.json) | Flags de config (defaults). |
 | [manifest.json](../manifest.json) | Carga del nuevo JS. |
 | [contentScript.js](../contentScript.js) | Bootstrap genérico (itera `JamBot.features`). |

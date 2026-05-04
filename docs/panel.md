@@ -95,25 +95,24 @@ Pensado como tab de "abrí el panel solo para mirar": no necesitás bajar a Reco
 
 ### Settings
 - Toggle "Finalizar construcción gratis" (lee/escribe `chrome.storage.local.jambotConfig.finalizarHabilitado`; la feature `finalizarConstruccion` escucha `chrome.storage.onChanged` y reacciona automáticamente).
-- Lista de ciudades con select 5/10 min. Al cambiar, persiste en `jambotConfig.porCiudad[codigoCiudad]`.
+- Lista de ciudades con badge auto-detectado del cooldown (5 o 10 min). Es **read-only**: el bot infiere el cooldown de `lootable_at - last_looted_at` del modelo `FarmTownPlayerRelation` que ya viene del server al boot. Tres estados: `Lealtad investigada` (verde, 10 min), `sin Lealtad` (azul, 5 min), `sin datos aún` (gris, 5 min asumido — ciudad recién fundada que se auto-corrige al primer claim).
 - Sección "Mantenimiento":
   - **Limpiar historial** → confirma → vacía `historialPorAldea` + `ciclos` y borra `jambotHistorial_${world_id}` del storage.
   - **Exportar JSON** → genera un `Blob` con `{world_id, exportadoEn, ciclos, porAldea}` y dispara descarga `jambot-historial-{world_id}-{YYYY-MM-DD}.json`.
   - **Reset cooldown server** → confirma → vacía `lastClaimAtPorAldea` y borra `jambotLastClaimAt_${world_id}`. Útil solo para debugging — el bot vuelve a sincronizar solo en el próximo ciclo via `aldea.loot`.
 
 ### Recolección
-Hasta seis secciones (la primera solo aparece bajo CAPTCHA):
+Hasta cinco secciones (la primera solo aparece bajo CAPTCHA):
 
 1. **Cartel CAPTCHA** (solo cuando `core.isCaptchaActive()`). Pinned arriba del tab. Pinta de:
    - **Rojo** en estado `pending`: muestra ciclo + ciudad/aldea que falló, lista de pendientes en cola, countdown del timeout (10 min) y botón **"Ya resolví"**.
    - **Verde** cuando el bridge ya detectó que `Game.bot_check` se limpió en el juego (flag `resueltoEnJuego`): el botón se resalta y cambia el copy.
    - **Gris** en estado `timeout`: pasaron 10 min sin click, cartel informa que el bot está detenido y que apretar Iniciar arranca un ciclo limpio.
    El botón "Ya resolví" llama `resolverCaptchaPorUsuario()`: refresca `island_info` de cada ciudad, reconcilia `lastClaimAtPorAldea` con los `loot` del server (detecta claims que hizo el humano), llama `core.onCaptchaResuelto()` y programa un tick inmediato.
-2. **Ciclo en curso** (solo si hay uno corriendo). Naranja. Header con icono `↻`, título `Ciclo #N en curso` y badge de ratio `A/B aldeas`. Resumen por ciudad con progreso parcial.
-3. **Último ciclo**. Verde si fue completo (todas las ciudades a 6/6), rojo si quedó incompleto. Header con icono ✓/✗, título, badge de ratio y hora+duración a la derecha (todos los headers de ciclo usan `headerCiclo()` para layout consistente).
+2. **Ciclo en curso** (solo si hay uno corriendo). Naranja. Header con icono `↻`, título `Ciclo #N en curso` y badge de ratio `A/B aldeas`. Cada ciudad expande su detalle de aldeas — el status mostrado por aldea está filtrado al ciclo en curso (las pendientes muestran `· —` gris, no heredan el `✓ OK` del ciclo anterior).
+3. **Último ciclo**. Verde si fue completo (todas las ciudades a 6/6), rojo si quedó incompleto. Header con icono ✓/✗, título, badge de ratio y hora+duración a la derecha (todos los headers de ciclo usan `headerCiclo()` para layout consistente). Cada ciudad expande sus aldeas con el status de ese ciclo; cada aldea expande su historial completo (36 últimas recolecciones — timestamp, recursos, status, número de ciclo).
 4. **Ciclos anteriores** (colapsable, cerrado por default). Lista los ciclos persistidos excepto el último. Cada uno es una tarjeta colapsable con el mismo formato.
-5. **Aldeas e historial**. Lista de ciudades. Cada ciudad expande sus 6 aldeas. Cada aldea expande su historial de 36 últimas recolecciones — timestamp, recursos, status, número de ciclo. Las ciudades con tanda incompleta en el último ciclo se abren expandidas por default.
-6. **Errores y warnings recientes** (colapsable, cerrado por default). Lee del buffer global filtrado a las últimas 15 entradas. Botón "Limpiar buffer" llama `core.clearErrores()`.
+5. **Errores y warnings recientes** (colapsable, cerrado por default). Lee del buffer global filtrado a las últimas 15 entradas. Botón "Limpiar buffer" llama `core.clearErrores()`.
 
 ### Construcción
 Cinco secciones:

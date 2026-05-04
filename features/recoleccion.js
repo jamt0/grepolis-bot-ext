@@ -83,11 +83,49 @@
 
     core.log("recoleccion", "obteniendo info...");
     await obtenerCiudadesConAldeas();
-    data.relacionPorAldea = await obtenerMapaRelaciones();
-    //Config por ciudad persistida en chrome.storage.local. Cada entrada:
-    //{ minutos: 5|10, opcion: 1|2 }. Sin override → se usa el default de
-    //data.json (opcionRecoleccion / tiempoRecoleccion).
-    const configPorCiudad = await cargarConfigPorCiudad();
+    const relInfo = await obtenerMapaRelaciones();
+    data.relacionPorAldea = relInfo.relacionPorAldea;
+    //Auto-detección del cooldown por ciudad (5 o 10 min). Lo derivamos
+    //del propio modelo del server (FarmTownPlayerRelation.lootable_at -
+    //last_looted_at) — ver detectarMinutosCiudad. Se rebuilda en
+    //`recalcularCooldownsAuto()` cuando hay datos nuevos (después del
+    //primer claim de una ciudad nueva, o post-CAPTCHA sync).
+    let cooldownSegPorAldea = relInfo.cooldownSegPorAldea;
+    const cooldownPorCiudad = {};
+    function recalcularCooldownsAuto() {
+      for (const ciudad of ciudadesConAldeas) {
+        cooldownPorCiudad[ciudad.codigoCiudad] = detectarMinutosCiudad(ciudad);
+      }
+    }
+    recalcularCooldownsAuto();
+
+    /**
+     * Re-pide la colección de relaciones al server y recalcula la
+     * auto-detección. Se llama al final de un ciclo si quedó alguna ciudad
+     * en `fallback` (sin claim histórico) — normalmente porque es una ciudad
+     * recién fundada y el bot acaba de hacer el primer claim. Una vez que
+     * todas resuelven con `fuente: "auto"` deja de llamarse.
+     *
+     * Costo: 1 GET adicional al servidor por ciclo, solo mientras haya
+     * ciudades en fallback. Es transparente para el ciclo (corre después
+     * de que ya se programó el siguiente tick).
+     */
+    async function refrescarCooldownsAuto() {
+      try {
+        const fresco = await obtenerMapaRelaciones();
+        data.relacionPorAldea = fresco.relacionPorAldea;
+        cooldownSegPorAldea = fresco.cooldownSegPorAldea;
+        recalcularCooldownsAuto();
+      } catch (e) {
+        core.logWarn("recoleccion", "no pude refrescar cooldowns auto", e);
+      }
+    }
+    function hayCiudadesEnFallback() {
+      for (const v of Object.values(cooldownPorCiudad)) {
+        if (v && v.fuente !== "auto") return true;
+      }
+      return false;
+    }
     //Restaurar el map de lastClaimAt persistido del mundo actual. Si el
     //bot estuvo corriendo y la pestaña se recargó, esto evita que el primer
     //ciclo dispare aldeas con cooldown server vivo.
@@ -98,36 +136,32 @@
     const histData = await cargarHistorial();
     historialPorAldea = histData.porAldea;
     ciclos = histData.ciclos;
+    const resumenAuto = (() => {
+      let ok = 0, fb = 0, c5 = 0, c10 = 0;
+      for (const v of Object.values(cooldownPorCiudad)) {
+        if (v.fuente === "auto") ok += 1; else fb += 1;
+        if (v.minutos === 5) c5 += 1; else c10 += 1;
+      }
+      return `auto=${ok}/fallback=${fb} · 5min=${c5} · 10min=${c10}`;
+    })();
     core.log(
       "recoleccion",
-      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · configCiudades=${Object.keys(configPorCiudad).length} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas · ciclos persistidos=${ciclos.length}`,
+      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · cooldown ${resumenAuto} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas · ciclos persistidos=${ciclos.length}`,
       "ok"
     );
 
-    //—— Storage de config por ciudad ———————————————————————————————————
-
-    function cargarConfigPorCiudad() {
-      return new Promise((resolve) => {
-        chrome.storage.local.get("jambotConfig", (obj) => {
-          const cfg = (obj && obj.jambotConfig && obj.jambotConfig.porCiudad) || {};
-          resolve(cfg);
-        });
-      });
-    }
-
-    function guardarConfigPorCiudad() {
-      //Merge contra lo que haya en storage para no pisar otras claves
-      //(e.g. finalizarHabilitado del toggle del panel).
-      return new Promise((resolve) => {
-        chrome.storage.local.get("jambotConfig", (obj) => {
-          const cfgPrev = (obj && obj.jambotConfig) || {};
-          chrome.storage.local.set(
-            { jambotConfig: { ...cfgPrev, porCiudad: configPorCiudad } },
-            resolve
-          );
-        });
-      });
-    }
+    //Limpieza de la config legacy `porCiudad` (5/10min manual). Si el
+    //usuario tenía la versión anterior, el storage trae esa key — la
+    //borramos al boot porque ahora todo es auto. No tocamos otras keys
+    //del mismo blob (e.g. `finalizarHabilitado`).
+    chrome.storage.local.get("jambotConfig", (obj) => {
+      const cfg = obj && obj.jambotConfig;
+      if (cfg && cfg.porCiudad) {
+        const resto = { ...cfg };
+        delete resto.porCiudad;
+        chrome.storage.local.set({ jambotConfig: resto });
+      }
+    });
 
     //—— Storage de lastClaimAt por mundo ————————————————————————————————
 
@@ -273,20 +307,53 @@
     }
 
 
+    /**
+     * Determina el cooldown real (en minutos) que tiene una ciudad para la
+     * recolección "Recoger" (option=1). Devuelve { minutos, fuente, lealtad }.
+     *
+     * - fuente="auto": se infirió mirando alguna aldea de la ciudad con
+     *   `lootable_at - last_looted_at` válido (≈300s ⇒ 5min sin Lealtad,
+     *   ≈600s ⇒ 10min con Lealtad). Es la fuente confiable.
+     * - fuente="fallback": ninguna aldea de la ciudad tiene claim histórico
+     *   (ciudad recién fundada o storage del server reseteado). Usamos el
+     *   default de data.json — se auto-corrige sola en el primer ciclo
+     *   después del primer claim, cuando recalcularCooldownsAuto() se ejecuta.
+     *
+     * IMPORTANTE: la habilidad "Lealtad de los Aldeanos" se estudia POR
+     * CIUDAD y duplica el cooldown (5min → 10min) a cambio de +115% de
+     * recursos. Por eso basta con UNA aldea de la ciudad para inferirlo —
+     * todas comparten la misma habilidad.
+     */
+    function detectarMinutosCiudad(ciudad) {
+      const aldeas = ciudad.aldeas || [];
+      for (const a of aldeas) {
+        const seg = cooldownSegPorAldea[a.id];
+        if (!seg) continue;
+        //Buckets con margen ±60s para drift / cooldowns parcialmente
+        //avanzados. Cualquier valor fuera de los buckets esperados es
+        //sospechoso pero asumimos el más cercano.
+        if (seg < 450) return { minutos: 5, fuente: "auto", lealtad: false };
+        return { minutos: 10, fuente: "auto", lealtad: true };
+      }
+      return {
+        minutos: data.tiempoRecoleccion || 5,
+        fuente: "fallback",
+        lealtad: null,
+      };
+    }
+
     function getConfigCiudad(codigoCiudad) {
-      const override = configPorCiudad[codigoCiudad];
-      const minutos =
-        override && (override.minutos === 5 || override.minutos === 10)
-          ? override.minutos
-          : data.tiempoRecoleccion || 5;
+      const det = cooldownPorCiudad[codigoCiudad];
+      const minutos = (det && det.minutos) || data.tiempoRecoleccion || 5;
       //IMPORTANTE: option=1 SIEMPRE — es el primer botón "Recoger" del juego,
       //el más corto y más rentable. Su duración real depende de si la ciudad
       //estudió la habilidad de academia "Lealtad de los Aldeanos" (duplica
       //tiempos, +115% recursos): sin habilidad rinde 5min, con habilidad
-      //rinde 10min. La elección 5/10 del panel sirve para que el usuario
-      //le indique al bot el cooldown real de cada ciudad. Las opciones 2-4
-      //del juego (10/20/4h sin habilidad, 40min/3h/8h con habilidad) no se
-      //usan nunca: rinden peor por hora y se acumula riesgo de almacén lleno.
+      //rinde 10min. Antes el usuario configuraba 5/10 manualmente por
+      //ciudad; ahora se auto-detecta vía detectarMinutosCiudad. Las opciones
+      //2-4 del juego (10/20/4h sin habilidad, 40min/3h/8h con habilidad) no
+      //se usan nunca: rinden peor por hora y se acumula riesgo de almacén
+      //lleno.
       return { minutos, opcion: 1 };
     }
 
@@ -556,13 +623,13 @@
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
-    //  ciclos: { actual: bool, ultimo: bool }   true = expandido
-    //  ciudades: { [id]: bool }                 true = expandido
-    //  aldeas:   { [id]: bool }                 true = expandido (historial)
+    //  ciclos:        { actual: bool, ultimo: bool }      true = expandido
+    //  aldeas:        { [id]: bool }                      true = expandido (historial)
+    //  cicloCiudades: { [n]: { [id]: bool } }             true = expandido (ciudad dentro de un ciclo)
     const uiColapso = {
       ciclos: { actual: true, ultimo: true },
-      ciudades: {},
       aldeas: {},
+      cicloCiudades: {},
       errores: false,
     };
 
@@ -1096,9 +1163,9 @@
       );
 
       ciudadesOrden.forEach((ciudad) => {
-        const cfg = getConfigCiudad(ciudad.codigoCiudad);
+        const det = cooldownPorCiudad[ciudad.codigoCiudad] || detectarMinutosCiudad(ciudad);
         const color = COLOR_CIUDAD;
-        const minutos = cfg.minutos;
+        const minutos = det.minutos;
 
         const card = document.createElement("div");
         card.style.cssText =
@@ -1134,29 +1201,33 @@
         info.appendChild(subEl);
         card.appendChild(info);
 
-        //Toggle visual 5 / 10 min — más expresivo que un select
-        const tabs = document.createElement("div");
-        tabs.style.cssText =
-          "display:flex;background:#0f1620;border:1px solid #2c3a4d;border-radius:4px;overflow:hidden";
-        [5, 10].forEach((m) => {
-          const b = document.createElement("button");
-          const activo = m === minutos;
-          b.textContent = `${m} min`;
-          b.style.cssText =
-            `padding:5px 12px;border:none;cursor:pointer;font-size:11px;font-weight:bold;` +
-            `background:${activo ? color : "transparent"};` +
-            `color:${activo ? "#fff" : "#7a8aa0"};transition:all 0.15s`;
-          b.addEventListener("click", async () => {
-            if (m === minutos) return;
-            configPorCiudad[ciudad.codigoCiudad] = { minutos: m, opcion: 1 };
-            await guardarConfigPorCiudad();
-            core.log("recoleccion", `config ${nombre}: ${m}min`, "ok");
-            //Re-render para reflejar el cambio inmediato
-            renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
-          });
-          tabs.appendChild(b);
-        });
-        card.appendChild(tabs);
+        //Badge auto-detectado: minutos + estado de Lealtad. Reemplaza al
+        //toggle 5/10 manual — la auto-detección lee `lootable_at -
+        //last_looted_at` del modelo del server, que es exacto. Si la
+        //ciudad no tiene claim histórico (lealtad=null, fuente=fallback)
+        //mostramos el cooldown asumido en gris para que el usuario sepa
+        //que se va a corregir solo al primer claim.
+        const badge = document.createElement("div");
+        const esFallback = det.fuente !== "auto";
+        const colorBadge = esFallback ? "#5a6776" : (det.lealtad ? "#27ae60" : "#3498db");
+        badge.style.cssText =
+          "display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0";
+        const minLine = document.createElement("div");
+        minLine.textContent = `${minutos} min`;
+        minLine.style.cssText =
+          `padding:4px 10px;border-radius:4px;font-size:11.5px;font-weight:bold;` +
+          `background:${colorBadge}22;color:${colorBadge};border:1px solid ${colorBadge}55`;
+        const subBadge = document.createElement("div");
+        subBadge.textContent = esFallback
+          ? "sin datos aún"
+          : (det.lealtad ? "Lealtad investigada" : "sin Lealtad");
+        subBadge.style.cssText = `color:${colorBadge};font-size:9.5px;letter-spacing:0.3px`;
+        badge.appendChild(minLine);
+        badge.appendChild(subBadge);
+        badge.title = esFallback
+          ? "Ninguna aldea de esta ciudad tiene cooldown server registrado todavía. Se va a auto-detectar en el primer ciclo."
+          : `Auto-detectado: el server reporta cooldown de ${minutos*60}s para las aldeas de esta ciudad.`;
+        card.appendChild(badge);
 
         wrap.appendChild(card);
       });
@@ -1500,14 +1571,7 @@
         body.appendChild(vacio);
       }
 
-      //Sección 3: aldeas con historial — siempre visible (cada ciudad
-      //colapsable, default cerradas excepto la que tiene aldeas falladas
-      //en el último ciclo)
-      body.appendChild(crearSeparador());
-      body.appendChild(crearTituloSeccion("Aldeas e historial"));
-      body.appendChild(renderListaCiudadesHistorial());
-
-      //Sección 4: errores recientes
+      //Sección 3: errores recientes
       body.appendChild(crearSeparador());
       const errores = core.getErrores ? core.getErrores().slice(-15).reverse() : [];
       body.appendChild(seccionColapsable(
@@ -1821,6 +1885,7 @@
       const ciudadesArr = Object.entries(ciclo.ciudades || {})
         .map(([id, c]) => ({ id, ...c }))
         .sort((a, b) => (a.nombre || "").localeCompare(b.nombre || "", undefined, { numeric: true }));
+      uiColapso.cicloCiudades[ciclo.n] = uiColapso.cicloCiudades[ciclo.n] || {};
       for (const c of ciudadesArr) {
         const completa = c.claims >= (c.esperado || 6);
         const enProgreso = enCurso && c.claims < (c.esperado || 6);
@@ -1828,38 +1893,44 @@
         const color = sinClaims ? "#7a8aa0" : enProgreso ? "#f39c12" : completa ? "#27ae60" : "#e74c3c";
         const icon = sinClaims ? "·" : enProgreso ? "↻" : completa ? "✓" : "✗";
 
-        const fila = document.createElement("div");
-        fila.className = "pcj-row";
-        fila.style.cssText =
-          "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
-          "background:#172029;border-radius:3px;border-left:3px solid " + color;
-
-        //Badge cuadrado coloreado con el ícono
-        const badge = document.createElement("span");
-        badge.style.cssText =
-          `display:inline-flex;align-items:center;justify-content:center;` +
+        //Header HTML que replica la fila plana anterior: badge + nombre +
+        //ratio + recursos. seccionColapsable agrega su propio arrow.
+        const headerTxt =
+          `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
+          `  <span style="display:inline-flex;align-items:center;justify-content:center;` +
           `width:20px;height:20px;background:${color}22;color:${color};` +
-          `border-radius:3px;font-weight:bold;font-size:12px;flex-shrink:0`;
-        badge.textContent = icon;
-        fila.appendChild(badge);
+          `border-radius:3px;font-weight:bold;font-size:12px;flex-shrink:0">${icon}</span>` +
+          `  <span style="flex:1;font-size:12px;color:#e6e9ee;text-align:left">${escapeHtml(c.nombre)}</span>` +
+          `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right">${c.claims}/${c.esperado || 6}</span>` +
+          `  <span style="color:#7a8aa0;font-family:monospace;font-size:10.5px;min-width:140px;text-align:right">+${c.wood} / +${c.stone} / +${c.iron}</span>` +
+          `</div>`;
 
-        const nombre = document.createElement("span");
-        nombre.textContent = c.nombre;
-        nombre.style.cssText = "flex:1;font-size:12px;color:#e6e9ee;text-align:left";
-        fila.appendChild(nombre);
+        //Lookup de las aldeas estáticas de la ciudad para mostrar el
+        //historial al expandir. Si la ciudad ya no existe en memoria
+        //(p.ej. ciclo viejo de antes de un reload), mostramos un placeholder.
+        const ciudadFull = ciudadesConAldeas.find(
+          (x) => String(x.codigoCiudad) === String(c.id)
+        );
+        const aldeasOrden = ciudadFull
+          ? (ciudadFull.aldeas || []).slice().sort((a, b) =>
+              (a.name || "").localeCompare(b.name || "", undefined, { numeric: true })
+            )
+          : [];
 
-        const ratio = document.createElement("span");
-        ratio.textContent = `${c.claims}/${c.esperado || 6}`;
-        ratio.style.cssText = `color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right`;
-        fila.appendChild(ratio);
-
-        const recursos = document.createElement("span");
-        recursos.textContent = `+${c.wood} / +${c.stone} / +${c.iron}`;
-        recursos.style.cssText =
-          "color:#7a8aa0;font-family:monospace;font-size:10.5px;min-width:140px;text-align:right";
-        fila.appendChild(recursos);
-
-        wrap.appendChild(fila);
+        wrap.appendChild(seccionColapsable(
+          headerTxt,
+          uiColapso.cicloCiudades[ciclo.n][c.id] === true,
+          (v) => uiColapso.cicloCiudades[ciclo.n][c.id] = v,
+          () => aldeasOrden.length
+            ? renderAldeasDeCiudad(aldeasOrden, ciclo.n)
+            : (() => {
+                const v = document.createElement("div");
+                v.textContent = "(aldeas no disponibles — ciudad ya no está cargada)";
+                v.style.cssText = "opacity:0.6;font-style:italic;padding:4px 0";
+                return v;
+              })(),
+          color
+        ));
       }
       if (!enCurso && ciclo.duracion != null) {
         const totWood = ciudadesArr.reduce((s, c) => s + (c.wood || 0), 0);
@@ -1877,46 +1948,6 @@
       return wrap;
     }
 
-    function renderListaCiudadesHistorial() {
-      const wrap = document.createElement("div");
-      const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
-      const ciudadesOrden = ciudadesConAldeas.slice().sort((a, b) =>
-        (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
-      );
-      for (const ciudad of ciudadesOrden) {
-        const aldeasOrden = (ciudad.aldeas || []).slice().sort((a, b) =>
-          (a.name || "").localeCompare(b.name || "", undefined, { numeric: true })
-        );
-        const okEnUltimoCiclo = ultimoCiclo && ultimoCiclo.ciudades && ultimoCiclo.ciudades[ciudad.codigoCiudad];
-        const claims = okEnUltimoCiclo ? okEnUltimoCiclo.claims : 0;
-        const esperado = okEnUltimoCiclo ? okEnUltimoCiclo.esperado : 6;
-        const color = !okEnUltimoCiclo ? "#7a8aa0"
-          : claims >= esperado ? "#27ae60" : "#e74c3c";
-        const ratioBadge = okEnUltimoCiclo
-          ? `<span style="color:${color};font-weight:bold;background:${color}22;padding:1px 6px;border-radius:3px;font-size:10.5px">${claims}/${esperado}</span>`
-          : "";
-        //Nombre + cantidad a la izquierda (flex:1), badge a la derecha.
-        const headerTxt =
-          `<div style="display:flex;align-items:center;width:100%;gap:8px">` +
-          `  <div style="flex:1;min-width:0">` +
-          `    <span style="color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad || ciudad.codigoCiudad)}</span>` +
-          `    <span style="color:#7a8aa0;font-size:10.5px;margin-left:6px">· ${aldeasOrden.length} aldeas</span>` +
-          `  </div>` +
-          `  ${ratioBadge}` +
-          `</div>`;
-        const expandidoDefault = uiColapso.ciudades[ciudad.codigoCiudad] === true ||
-          (ultimoCiclo && claims < esperado && uiColapso.ciudades[ciudad.codigoCiudad] !== false);
-        wrap.appendChild(seccionColapsable(
-          headerTxt,
-          !!expandidoDefault,
-          (v) => uiColapso.ciudades[ciudad.codigoCiudad] = v,
-          () => renderAldeasDeCiudad(aldeasOrden),
-          color
-        ));
-      }
-      return wrap;
-    }
-
     //Mapa central de presentación de status. Devuelve {label, color, icono}
     //para cada uno de los 4 valores que retorna recolectarAldea (más null
     //cuando no hay historial). Centralizar acá evita texto críptico tipo
@@ -1927,18 +1958,25 @@
         case "reintentar":       return { label: "Pendiente",   color: "#f39c12", icono: "↻" };
         case "descartar":        return { label: "Descartada",  color: "#e74c3c", icono: "✗" };
         case "saltada-cooldown": return { label: "En cooldown", color: "#8a96a6", icono: "⏱" };
+        case "no-pertenece":     return { label: "Sin acceso",  color: "#8a96a6", icono: "⊘" };
         default:                 return { label: "—",           color: "#8a96a6", icono: "·" };
       }
     }
 
-    function renderAldeasDeCiudad(aldeas) {
+    function renderAldeasDeCiudad(aldeas, cicloN) {
+      //Cuando se renderiza dentro de un ciclo concreto (cicloN definido), el
+      //status de cada aldea sale del historial filtrado a ese ciclo — no del
+      //último entry global. Sin esto, las aldeas de un ciclo en curso
+      //heredaban el "OK" del ciclo anterior antes de ser procesadas.
       const wrap = document.createElement("div");
       for (const aldea of aldeas) {
         const histo = historialPorAldea[aldea.id] || [];
         const ultimaOk = [...histo].reverse().find((e) => e.status === "ok");
         const desde = ultimaOk ? formatRelativo(ultimaOk.ts) : "—";
-        const ultimaCualquiera = histo[histo.length - 1];
-        const p = presentarStatus(ultimaCualquiera && ultimaCualquiera.status);
+        const entradaCiclo = cicloN != null
+          ? [...histo].reverse().find((e) => e.ciclo === cicloN)
+          : histo[histo.length - 1];
+        const p = presentarStatus(entradaCiclo && entradaCiclo.status);
         //Layout: status (badge) a la izquierda · nombre + hace-tiempo debajo
         const headerTxt =
           `<div style="display:flex;align-items:center;gap:10px;width:100%">` +
@@ -2384,17 +2422,28 @@
       //Warning si el ciclo se está acercando al cooldown — a partir del 70%
       //hay riesgo de chocar con el cooldown del server cuando una ciudad
       //procesada al final del ciclo aparezca al principio del siguiente.
-      //La solución es subir esas ciudades a 10min en el panel.
+      //Antes la salida era "subí ciudades a 10min en el panel"; ahora el
+      //cooldown se auto-detecta del server, así que el remedio es investigar
+      //"Lealtad de los aldeanos" en las ciudades de 5min para que pasen a
+      //10min — o si ya está, reducir cantidad de ciudades por bot.
       if (duracionCiclo > baseMs * 0.7) {
         const pct = Math.round((duracionCiclo / baseMs) * 100);
         core.logWarn(
           "recoleccion",
-          `ciclo (${core.formatDuracion(duracionCiclo / 1000)}) ocupa el ${pct}% del cooldown (${core.formatDuracion(baseMs / 1000)}). Riesgo de rechazo del server — subí ciudades a 10min.`
+          `ciclo (${core.formatDuracion(duracionCiclo / 1000)}) ocupa el ${pct}% del cooldown (${core.formatDuracion(baseMs / 1000)}). Riesgo de rechazo del server — investigá "Lealtad de los aldeanos" en las ciudades de 5min para subirlas a 10min.`
         );
       }
 
       actualizarEstadoCard();
       programarSiguienteTick(tiempoEspera);
+
+      //Refresh auto-detección del cooldown si quedó alguna ciudad sin
+      //datos (típicamente: ciudad recién fundada que ahora ya tuvo su
+      //primer claim). Lo dejamos al final, sin await — el siguiente tick
+      //ya está programado.
+      if (hayCiudadesEnFallback()) {
+        refrescarCooldownsAuto();
+      }
     }
 
     //—— Lógica de recolección ——————————————————————————————————————————
@@ -2449,7 +2498,26 @@
       for (idxCiudadActual = 0; idxCiudadActual < ciudadesOrdenadas.length; idxCiudadActual++) {
         const ciudad = ciudadesOrdenadas[idxCiudadActual];
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
-        acumuladoCiclo[ciudad.codigoCiudad] = { wood: 0, stone: 0, iron: 0, claims: 0 };
+        //Contadores por ciudad para el resumen del final del ciclo:
+        //  claims               aldeas claimeadas con éxito en este ciclo
+        //  saltadasCooldown     aldeas en cooldown vivo (cliente o server) — esperado, no es error
+        //  descartadasOtras     errores no recuperables: recursosLlenos, sin relation_id, sin Town/CAPTCHA
+        //  reintentadasFallidas success=false que tras 3 intentos siguen fallando
+        //  bloqueadas           aldeas que el server reporta como "no te pertenece" — la ciudad
+        //                       todavía no las desbloqueó (típico en ciudades recién fundadas con
+        //                       <6 aldeas vasallas conquistadas). No es error: se descuentan del
+        //                       total esperado para no marcar la tanda como incompleta.
+        //
+        //"tanda incompleta" (rojo) solo si claims+saltadasCooldown < (6 - bloqueadas) — o sea,
+        //si hubo descartes o reintentos agotados. Si todas las que faltaron
+        //estaban en cooldown legítimo o sin acceso, la tanda es OK (verde).
+        acumuladoCiclo[ciudad.codigoCiudad] = {
+          wood: 0, stone: 0, iron: 0, claims: 0,
+          saltadasCooldown: 0,
+          descartadasOtras: 0,
+          reintentadasFallidas: 0,
+          bloqueadas: 0,
+        };
         //Banner azul por ciudad — mismo formato que el banner de ciclo pero
         //en color "info" para distinguirlo visualmente de los headers de
         //ciclo (violeta).
@@ -2535,6 +2603,7 @@
               "recoleccion",
               `aldea ${item.aldea.id} (${item.ciudad.nombreCiudad || item.ciudad.codigoCiudad}): descartada tras ${MAX_INTENTOS} intentos sin éxito`
             );
+            if (item.acumulador) item.acumulador.reintentadasFallidas += 1;
             continue;
           }
           try {
@@ -2573,15 +2642,52 @@
       const TOTAL_ESPERADO = 6;
       for (const ciudad of ciudadesOrdenadas) {
         const acc = acumuladoCiclo[ciudad.codigoCiudad];
-        if (!acc || acc.claims === 0) continue;
+        if (!acc) continue;
+        //Skip ciudades sin actividad (no debería pasar — todas tienen 6
+        //aldeas — pero es defensivo).
+        const total = acc.claims + acc.saltadasCooldown + acc.descartadasOtras + acc.reintentadasFallidas + acc.bloqueadas;
+        if (total === 0) continue;
+
         const nombre = ciudad.nombreCiudad || ciudad.codigoCiudad;
-        const resumen = `${nombre}: ${acc.claims}/${TOTAL_ESPERADO} aldeas → ${fmt(acc.wood)}/${fmt(acc.stone)}/${fmt(acc.iron)}`;
-        if (acc.claims === TOTAL_ESPERADO) {
-          core.log("recoleccion", `─── ${resumen} ───`, "ok");
+        const recursos = `${fmt(acc.wood)}/${fmt(acc.stone)}/${fmt(acc.iron)}`;
+
+        //Desglose: claims OK + saltadas por cooldown legítimo (cliente o
+        //server) + bloqueadas (sin acceso) cuentan como "esperado". Solo
+        //es tanda incompleta REAL si hubo descartes (recursosLlenos / sin
+        //relation / sin Town / CAPTCHA) o reintentos agotados — esos sí
+        //son yield perdido.
+        const partes = [`${acc.claims} ok`];
+        if (acc.saltadasCooldown) partes.push(`${acc.saltadasCooldown} en cooldown`);
+        if (acc.bloqueadas) partes.push(`${acc.bloqueadas} sin acceso`);
+        if (acc.reintentadasFallidas) partes.push(`${acc.reintentadasFallidas} fallaron tras retry`);
+        if (acc.descartadasOtras) partes.push(`${acc.descartadasOtras} descartadas`);
+        const desglose = partes.join(", ");
+
+        //Las bloqueadas (no le pertenecen al jugador) no son aldeas
+        //farmeables: las descontamos del total esperado para que una
+        //ciudad recién fundada con 4/6 aldeas conquistadas no marque la
+        //tanda como incompleta cada ciclo.
+        const esperadoCiudad = TOTAL_ESPERADO - acc.bloqueadas;
+        const esperado = acc.claims + acc.saltadasCooldown;
+        const fallasReales = acc.reintentadasFallidas + acc.descartadasOtras;
+
+        if (fallasReales === 0 && esperado === esperadoCiudad) {
+          //Tanda OK: todo lo que faltó claimear estaba en cooldown legítimo
+          //o sin acceso (esperado para esta ciudad).
+          core.log("recoleccion", `─── ${nombre}: ${desglose} → ${recursos} ───`, "ok");
+        } else if (fallasReales === 0) {
+          //Sin fallas reales pero la suma no llega al esperado — caso raro
+          //(e.g. la cantidad de aldeas que el server devolvió no coincide
+          //con esperadoCiudad). Logueamos como warn, no como error.
+          core.logWarn(
+            "recoleccion",
+            `${nombre}: ${desglose} → ${recursos} (esperado ${esperadoCiudad}, contadas ${esperado})`
+          );
         } else {
+          //Hubo fallas reales — yield perdido, log rojo.
           core.logError(
             "recoleccion",
-            `tanda incompleta — ${resumen} (faltaron ${TOTAL_ESPERADO - acc.claims})`
+            `tanda incompleta — ${nombre}: ${desglose} → ${recursos}`
           );
         }
       }
@@ -2630,6 +2736,7 @@
           const ahoraSec = Math.floor(Date.now() / 1000);
           if (aldea.loot > ahoraSec) {
             saltadasPorCooldown += 1;
+            if (acumulador) acumulador.saltadasCooldown += 1;
             const restante = aldea.loot - ahoraSec;
             if (restante < restanteMinSeg) restanteMinSeg = restante;
             registrarClaim({
@@ -2654,6 +2761,7 @@
           //resolví"). La sincronización post-resolver refresca el server y
           //continúa el ciclo. Acá simplemente respetamos el cooldown.
           saltadasPorCooldown += 1;
+          if (acumulador) acumulador.saltadasCooldown += 1;
           const restante = Math.round((cooldownMs - transcurrido) / 1000);
           if (restante < restanteMinSeg) restanteMinSeg = restante;
           registrarClaim({
@@ -2734,6 +2842,7 @@
           ciclo: nCiclo, status: "descartar",
           errorMsg: "ciudad con recursosLlenos",
         });
+        if (acumulador) acumulador.descartadasOtras += 1;
         return { status: "descartar" };
       }
 
@@ -2747,6 +2856,7 @@
           ciclo: nCiclo, status: "descartar",
           errorMsg: "sin relation_id",
         });
+        if (acumulador) acumulador.descartadasOtras += 1;
         return { status: "descartar" };
       }
 
@@ -2810,6 +2920,7 @@
         const errorMsg =
           (r.errors && r.errors[0]) ||
           r.error_msg ||
+          r.error ||
           (r.response && r.response.error) ||
           "success=false";
 
@@ -2841,14 +2952,66 @@
             ciclo: nCiclo, status: "descartar",
             errorMsg: `cooldown server: ${errorMsg}`,
           });
+          //Conceptualmente es lo mismo que cooldown cliente: el server nos
+          //dice "todavía no toca". No es error, es expected — cuenta como
+          //saltada-cooldown para que el resumen no pinte la tanda en rojo.
+          if (acumulador) acumulador.saltadasCooldown += 1;
+          return { status: "descartar" };
+        }
+
+        //Detectar específicamente "Esta aldea no te pertenece" (server
+        //rechaza porque la aldea todavía no fue conquistada por el
+        //jugador). Es expected — cada ciudad tiene 6 aldeas potenciales
+        //pero las recién fundadas las desbloquean de a poco. Descarte
+        //silencioso: log info (no warn), nuevo status "no-pertenece" en
+        //el historial → la UI muestra "Sin acceso" en gris en vez de
+        //"Pendiente" naranja, y el resumen de tanda no la cuenta como
+        //fallo.
+        const esAldeaNoPropia = typeof errorMsg === "string" &&
+          /no te pertenece|does not belong|doesn't belong|not yours|nicht.*geh[öo]rt/i.test(errorMsg);
+
+        if (esAldeaNoPropia) {
+          core.log(
+            "recoleccion",
+            `aldea ${farmTownId} (${ciudadNombreSafe}): sin acceso — ${errorMsg}`
+          );
+          registrarClaim({
+            aldeaId: farmTownId, ciudadId: codigoCiudad,
+            ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
+            ciclo: nCiclo, status: "no-pertenece",
+            errorMsg,
+          });
+          if (acumulador) acumulador.bloqueadas += 1;
+          //Ajustar el esperado del ciclo en vivo: la card de la ciudad
+          //muestra "claims/esperado" (default 6) y el header global muestra
+          //"X/totalAldeas". Sin este ajuste, una ciudad con 4 aldeas
+          //farmeables y 2 sin acceso quedaría visualmente como 4/6 rojo
+          //hasta el final del ciclo, aunque conceptualmente esté completa.
+          //También recheck `ciudadesCompletadas` por si la última bloqueada
+          //llega DESPUÉS del último claim OK (en ese caso el incremento
+          //"normal" en c.claims >= c.esperado nunca dispara, porque acá
+          //no aumentamos claims sino que bajamos esperado).
+          if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+            const cc = cicloActual.ciudades[codigoCiudad];
+            const eraCompleta = cc.claims >= cc.esperado;
+            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+            if (!eraCompleta && cc.claims >= cc.esperado) {
+              cicloActual.ciudadesCompletadas += 1;
+            }
+            actualizarIndicadorVivo();
+          }
           return { status: "descartar" };
         }
 
         //Otros errores (rate limit transitorio, etc): retry diferido como
-        //antes — vale la pena darle otra chance.
+        //antes — vale la pena darle otra chance. El errorMsg va en el texto
+        //principal para que se lea bien en chrome://extensions (donde el
+        //extra aparece como [object Object]).
+        const errorMsgCorto = typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg);
         core.logWarn(
           "recoleccion",
-          `aldea ${farmTownId} (${ciudadNombreSafe}): server respondió success=false`,
+          `aldea ${farmTownId} (${ciudadNombreSafe}): server rechazó claim — "${errorMsgCorto}" (se reintenta al final del ciclo)`,
           {
             errors: r.errors,
             error_msg: r.error_msg,
@@ -2896,6 +3059,7 @@
           ciclo: nCiclo, status: "descartar",
           errorMsg: "sin Town notification (probable CAPTCHA)",
         });
+        if (acumulador) acumulador.descartadasOtras += 1;
         //CAPTCHA → descartar (no reintentar este ciclo). El bot queda
         //esperando al humano (cartel + botón "Ya resolví" en la UI).
         return { status: "descartar" };
@@ -2991,6 +3155,18 @@
 
     //—— Loaders ————————————————————————————————————————————————————————
 
+    /**
+     * Pide la colección FarmTownPlayerRelations al server. Devuelve:
+     *   - relacionPorAldea: { farm_town_id → relation_id } (lo usa el claim).
+     *   - cooldownSegPorAldea: { farm_town_id → seg } con el cooldown real
+     *     que el server tiene activo para esa aldea, derivado de
+     *     `lootable_at - last_looted_at` (mismo patrón que el bridge —
+     *     ver gameBridge.js:80). Solo presente para aldeas con al menos
+     *     un claim histórico (ambos campos > 0). Lo usa la auto-detección
+     *     del cooldown por ciudad — la habilidad "Lealtad de los aldeanos"
+     *     se estudia por ciudad y duplica el cooldown (5min → 10min), así
+     *     que cualquier aldea con datos basta para inferirlo.
+     */
     async function obtenerMapaRelaciones() {
       const json = `{"collections":{"FarmTownPlayerRelations":[]},"town_id":${townId},"nl_init":false}`;
       const url = `https://${world_id}.grepolis.com/game/frontend_bridge?town_id=${townId}&action=refetch&h=${csrfToken}&json=${encodeURIComponent(json)}`;
@@ -3011,14 +3187,16 @@
           res.json.collections.FarmTownPlayerRelations.data) ||
         [];
 
-      const mapa = {};
+      const relacionPorAldea = {};
+      const cooldownSegPorAldea = {};
       for (const item of items) {
         const rel = item.d || item;
-        if (rel && rel.farm_town_id != null && rel.id != null) {
-          mapa[rel.farm_town_id] = rel.id;
-        }
+        if (!rel || rel.farm_town_id == null || rel.id == null) continue;
+        relacionPorAldea[rel.farm_town_id] = rel.id;
+        const cooldown = (rel.lootable_at || 0) - (rel.last_looted_at || 0);
+        if (cooldown > 0) cooldownSegPorAldea[rel.farm_town_id] = cooldown;
       }
-      return mapa;
+      return { relacionPorAldea, cooldownSegPorAldea };
     }
 
     async function obtenerCiudadesConAldeas() {

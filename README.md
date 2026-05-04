@@ -26,7 +26,7 @@ Funciona como **extensión local cargada en modo desarrollador**. No se publica 
 ## 1. Qué hace en detalle
 
 ### Recolección
-- Cada **5 o 10 minutos** (configurable por ciudad) recorre todas tus ciudades y, en cada una, intenta saquear sus 6 aldeas farmeables.
+- Cada **5 o 10 minutos** (auto-detectado por ciudad — ver punto 5) recorre todas tus ciudades y, en cada una, intenta saquear sus 6 aldeas farmeables.
 - Usa siempre el primer botón ("Recoger" 5min / 10min con la habilidad *Lealtad de los aldeanos*) — el más rentable por hora.
 - Si una aldea aún tiene cooldown del servidor (porque la claimeaste manualmente o desde otra pestaña), la **salta sin atacar al server**.
 - Si el server rechaza un claim por borde de cooldown, **reintenta hasta 3 veces** al final del ciclo (espera 5s entre rondas).
@@ -124,27 +124,26 @@ La card "Jam" siempre visible muestra el estado del bot sin abrir el panel:
 
 ---
 
-## 5. Configuración por ciudad (importante)
+## 5. Cooldown por ciudad (auto-detectado)
 
-> **Esto es lo único que tenés que configurar manualmente — y es lo que más impacta el rendimiento.**
+> **Antes esto era manual. Ahora el bot lo detecta solo a partir de los datos del server — no toca configurar nada.**
 
 Cada ciudad tiene un cooldown propio del servidor para los claims rápidos:
 
 - **5 minutos** si la ciudad **no investigó** la habilidad de academia *Lealtad de los aldeanos*.
 - **10 minutos** si la ciudad **sí investigó** *Lealtad de los aldeanos* (rinde +115% recursos pero duplica el cooldown).
 
-**Por defecto el bot asume 5 minutos para todas las ciudades.** Si tenés ciudades con la habilidad Lealtad investigada, tenés que cambiarlas a 10 min en el panel para que el bot no le pegue al server antes de tiempo (lo que generaría rechazos `success:false` y perdería claims).
+El bot lee `lootable_at - last_looted_at` del modelo `FarmTownPlayerRelation` que ya viene en la respuesta del server al boot. Cualquier aldea de la ciudad con un claim histórico alcanza para inferir el cooldown — la habilidad Lealtad se estudia por ciudad, así que las 6 aldeas comparten el mismo cooldown.
 
-### Cómo configurar
+### Lo que ves en el panel
 
-1. Click en la card **Jam** para abrir el panel → tab **"Settings"**.
-2. En la sección **"Tiempo de recolección por ciudad"** ves cada ciudad con un selector `5 min` / `10 min`.
-3. Para cada ciudad, elegí el valor que coincida con su cooldown real:
-   - Si la ciudad tiene Lealtad → **10 min**
-   - Si no → **5 min**
-4. La configuración se guarda automáticamente y persiste entre recargas.
+En el tab **"Settings"** → sección **"Tiempo de recolección por ciudad"** cada ciudad muestra un badge:
 
-> **Tip**: si no estás seguro, miralo desde la pantalla del juego: en cada ciudad, abrí "Academia" → buscá "Lealtad de los aldeanos". Si está investigada, tu ciudad rinde 10 min con +115% de recursos.
+- **`10 min · Lealtad investigada`** (verde) — la ciudad tiene la habilidad.
+- **`5 min · sin Lealtad`** (azul) — la ciudad no tiene la habilidad.
+- **`5 min · sin datos aún`** (gris) — ciudad recién fundada que todavía no tuvo ningún claim. El bot asume 5 min y se auto-corrige al primer ciclo después del primer claim.
+
+No hay botones para cambiar — es informativo. Si investigás Lealtad en una ciudad, el badge cambia solo en cuanto el server reporta el cooldown nuevo (típicamente al boot siguiente o en el primer claim después de la investigación).
 
 ### Otras opciones del tab Settings
 
@@ -168,10 +167,9 @@ Configuración (ver punto 5).
 
 ### Tab "Recolección"
 - **Cartel CAPTCHA** (solo si hay captcha pendiente o en timeout): qué ciudad/aldea disparó el CAPTCHA, lista de aldeas pendientes en cola, countdown del timeout (10 min) y botón **"Ya resolví"** para sincronizar y reanudar.
-- **Ciclo en curso** (mientras corre): qué ciudades ya se procesaron y cuáles faltan, en color naranja.
-- **Último ciclo**: resumen del último ciclo terminado — verde si fue completo (6/6 en cada ciudad), rojo si alguna ciudad quedó incompleta.
-- **Ciclos anteriores** (colapsable): los últimos 36 ciclos persistidos (~6 horas a 10 min/ciclo). Click en cada uno para ver el detalle.
-- **Aldeas e historial**: lista de tus ciudades. Expandí una ciudad para ver sus 6 aldeas, expandí una aldea para ver sus últimas 36 recolecciones (timestamp, deltas de recursos, status).
+- **Ciclo en curso** (mientras corre): qué ciudades ya se procesaron y cuáles faltan, en color naranja. Expandí una ciudad para ver sus aldeas con el status en este ciclo (las pendientes muestran `· —` gris hasta que se claimean — ya no heredan el OK del ciclo anterior).
+- **Último ciclo**: resumen del último ciclo terminado — verde si fue completo, rojo si quedó tanda incompleta. Expandí una ciudad para ver sus 6 aldeas, expandí una aldea para ver sus últimas 36 recolecciones (timestamp, deltas de recursos, status, número de ciclo).
+- **Ciclos anteriores** (colapsable): los últimos 36 ciclos persistidos (~6 horas a 10 min/ciclo). Click en cada uno para ver el detalle con la misma estructura.
 - **Errores y warnings recientes**: últimos eventos del buffer compartido — útil para diagnosticar si algo no anda bien.
 
 ### Tab "Construcción"
@@ -201,6 +199,7 @@ Configuración (ver punto 5).
 ### "Una tanda salió en rojo (3/6 aldeas)"
 - Pasa de vez en cuando por borde de cooldown server. El retry automático (3 intentos) debería recuperarla en el siguiente ciclo.
 - Si sucede repetidamente, mirá el panel **Errores recientes** — ahí va a aparecer la causa exacta (ej: `success=false` con detalle del server).
+- **Nota**: si la ciudad es recién fundada y todavía no conquistó las 6 aldeas vasallas, el bot ahora detecta esto (`Sin acceso` en gris) y **no** la cuenta como tanda incompleta. Solo aparecen en rojo las tandas con yield perdido real (errores no recuperables o reintentos agotados).
 
 ### "Después de un reload el primer ciclo no farmea nada"
 - Es el comportamiento esperado durante hasta ~10 min (el tiempo del cooldown más largo). El bot ya sabe que las aldeas están en cooldown y espera; el panel muestra `próxima en X minutos`. Si una aldea se libera antes del próximo ciclo normal, el bot **adelanta el tick** automáticamente.

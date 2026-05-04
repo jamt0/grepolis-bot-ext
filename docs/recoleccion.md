@@ -6,7 +6,7 @@ La feature principal del bot. Implementada en [`features/recoleccion.js`](../fea
 
 ## 1. Qué hace
 
-Cada **5 o 10 minutos** (configurable por ciudad), recorre todas las ciudades del jugador y, en cada una, claimea sus 6 aldeas farmeables. Usa siempre la opción "Recoger" rápida (`option=1` en el endpoint).
+Cada **5 o 10 minutos** (auto-detectado por ciudad — ver §3.1), recorre todas las ciudades del jugador y, en cada una, claimea sus 6 aldeas farmeables. Usa siempre la opción "Recoger" rápida (`option=1` en el endpoint).
 
 ---
 
@@ -68,11 +68,23 @@ Retorna `{status: "ok" | "reintentar" | "descartar"}`:
 
 | Path | Status | Acción |
 |------|--------|--------|
-| `recursosLlenos === true` | `descartar` | Salta sin pegarle al server. Loguea warning. |
-| `relationId == null` | `descartar` | Aldea conocida pero sin `FarmTownPlayerRelation` activa (huérfana). Loguea warning. |
-| `success: false` del server | `reintentar` | Va al retry diferido. Loguea con cuerpo de respuesta. |
-| Sin notification `Town` en la respuesta | `descartar` | Probable CAPTCHA. Dispara `core.onCaptchaDetectado()`. |
+| `recursosLlenos === true` | `descartar` | Salta sin pegarle al server. Loguea warning. Cuenta como `descartadasOtras` en el resumen de tanda (yield perdido). |
+| `relationId == null` | `descartar` | Aldea conocida pero sin `FarmTownPlayerRelation` activa (huérfana). Loguea warning. `descartadasOtras`. |
+| `success: false` con cooldown server | `descartar` | Server reporta cooldown vivo. Cuenta como `saltadasCooldown` (no es error). |
+| `success: false` con "no te pertenece" | `descartar` | La aldea todavía no fue conquistada por el jugador (típico en ciudades recién fundadas con <6 vasallas). Status especial `no-pertenece` en el historial → la UI muestra "Sin acceso" gris. Cuenta como `bloqueadas` y descuenta del `esperado` del ciclo en vivo (la card pasa de `4/6` a `4/4`). Log info, no warn. |
+| `success: false` otros errores | `reintentar` | Va al retry diferido. El error_msg del server va en el texto del log para que se vea en chrome://extensions. Si tras 3 intentos sigue fallando: `reintentadasFallidas` (yield perdido). |
+| Sin notification `Town` en la respuesta | `descartar` | Probable CAPTCHA. Dispara `core.onCaptchaDetectado()`. `descartadasOtras`. |
 | OK | `ok` | Loguea claim, actualiza `lastClaimAtPorAldea[id]`, persiste. |
+
+### Resumen de tanda al final del ciclo
+
+Por cada ciudad `recolectarCiudades` imprime un balance basado en los contadores: `claims ok`, `saltadas en cooldown`, `bloqueadas sin acceso`, `reintentadasFallidas`, `descartadas otras`. El color depende del criterio "tanda OK = sin fallas reales y sumó al esperado":
+
+- **Verde** si `claims + saltadasCooldown == 6 - bloqueadas` y no hubo `reintentadasFallidas` ni `descartadasOtras`. Todo lo que no se claimeó tenía motivo legítimo.
+- **Naranja** (warn) si no hubo fallas reales pero la suma no llegó al esperado (caso raro defensivo).
+- **Rojo** (`logError` "tanda incompleta") si hubo `reintentadasFallidas + descartadasOtras > 0` — yield realmente perdido.
+
+Esto cambió respecto del criterio anterior que sólo miraba `claims === 6` y marcaba rojo cualquier ciudad con aldeas en cooldown legítimo o sin acceso.
 
 ---
 
@@ -264,19 +276,54 @@ Si el humano no apreta "Ya resolví" en 10 min, entramos en estado `"timeout"`:
 
 ---
 
-## 11. Persistencia (resumen)
+## 11. Auto-detección del cooldown por ciudad
+
+El cooldown real de cada ciudad (5 o 10 min) depende de si estudió la habilidad de academia *Lealtad de los aldeanos* (sin: 5 min · con: 10 min · +115% recursos). Antes era un toggle manual por ciudad; ahora se infiere del modelo del server al boot.
+
+### Fuente
+
+`obtenerMapaRelaciones` ya pide la colección `FarmTownPlayerRelations`. Cada item trae `lootable_at` y `last_looted_at`. Su diferencia es el cooldown en segundos:
+
+```js
+const cooldown = (rel.lootable_at || 0) - (rel.last_looted_at || 0);
+```
+
+Es el mismo patrón que usa el bridge para resetear el ícono visual al claimear ([`gameBridge.js`](../js/gameBridge.js#L80)) — sabemos que es exacto.
+
+### Decisión
+
+`detectarMinutosCiudad(ciudad)` recorre las 6 aldeas de la ciudad y devuelve a partir de la primera con cooldown válido:
+
+| Cooldown | Minutos asumidos | Lealtad |
+|---------:|------------------|---------|
+| < 450 s  | 5                | no investigada |
+| ≥ 450 s  | 10               | investigada |
+
+La habilidad se estudia POR CIUDAD, así que las 6 aldeas comparten el mismo cooldown — basta UNA aldea con datos para inferirlo.
+
+### Fallback
+
+Si NINGUNA aldea de la ciudad tiene `lootable_at > last_looted_at > 0` (típicamente: ciudad recién fundada que nunca tuvo claim), `getConfigCiudad` cae al default de `data.json` (5 min). Después del primer ciclo, `recolectarRecursos` llama `refrescarCooldownsAuto()` (1 GET adicional al mismo endpoint que `obtenerMapaRelaciones`) si quedó alguna ciudad en fallback. En el siguiente ciclo el server ya devuelve `last_looted_at` y la auto-detección se corrige sola.
+
+### UI
+
+El panel (tab Settings) muestra el resultado en un badge **read-only**: `10 min · Lealtad investigada` (verde), `5 min · sin Lealtad` (azul) o `5 min · sin datos aún` (gris fallback). No hay botones para cambiar.
+
+---
+
+## 12. Persistencia (resumen)
 
 Ver [persistencia.md](persistencia.md) para el detalle completo. Lo que toca esta feature:
 
 | Clave (en `chrome.storage.local`) | Contenido |
 |-----------------------------------|-----------|
-| `jambotConfig` | Config por ciudad (5/10 min) + toggle finalizar gratis. Global. |
+| `jambotConfig` | Toggle `finalizarHabilitado`. Global. (`porCiudad` legacy se borra al boot — ahora el cooldown se auto-detecta, ver §11.) |
 | `jambotLastClaimAt_${world_id}` | Map `{aldeaId: timestamp}`. |
 | `jambotHistorial_${world_id}` | `{porAldea: {aldeaId: [36 entradas]}, ciclos: [36 ciclos]}`. |
 
 ---
 
-## 12. Ver también
+## 13. Ver también
 
 - [arquitectura.md](arquitectura.md) — visión general.
 - [panel.md](panel.md) — la UI que muestra todo este estado.

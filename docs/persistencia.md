@@ -27,20 +27,15 @@ Configuración del usuario. Global (no namespaceada por mundo) — la asunción 
 
 ```js
 {
-  porCiudad: {
-    91:   { minutos: 10, opcion: 1 },
-    1156: { minutos: 5,  opcion: 1 },
-    1339: { minutos: 10, opcion: 1 },
-    ...
-  },
   finalizarHabilitado: true
 }
 ```
 
-- `porCiudad[townId].minutos` — 5 o 10. El `opcion: 1` es un campo dejado por compatibilidad; el bot SIEMPRE usa `option: 1` (la opción más rentable) hardcoded.
 - `finalizarHabilitado` — toggle de la feature de finalizar construcción gratis.
 
-Lectura: `cargarConfigPorCiudad()` en `recoleccion.js`. Escritura: `guardarConfigPorCiudad()` (merge contra el blob existente para no pisar otras claves).
+> **Nota histórica**: hasta vNN existió `porCiudad` con el cooldown manual (5/10 min) por ciudad. Ahora se auto-detecta de `lootable_at - last_looted_at` del modelo `FarmTownPlayerRelation` que ya viene en la respuesta del server al boot, así que esa key se borra automáticamente en `recoleccion.init()` si está presente (legacy cleanup).
+
+Lectura/escritura: directamente vía `chrome.storage.local.get/set` en los handlers del panel y en `finalizarConstruccion.js`.
 
 ### `jambotLastClaimAt_${world_id}`
 

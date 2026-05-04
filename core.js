@@ -87,10 +87,15 @@
     );
   }
 
+  //logWarn/logError NO usan %c en la cadena de formato. Razón: estos
+  //terminan en la página de errores de chrome://extensions, donde los %c
+  //aparecen como texto literal y los objetos extra se renderean como
+  //"[object Object]". Sin %c el texto queda limpio en ambos contextos —
+  //en DevTools console.warn/error ya pinta amarillo/rojo de fábrica, y
+  //el emoji ⚠/✖ marca visualmente el nivel.
   function logWarn(scope, mensaje, ...extra) {
     console.warn(
-      `%c[${formatTimestamp()}]%c [${scope}] %c⚠ ${mensaje}`,
-      ESTILOS.ts, ESTILOS.scope, ESTILOS.warn,
+      `[${formatTimestamp()}] [${scope}] ⚠ ${mensaje}`,
       ...extra
     );
     guardarError("warn", scope, mensaje, extra);
@@ -98,8 +103,7 @@
 
   function logError(scope, mensaje, ...extra) {
     console.error(
-      `%c[${formatTimestamp()}]%c [${scope}] %c✖ ERROR: ${mensaje}`,
-      ESTILOS.ts, ESTILOS.scope, ESTILOS.error,
+      `[${formatTimestamp()}] [${scope}] ✖ ERROR: ${mensaje}`,
       ...extra
     );
     guardarError("error", scope, mensaje, extra);
