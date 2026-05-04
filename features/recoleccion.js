@@ -143,6 +143,10 @@
     //chrome.storage.local set es ~1ms, despreciable. Si una escritura falla
     //(quota, etc) el siguiente claim sobrescribe — no hace falta retry.
     function guardarLastClaimAt() {
+      //Si la extensión fue recargada, isExtensionContextValid loggea una
+      //sola vez + pausa el bot. Salir sin tocar storage evita el spam de
+      //"Extension context invalidated" (1 por aldea × 6 aldeas × N ciudades).
+      if (!core.isExtensionContextValid()) return;
       try {
         chrome.storage.local.set({ [STORAGE_KEY_LAST_CLAIM]: lastClaimAtPorAldea });
       } catch (e) {
@@ -172,6 +176,7 @@
     }
 
     function guardarHistorial() {
+      if (!core.isExtensionContextValid()) return;
       try {
         chrome.storage.local.set({
           [STORAGE_KEY_HISTORIAL]: {
@@ -182,6 +187,28 @@
       } catch (e) {
         core.logWarn("recoleccion", "no pude persistir historial", e);
       }
+    }
+
+    //Versión que retorna Promise — usada en la promoción del ciclo para
+    //garantizar que el ciclo recién terminado llegue al disco ANTES de
+    //volver a programar el siguiente tick. Sin esto, un reload de la
+    //pestaña entre el push a ciclos[] y el set() async (~10-50ms) perdía
+    //el ciclo entero.
+    function guardarHistorialAsync() {
+      if (!core.isExtensionContextValid()) return Promise.resolve();
+      return new Promise((resolve) => {
+        try {
+          chrome.storage.local.set({
+            [STORAGE_KEY_HISTORIAL]: {
+              porAldea: historialPorAldea,
+              ciclos: ciclos,
+            },
+          }, resolve);
+        } catch (e) {
+          core.logWarn("recoleccion", "no pude persistir historial", e);
+          resolve();
+        }
+      });
     }
 
     /**
@@ -327,7 +354,7 @@
         c = document.createElement("div");
         c.id = "jambot-buttons";
         c.style.cssText =
-          "position:absolute;bottom:40px;left:10px;z-index:5;" +
+          "position:absolute;bottom:45px;left:80px;z-index:5;" +
           "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
         document.body.appendChild(c);
         return c;
@@ -367,18 +394,20 @@
         card.style.borderColor = "#2c3a4d";
       });
       card.addEventListener("click", () => {
-        //Click en la card siempre lleva al Dashboard. Si el panel está
-        //cerrado, lo abre en Dashboard; si está abierto en otro tab, salta
-        //a Dashboard sin cerrar; si ya está abierto en Dashboard, cierra.
+        //Click en la card normalmente lleva a Dashboard. EXCEPCIÓN: cuando
+        //hay CAPTCHA pendiente, lleva a Recolección — ahí está el cartel
+        //con el botón "Ya resolví", que es lo único que el usuario quiere
+        //hacer en ese momento.
+        const tabDestino = core.isCaptchaActive() ? "recoleccion" : "dashboard";
         const panel = document.getElementById("panelConfigJam");
         const cerrado = !panel || panel.style.display === "none";
         if (cerrado) {
-          tabActivo = "dashboard";
-          window.localStorage.setItem(STORAGE_KEY_TAB, "dashboard");
+          tabActivo = tabDestino;
+          window.localStorage.setItem(STORAGE_KEY_TAB, tabDestino);
           abrirPanel(panelConfig);
-        } else if (tabActivo !== "dashboard") {
-          tabActivo = "dashboard";
-          window.localStorage.setItem(STORAGE_KEY_TAB, "dashboard");
+        } else if (tabActivo !== tabDestino) {
+          tabActivo = tabDestino;
+          window.localStorage.setItem(STORAGE_KEY_TAB, tabDestino);
           renderPanelConfig(panelConfig);
         } else {
           cerrarPanel(panelConfig);
@@ -389,43 +418,74 @@
     }
 
     function actualizarEstadoCard() {
+      const card = document.getElementById("jambot-card");
       const span = document.getElementById("jambot-card-estado");
+      const captchaActivo = core.isCaptchaActive();
+      const captchaState = core.getCaptchaState ? core.getCaptchaState() : "none";
+      const ctx = core.getCaptchaContext ? core.getCaptchaContext() : null;
+      const resueltoEnJuego = core.isCaptchaResueltoEnJuego && core.isCaptchaResueltoEnJuego();
+
       if (span) {
-        if (core.isCaptchaActive()) {
-          span.textContent = "⚠";
-          span.style.color = "#e74c3c";
+        if (captchaActivo) {
+          span.textContent = captchaState === "timeout" ? "⏱" : "⚠";
+          span.style.color = captchaState === "timeout" ? "#7a8aa0" : "#e74c3c";
         } else if (core.isPaused()) {
           span.textContent = "▶";
           span.style.color = "#27ae60";
         } else {
-          span.textContent = "⏸";
-          span.style.color = "#3498db";
+          //Corriendo: sin icono. El countdown / spinner indican actividad.
+          //Antes mostrábamos ⏸ pero confunde — leer "pausa" cuando en
+          //realidad está corriendo.
+          span.textContent = "";
         }
       }
 
-      //Countdown del próximo ciclo / progreso del ciclo en curso. Solo
-      //aparece cuando hay algo que mostrar — si está pausado y sin tick
-      //programado, se oculta para no ensuciar la card.
+      //Cuando hay CAPTCHA, además del ⚠ pintamos el borde rojo (o verde
+      //si el bridge ya detectó que el captcha del juego se limpió y solo
+      //falta el click "Ya resolví"). En timeout queda gris.
+      if (card) {
+        if (captchaActivo) {
+          card.style.borderColor =
+            captchaState === "timeout" ? "#7a8aa0" :
+            resueltoEnJuego ? "#27ae60" : "#e74c3c";
+          //Tooltip con el contexto.
+          if (ctx && ctx.ciudad && ctx.aldea) {
+            card.title = `CAPTCHA · ${ctx.ciudad.nombre} → ${ctx.aldea.nombre} (click para resolver)`;
+          } else {
+            card.title = "CAPTCHA pendiente — click para resolver";
+          }
+        } else {
+          //Restaurar el borde default (lo manejan los hover handlers).
+          card.style.borderColor = "#2c3a4d";
+          card.title = "";
+        }
+      }
+
+      //Indicador secundario (countdown / spinner / texto CAPTCHA).
       const cd = document.getElementById("jambot-card-countdown");
       if (cd) {
-        if (core.isCaptchaActive()) {
-          cd.textContent = "";
+        if (captchaActivo && ctx && ctx.aldea) {
+          //Mostrar la aldea que falló — el usuario lee el pulpo y ya sabe
+          //cuál tiene que recolectar manual sin abrir el panel.
+          cd.innerHTML = `<span style="color:#f39c12">${escapeHtml(ctx.aldea.nombre)}</span>`;
         } else if (cicloActual) {
-          cd.textContent = `${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas}`;
-          cd.style.color = "#f39c12";
+          cd.innerHTML = `<span class="jambot-spinner"></span>`;
         } else if (proximoTickAt && !core.isPaused()) {
           const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
           cd.textContent = core.formatDuracion(seg);
-          cd.style.color = "#7a8aa0";
         } else {
-          cd.textContent = "";
+          cd.innerHTML = "";
         }
       }
     }
     actualizarEstadoCard();
-    //Refresh cada 1s del countdown — independiente del setInterval del
-    //panel (que solo corre cuando el panel está abierto). La card es
-    //siempre visible, así que su countdown necesita su propio tick.
+    //Tick de 1s SOLO para refrescar el countdown al próximo ciclo.
+    //El spinner es CSS puro y los demás estados se actualizan por evento
+    //(onPlayPauseChange/onCaptcha) o por llamadas explícitas, así que el
+    //interval en sí mismo no es necesario para esos casos. Igual lo
+    //dejamos siempre activo: actualizarEstadoCard es barato (lee globals
+    //y toca 2-3 nodos) y simplifica el ciclo de vida — no hay que
+    //arrancar/parar el interval según el estado.
     setInterval(actualizarEstadoCard, 1000);
 
     //Reaccionar al play/pause global: cancelar tick al pausar, arrancar al
@@ -518,6 +578,19 @@
           .pcj-row { transition: background 0.12s; }
           .pcj-row:hover { background: rgba(255,255,255,0.04) !important; }
           #panelConfigJam button:focus { outline: 2px solid #3498db44; outline-offset: 1px; }
+
+          /* Spinner para la card "Jam" cuando hay un ciclo en curso.
+             CSS-only (no depende de re-renders en JS). */
+          @keyframes jb-spin { to { transform: rotate(360deg); } }
+          .jambot-spinner {
+            display: inline-block;
+            width: 11px; height: 11px;
+            border: 2px solid rgba(255,255,255,0.15);
+            border-top-color: #f39c12;
+            border-radius: 50%;
+            animation: jb-spin 0.8s linear infinite;
+            vertical-align: -1px;
+          }
 
           /* Scrollbar custom alineado con el dark theme del panel.
              Solo aplica al body con scroll y a cualquier descendiente que
@@ -726,9 +799,20 @@
       if (!header) return;
 
       const captcha = core.isCaptchaActive();
+      const captchaState = core.getCaptchaState ? core.getCaptchaState() : (captcha ? "pending" : "none");
       const pausado = core.isPaused();
-      const color = captcha ? "#e74c3c" : pausado ? "#27ae60" : "#3498db";
-      const label = captcha ? "CAPTCHA" : pausado ? "Pausado" : "Corriendo";
+      //En "pending" mostramos pill rojo "CAPTCHA" y deshabilitamos el botón
+      //(el usuario tiene que resolver vía el cartel del tab Recolección).
+      //En "timeout" mostramos pill gris "TIMEOUT" pero el botón Iniciar SE
+      //HABILITA — apretarlo limpia el captcha y arranca un ciclo nuevo.
+      const colorPill =
+        captchaState === "pending" ? "#e74c3c" :
+        captchaState === "timeout" ? "#7a8aa0" :
+        pausado ? "#27ae60" : "#3498db";
+      const label =
+        captchaState === "pending" ? "CAPTCHA" :
+        captchaState === "timeout" ? "TIMEOUT" :
+        pausado ? "Pausado" : "Corriendo";
 
       let proximoTexto = "—";
       let proximoColor = "#cdd5e0";
@@ -737,6 +821,12 @@
         proximoColor = "#f39c12";
       } else if (proximoTickAt) {
         proximoTexto = "próximo en " + core.formatDuracion((proximoTickAt - Date.now()) / 1000);
+      } else if (captchaState === "pending") {
+        proximoTexto = "esperando que el humano resuelva el CAPTCHA";
+        proximoColor = "#e74c3c";
+      } else if (captchaState === "timeout") {
+        proximoTexto = "bot detenido — iniciá para arrancar un nuevo ciclo";
+        proximoColor = "#cdd5e0";
       }
 
       header.innerHTML = "";
@@ -746,25 +836,35 @@
       const izq = document.createElement("div");
       izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap";
       izq.innerHTML =
-        statusPill(label, color) +
+        statusPill(label, colorPill) +
         `<span style="color:${proximoColor};font-size:11.5px">${proximoTexto}</span>`;
       wrap.appendChild(izq);
 
+      //El botón usa el color de play/pause "real" (no el del captcha pill)
+      //para que sea visualmente claro que apretarlo cambia ese estado.
+      const colorBtn = pausado ? "#27ae60" : "#3498db";
       const btn = document.createElement("button");
       const accion = pausado ? "Iniciar" : "Pausar";
       btn.textContent = (pausado ? "▶  " : "⏸  ") + accion;
       btn.style.cssText =
-        `padding:6px 14px;background:${color};color:#fff;border:none;` +
+        `padding:6px 14px;background:${colorBtn};color:#fff;border:none;` +
         "border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;" +
         "letter-spacing:0.3px;transition:opacity 0.15s;flex-shrink:0";
-      if (captcha) {
+      const bloqueadoPorCaptcha = captchaState === "pending";
+      if (bloqueadoPorCaptcha) {
         btn.disabled = true;
         btn.style.opacity = "0.5";
         btn.style.cursor = "not-allowed";
-        btn.title = "Resolvé el CAPTCHA en el juego primero";
+        btn.title = "Resolvé el CAPTCHA primero (botón en el tab Recolección)";
       }
       btn.addEventListener("click", () => {
-        if (captcha) return;
+        if (bloqueadoPorCaptcha) return;
+        //En "timeout" el captcha sigue activo; al iniciar limpiamos el
+        //estado para arrancar un ciclo nuevo limpio (los cooldowns por
+        //aldea siguen vivos en lastClaimAtPorAldea, no se pierden).
+        if (captchaState === "timeout" && pausado) {
+          core.onCaptchaResuelto();
+        }
         core.togglePlayPause();
         //Repaint inmediato del header — sin esto el botón se quedaba con
         //el label viejo hasta el siguiente tick del setInterval (1s),
@@ -913,16 +1013,45 @@
         `display:inline-block">${escapeHtml(label)}</span>`;
     }
 
-    //Helper: recursos con íconos universales (sin depender de assets del juego)
-    //  🌲 madera (verde), 🪨 piedra (gris), 🪙 plata (dorado).
-    //  Acepta números y los formatea con separador de miles.
+    //Helper: recursos con nombre + cantidad, coloreados por recurso.
+    //  Madera = café, Piedra = gris, Plata = plateado. Cada recurso usa el
+    //  mismo color para nombre y número.
     function recursosConIconos(w, s, i) {
       const num = (n) => Number(n || 0).toLocaleString("es-AR");
-      return `<span style="color:#27ae60">🌲 ${num(w)}</span>` +
-        ` <span style="color:#5a6776">·</span> ` +
-        `<span style="color:#cdd5e0">🪨 ${num(s)}</span>` +
-        ` <span style="color:#5a6776">·</span> ` +
-        `<span style="color:#f39c12">🪙 ${num(i)}</span>`;
+      const item = (color, nombre, valor) =>
+        `<span style="color:${color}">${nombre} ${num(valor)}</span>`;
+      const sep = ` <span style="color:#5a6776">·</span> `;
+      return item("#a47148", "Madera", w) + sep +
+        item("#9aa4b0", "Piedra", s) + sep +
+        item("#c0c8d0", "Plata", i);
+    }
+
+    /**
+     * Header de "ciclo" para `seccionColapsable` con layout flex (no
+     * centrado). 3 zonas: título a la izquierda (flex:1), badge de ratio
+     * en el medio, hora+duración a la derecha. Usado por los headers de
+     * "Ciclo en curso", "Último ciclo" y "Ciclos anteriores" para que se
+     * vean consistentes y los datos no compitan por el centro.
+     */
+    function headerCiclo({ icono, color, titulo, ratio, hora, duracion }) {
+      const tituloHtml =
+        `<span style="color:${color};font-weight:bold;flex:1;min-width:0;` +
+        `overflow:hidden;text-overflow:ellipsis;white-space:nowrap">` +
+        `${escapeHtml(icono)} ${escapeHtml(titulo)}</span>`;
+      const ratioHtml = ratio
+        ? `<span style="color:${color};font-weight:bold;background:${color}22;` +
+          `padding:1px 8px;border-radius:3px;font-size:10.5px;flex-shrink:0">` +
+          `${escapeHtml(ratio)}</span>`
+        : "";
+      const horaHtml = (hora || duracion)
+        ? `<span style="color:#7a8aa0;font-size:10.5px;font-family:monospace;` +
+          `flex-shrink:0;text-align:right">` +
+          `${escapeHtml(hora || "")}${duracion ? ` · ${escapeHtml(duracion)}` : ""}` +
+          `</span>`
+        : "";
+      return `<div style="display:flex;align-items:center;gap:10px;width:100%">` +
+        tituloHtml + ratioHtml + horaHtml +
+        `</div>`;
     }
 
     //—— Tab Settings (configuración) ——————————————————————————————————————
@@ -994,7 +1123,7 @@
 
         //Nombre + cantidad de aldeas
         const info = document.createElement("div");
-        info.style.cssText = "flex:1;min-width:0";
+        info.style.cssText = "flex:1;min-width:0;text-align:left";
         const nombreEl = document.createElement("div");
         nombreEl.textContent = nombre;
         nombreEl.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
@@ -1098,7 +1227,7 @@
         "border-radius:4px;margin-top:6px";
 
       const lblWrap = document.createElement("div");
-      lblWrap.style.cssText = "flex:1;min-width:0";
+      lblWrap.style.cssText = "flex:1;min-width:0;text-align:left";
       const lblTitulo = document.createElement("div");
       lblTitulo.textContent = "Finalizar construcción gratis";
       lblTitulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
@@ -1155,15 +1284,172 @@
       return fila;
     }
 
+    //—— Cartel CAPTCHA ———————————————————————————————————————————————————
+    //
+    //Aparece arriba del tab Recolección mientras el bot está esperando que
+    //el humano resuelva un CAPTCHA. Tres estados visuales:
+    //  - "pending"             rojo, botón "Ya resolví" deshabilitado o
+    //                          activo (depende de si el bridge ya detectó
+    //                          que el captcha del juego se limpió).
+    //  - "pending"+resueltoEnJuego: borde verde + badge "captcha del juego
+    //                          ya resuelto", botón resaltado.
+    //  - "timeout"             gris/error, sin botón "Ya resolví", solo
+    //                          texto: "Iniciá manualmente para nuevo ciclo".
+
+    function renderCartelCaptcha() {
+      const wrap = document.createElement("div");
+      const ctx = (core.getCaptchaContext && core.getCaptchaContext()) || {};
+      const state = (core.getCaptchaState && core.getCaptchaState()) || "pending";
+      const resueltoEnJuego = !!(core.isCaptchaResueltoEnJuego && core.isCaptchaResueltoEnJuego());
+
+      const esTimeout = state === "timeout";
+      const colorBorde = esTimeout ? "#7a8aa0" : (resueltoEnJuego ? "#27ae60" : "#e74c3c");
+      const colorFondo = esTimeout ? "#2a2f38" : (resueltoEnJuego ? "#1f3327" : "#3a1e1e");
+      wrap.style.cssText =
+        `border:2px solid ${colorBorde};background:${colorFondo};` +
+        "border-radius:6px;padding:14px 16px;margin-bottom:14px;" +
+        "box-shadow:0 2px 8px rgba(0,0,0,0.3)";
+
+      const titulo = document.createElement("div");
+      titulo.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:10px";
+      const icono = esTimeout ? "⏱" : "⚠";
+      titulo.innerHTML =
+        `<span style="font-size:22px">${icono}</span>` +
+        `<span style="font-size:14px;font-weight:bold;color:${colorBorde};letter-spacing:0.3px">` +
+        (esTimeout ? "CAPTCHA — TIMEOUT" : "CAPTCHA pendiente") +
+        `</span>`;
+
+      //Countdown del timeout (10 min). Solo en pending.
+      if (!esTimeout && ctx.deteccionTs) {
+        const restanteMs = Math.max(0, (ctx.deteccionTs + 10 * 60 * 1000) - Date.now());
+        const txt = document.createElement("span");
+        txt.style.cssText = "margin-left:auto;font-family:monospace;font-size:12px;color:#cdd5e0";
+        const m = Math.floor(restanteMs / 60000);
+        const s = Math.floor((restanteMs % 60000) / 1000);
+        txt.textContent = `timeout en ${m}:${String(s).padStart(2, "0")}`;
+        titulo.appendChild(txt);
+      }
+      wrap.appendChild(titulo);
+
+      if (esTimeout) {
+        const msg = document.createElement("div");
+        msg.style.cssText = "font-size:12.5px;color:#cdd5e0;line-height:1.5";
+        msg.textContent =
+          "Pasaron 10 minutos sin que se resuelva el CAPTCHA. El bot está detenido. " +
+          "Apretá Iniciar arriba para arrancar un ciclo nuevo (los cooldowns se respetan).";
+        wrap.appendChild(msg);
+        return wrap;
+      }
+
+      //Estado "pending" — info del fallo + botón "Ya resolví"
+      const cuerpo = document.createElement("div");
+      cuerpo.style.cssText = "display:flex;flex-direction:column;gap:10px";
+
+      //Línea 1: ciclo + ciudad/aldea que falló
+      if (ctx.ciclo != null && ctx.ciudad && ctx.aldea) {
+        const linea = document.createElement("div");
+        linea.style.cssText = "font-size:12.5px;color:#e6e9ee;line-height:1.5";
+        linea.innerHTML =
+          `<b>Ciclo #${ctx.ciclo}</b> · ` +
+          `Ciudad <b>${escapeHtml(ctx.ciudad.nombre)}</b> → ` +
+          `Aldea <b style="color:#f39c12">${escapeHtml(ctx.aldea.nombre)}</b> ` +
+          `<span style="color:#7a8aa0">(id ${ctx.aldea.id})</span>`;
+        cuerpo.appendChild(linea);
+      }
+
+      //Instrucción al usuario
+      const instr = document.createElement("div");
+      instr.style.cssText = "font-size:12px;color:#cdd5e0;line-height:1.5";
+      instr.innerHTML =
+        "Andá al juego, hacé click en <b>Recolectar</b> en cualquier aldea pendiente, " +
+        "resolvé el CAPTCHA del juego y volvé. Da igual qué aldea recolectes — el bot " +
+        "verifica el estado del server y completa lo que falte.";
+      cuerpo.appendChild(instr);
+
+      //Lista de pendientes (colapsada por default si son muchas)
+      if (ctx.pendientes && ctx.pendientes.length) {
+        const totalAldeas = ctx.pendientes.reduce((s, p) => s + (p.aldeas || []).length, 0);
+        const det = document.createElement("details");
+        det.style.cssText = "border:1px solid #2c3a4d;border-radius:4px;background:#1a232e;padding:6px 10px";
+        const sum = document.createElement("summary");
+        sum.style.cssText = "cursor:pointer;font-size:11.5px;color:#7a8aa0;font-weight:bold;letter-spacing:0.3px;outline:none";
+        sum.textContent = `Pendientes en cola (${totalAldeas} aldeas en ${ctx.pendientes.length} ciudades)`;
+        det.appendChild(sum);
+        const lista = document.createElement("div");
+        lista.style.cssText = "margin-top:8px;font-size:11.5px;line-height:1.6;color:#cdd5e0";
+        for (const p of ctx.pendientes) {
+          const l = document.createElement("div");
+          l.innerHTML =
+            `<b>${escapeHtml(p.ciudadNombre)}</b>: ` +
+            (p.aldeas || []).map((a) => escapeHtml(a.nombre)).join(", ");
+          lista.appendChild(l);
+        }
+        det.appendChild(lista);
+        cuerpo.appendChild(det);
+      }
+
+      //Badge "bridge: captcha ya resuelto en el juego"
+      if (resueltoEnJuego) {
+        const ok = document.createElement("div");
+        ok.style.cssText =
+          "background:rgba(39,174,96,0.15);border:1px solid #27ae60;" +
+          "border-radius:4px;padding:6px 10px;font-size:11.5px;color:#27ae60;font-weight:bold";
+        ok.innerHTML = "✓ El CAPTCHA del juego ya está resuelto. Apretá el botón para sincronizar y reanudar.";
+        cuerpo.appendChild(ok);
+      }
+
+      //Botón "Ya resolví"
+      const btn = document.createElement("button");
+      btn.textContent = resueltoEnJuego ? "✓ Ya resolví — sincronizar y reanudar" : "✓ Ya resolví el CAPTCHA";
+      btn.style.cssText =
+        `padding:10px 16px;background:${resueltoEnJuego ? "#27ae60" : "#3498db"};color:#fff;` +
+        "border:none;border-radius:4px;cursor:pointer;font-weight:bold;font-size:13px;" +
+        "letter-spacing:0.3px;transition:opacity 0.15s;align-self:flex-start";
+      btn.addEventListener("mouseenter", () => { btn.style.opacity = "0.85"; });
+      btn.addEventListener("mouseleave", () => { btn.style.opacity = "1"; });
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.style.opacity = "0.5";
+        btn.textContent = "Sincronizando…";
+        try {
+          await resolverCaptchaPorUsuario();
+        } catch (e) {
+          core.logError("recoleccion", "resolverCaptchaPorUsuario falló", e);
+          btn.disabled = false;
+          btn.style.opacity = "1";
+          btn.textContent = resueltoEnJuego ? "✓ Ya resolví — sincronizar y reanudar" : "✓ Ya resolví el CAPTCHA";
+        }
+      });
+      cuerpo.appendChild(btn);
+
+      wrap.appendChild(cuerpo);
+      return wrap;
+    }
+
     //—— Tab Recolección ——————————————————————————————————————————————————
 
     function renderTabRecoleccion(body) {
       body.innerHTML = "";
 
+      //Cartel CAPTCHA — pinned en el tope cuando hay captcha activo (o en
+      //timeout). Es la pieza más importante del tab mientras el bot está
+      //esperando al humano: dice qué pasó, qué aldea/ciudad disparó el
+      //captcha, cuántas aldeas quedaron en cola y cuánto falta para el
+      //timeout. Botón "Ya resolví" gatilla la sincronización del server.
+      if (core.isCaptchaActive && core.isCaptchaActive()) {
+        body.appendChild(renderCartelCaptcha());
+      }
+
       //Sección 1: ciclo en curso (si lo hay) — colapsable, abierto por default
       if (cicloActual) {
         body.appendChild(seccionColapsable(
-          `🍎  Ciclo #${cicloActual.n} en curso  ·  ${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciudades · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`,
+          headerCiclo({
+            icono: "↻",
+            color: "#f39c12",
+            titulo: `Ciclo #${cicloActual.n} en curso`,
+            ratio: `${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`,
+            //sin hora — no tiene sentido aún (no terminó)
+          }),
           uiColapso.ciclos.actual,
           (v) => uiColapso.ciclos.actual = v,
           () => renderResumenCiclo(cicloActual, true),
@@ -1179,7 +1465,14 @@
         const claims = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
         const completo = claims === total;
         body.appendChild(seccionColapsable(
-          `${completo ? "✓" : "✗"}  Último ciclo #${ultimoCiclo.n}  ·  ${claims}/${total} aldeas  ·  ${formatHoraCorta(ultimoCiclo.fin)} (${core.formatDuracion((ultimoCiclo.duracion || 0) / 1000)})`,
+          headerCiclo({
+            icono: completo ? "✓" : "✗",
+            color: completo ? "#27ae60" : "#e74c3c",
+            titulo: `Último ciclo #${ultimoCiclo.n}`,
+            ratio: `${claims}/${total} aldeas`,
+            hora: formatHoraCorta(ultimoCiclo.fin),
+            duracion: core.formatDuracion((ultimoCiclo.duracion || 0) / 1000),
+          }),
           uiColapso.ciclos.ultimo,
           (v) => uiColapso.ciclos.ultimo = v,
           () => renderResumenCiclo(ultimoCiclo, false),
@@ -1471,7 +1764,7 @@
       arrow.style.cssText = "margin-right:6px;color:#8a96a6;font-size:9px;width:10px";
       const txt = document.createElement("span");
       txt.innerHTML = headerTexto;
-      txt.style.cssText = "flex:1";
+      txt.style.cssText = "flex:1;text-align:left";
       header.appendChild(arrow);
       header.appendChild(txt);
       cont.appendChild(header);
@@ -1505,10 +1798,15 @@
           : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
         const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
         const completo = claims === total;
-        const headerTxt =
-          `${completo ? "✓" : "✗"}  Ciclo #${c.n}  ·  ${claims}/${total} aldeas  ·  ${formatHoraCorta(c.fin)} (${core.formatDuracion((c.duracion || 0) / 1000)})`;
         wrap.appendChild(seccionColapsable(
-          headerTxt,
+          headerCiclo({
+            icono: completo ? "✓" : "✗",
+            color: completo ? "#27ae60" : "#e74c3c",
+            titulo: `Ciclo #${c.n}`,
+            ratio: `${claims}/${total} aldeas`,
+            hora: formatHoraCorta(c.fin),
+            duracion: core.formatDuracion((c.duracion || 0) / 1000),
+          }),
           uiColapso.cicloPorN[c.n] === true,
           (v) => uiColapso.cicloPorN[c.n] = v,
           () => renderResumenCiclo(c, false),
@@ -1547,7 +1845,7 @@
 
         const nombre = document.createElement("span");
         nombre.textContent = c.nombre;
-        nombre.style.cssText = "flex:1;font-size:12px;color:#e6e9ee";
+        nombre.style.cssText = "flex:1;font-size:12px;color:#e6e9ee;text-align:left";
         fila.appendChild(nombre);
 
         const ratio = document.createElement("span");
@@ -1595,12 +1893,17 @@
         const color = !okEnUltimoCiclo ? "#7a8aa0"
           : claims >= esperado ? "#27ae60" : "#e74c3c";
         const ratioBadge = okEnUltimoCiclo
-          ? ` <span style="color:${color};font-weight:bold;background:${color}22;padding:1px 6px;border-radius:3px;font-size:10.5px">${claims}/${esperado}</span>`
+          ? `<span style="color:${color};font-weight:bold;background:${color}22;padding:1px 6px;border-radius:3px;font-size:10.5px">${claims}/${esperado}</span>`
           : "";
+        //Nombre + cantidad a la izquierda (flex:1), badge a la derecha.
         const headerTxt =
-          `<span style="color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad || ciudad.codigoCiudad)}</span>` +
-          ` <span style="color:#7a8aa0;font-size:10.5px">· ${aldeasOrden.length} aldeas</span>` +
-          ratioBadge;
+          `<div style="display:flex;align-items:center;width:100%;gap:8px">` +
+          `  <div style="flex:1;min-width:0">` +
+          `    <span style="color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad || ciudad.codigoCiudad)}</span>` +
+          `    <span style="color:#7a8aa0;font-size:10.5px;margin-left:6px">· ${aldeasOrden.length} aldeas</span>` +
+          `  </div>` +
+          `  ${ratioBadge}` +
+          `</div>`;
         const expandidoDefault = uiColapso.ciudades[ciudad.codigoCiudad] === true ||
           (ultimoCiclo && claims < esperado && uiColapso.ciudades[ciudad.codigoCiudad] !== false);
         wrap.appendChild(seccionColapsable(
@@ -1636,10 +1939,15 @@
         const desde = ultimaOk ? formatRelativo(ultimaOk.ts) : "—";
         const ultimaCualquiera = histo[histo.length - 1];
         const p = presentarStatus(ultimaCualquiera && ultimaCualquiera.status);
+        //Layout: status (badge) a la izquierda · nombre + hace-tiempo debajo
         const headerTxt =
-          `${escapeHtml(aldea.name || `id ${aldea.id}`)}` +
-          `  ·  <span style="color:#7a8aa0">hace</span> ${desde}` +
-          `  ·  <span style="color:${p.color}">${p.icono} ${p.label}</span>`;
+          `<div style="display:flex;align-items:center;gap:10px;width:100%">` +
+          `  <span style="color:${p.color};font-weight:bold;font-size:11px;min-width:62px;flex-shrink:0">${p.icono} ${escapeHtml(p.label)}</span>` +
+          `  <div style="flex:1;line-height:1.25;min-width:0">` +
+          `    <div style="color:#e6e9ee">${escapeHtml(aldea.name || `id ${aldea.id}`)}</div>` +
+          `    <div style="color:#7a8aa0;font-size:9.5px;margin-top:1px">hace ${escapeHtml(desde)}</div>` +
+          `  </div>` +
+          `</div>`;
         wrap.appendChild(seccionColapsable(
           headerTxt,
           uiColapso.aldeas[aldea.id] === true,
@@ -1752,6 +2060,148 @@
       void active;
     });
 
+    //Repintar UI cuando cambia el contexto del CAPTCHA — el bridge avisó
+    //"resueltoEnJuego" o el timeout disparó. La card del pulpo y el cartel
+    //grande del tab Recolección leen de core.getCaptchaContext / state.
+    if (core.onCaptchaContextChange) {
+      core.onCaptchaContextChange(() => {
+        actualizarEstadoCard();
+        const panel = document.getElementById("panelConfigJam");
+        if (panel && panel.style.display !== "none") {
+          actualizarHeaderPanel(panel);
+          if (tabActivo === "recoleccion") {
+            const body = panel.querySelector(".pcj-body");
+            if (body) renderTabRecoleccion(body);
+          }
+        }
+      });
+    }
+
+    //Si el CAPTCHA timeoutea (10 min sin click), pausar el bot. El próximo
+    //Iniciar arranca un ciclo limpio (recolectarRecursos resetea estado).
+    if (core.onCaptchaTimeout) {
+      core.onCaptchaTimeout(() => {
+        if (!core.isPaused()) core.setPaused(true);
+      });
+    }
+
+    //—— Sincronización post-CAPTCHA ——————————————————————————————————————
+    //
+    //Cuando el usuario aprieta "Ya resolví", refrescamos el estado real
+    //del server para detectar qué aldeas fue claimeando el humano mientras
+    //el bot estaba en pausa por CAPTCHA.
+    //
+    //Estrategia: cada aldea trae `loot` (timestamp Unix sec del próximo
+    //claim disponible). Si después del CAPTCHA `loot > now`, esa aldea
+    //tiene un cooldown vivo. Comparamos contra `lastClaimAtPorAldea`:
+    //  - si nuestro lastClaimAt + cooldown ≈ loot*1000  → ya la claimeó
+    //    el bot, el `loot` corresponde al claim que ya teníamos registrado.
+    //    No hacemos nada.
+    //  - si NO coinciden (o no teníamos lastClaimAt para esa aldea) →
+    //    el HUMANO la claimeó. Inferimos cuándo fue el claim a partir de
+    //    `loot` y el cooldown configurado, y seteamos lastClaimAtPorAldea.
+    //
+    //Eso sincroniza los "gaps" que pidió el usuario: si el humano claimeó
+    //3 aldeas con varios minutos de diferencia, cada una termina con su
+    //propio lastClaimAt correcto, y el próximo ciclo respeta cada cooldown
+    //sin pegarle al server antes de tiempo.
+
+    async function refrescarAldeasCiudad(codigoCiudad, islandId) {
+      try {
+        let res = await fetch(
+          `https://${world_id}.grepolis.com/game/island_info?town_id=${codigoCiudad}&action=index&h=${csrfToken}&json={"island_id":${islandId},"fetch_tmpl":1,"town_id":${codigoCiudad},"nl_init":true}`,
+          { method: "GET", headers: { "X-Requested-With": "XMLHttpRequest", accept: "text/plain, */*; q=0.01" } }
+        );
+        res = await res.json();
+        return (res && res.json && res.json.json && res.json.json.farm_town_list) || null;
+      } catch (e) {
+        core.logError("recoleccion", `refrescarAldeasCiudad falló (ciudad=${codigoCiudad})`, e);
+        return null;
+      }
+    }
+
+    /**
+     * Refresca cada ciudad del jugador y reconcilia `lastClaimAtPorAldea`
+     * con los `loot` actuales del server. Devuelve un resumen
+     * { humanoClaimeo: number, totalAldeas: number }.
+     */
+    async function sincronizarPostCaptcha() {
+      core.log("recoleccion", "sincronizando estado del server post-CAPTCHA…");
+      let humanoClaimeo = 0;
+      let totalAldeas = 0;
+      const ahoraSec = Math.floor(Date.now() / 1000);
+      //Margen de tolerancia para "matchea con un claim del bot ya
+      //registrado": ±90s cubre drift de reloj cliente/server, latencia, y
+      //jitter del setTimeout. Si la diferencia entre el loot inferido y el
+      //loot real es <90s, asumimos que es el mismo claim.
+      const TOLERANCIA_SEG = 90;
+      for (const ciudad of ciudadesConAldeas) {
+        const cfg = getConfigCiudad(ciudad.codigoCiudad);
+        const cooldownMs = cfg.minutos * 60 * 1000;
+        //Necesitamos islandId para refrescar — lo guardamos en
+        //ciudad.islandId si está; si no, salteamos esa ciudad.
+        const islandId = ciudad.islandId;
+        if (islandId == null) continue;
+        const aldeasFresco = await refrescarAldeasCiudad(ciudad.codigoCiudad, islandId);
+        if (!Array.isArray(aldeasFresco)) continue;
+        //Actualizar la lista en memoria con los loot nuevos.
+        ciudad.aldeas = aldeasFresco;
+        for (const a of aldeasFresco) {
+          totalAldeas += 1;
+          if (!a || !a.id || !a.loot) continue;
+          if (a.loot <= ahoraSec) continue; //sin cooldown vivo, no fue claimeada recientemente
+          const lootMs = a.loot * 1000;
+          const lastBot = lastClaimAtPorAldea[a.id] || 0;
+          const lootEsperadoBot = lastBot ? lastBot + cooldownMs : 0;
+          const diffSeg = Math.abs((lootMs - lootEsperadoBot) / 1000);
+          if (lastBot && diffSeg <= TOLERANCIA_SEG) {
+            //Coincide con el claim del bot — nada que hacer.
+            continue;
+          }
+          //Humano claimeó. Inferimos el ts del claim: loot - cooldown.
+          const claimInferidoMs = lootMs - cooldownMs;
+          lastClaimAtPorAldea[a.id] = claimInferidoMs;
+          humanoClaimeo += 1;
+          core.log(
+            "recoleccion",
+            `  ▸ ${ciudad.nombreCiudad || ciudad.codigoCiudad} ← ${a.name || `farm_${a.id}`} (id ${a.id}): claim del HUMANO hace ${core.formatDuracion((Date.now() - claimInferidoMs) / 1000)}`,
+            "ok"
+          );
+        }
+        await delayMs(200); //pequeño espaciado entre ciudades
+      }
+      guardarLastClaimAt();
+      core.log(
+        "recoleccion",
+        `sincronización OK · humano claimeó ${humanoClaimeo}/${totalAldeas} aldea(s)`,
+        "ok"
+      );
+      return { humanoClaimeo, totalAldeas };
+    }
+
+    /**
+     * Lo llama el botón "Ya resolví" del cartel. Hace la sincro y, si todo
+     * salió bien, cierra el estado de captcha en el core y reanuda el ciclo
+     * (tick inmediato con margen pequeño).
+     */
+    async function resolverCaptchaPorUsuario() {
+      if (!core.isCaptchaActive()) return;
+      try {
+        await sincronizarPostCaptcha();
+      } catch (e) {
+        core.logError("recoleccion", "sincronización post-CAPTCHA falló", e);
+        //Aun si la sincro falla, dejamos al usuario reanudar — quizá el
+        //humano claimeó manual y los próximos ciclos se autocorregirán.
+      }
+      core.onCaptchaResuelto();
+      //Tick inmediato (con jitter mínimo) para procesar lo que quedó del
+      //ciclo. recolectarRecursos chequea isPaused/isCaptchaActive al
+      //arranque, así que no hay riesgo de re-disparar si el captcha sigue.
+      if (!core.isPaused()) {
+        programarSiguienteTick(jitter(1500, 3000));
+      }
+    }
+
     //—— Bridge: pedir recursos actuales del Town cargado en MM ———————————
 
     function queryTownResources(townId) {
@@ -1851,6 +2301,10 @@
       const duracionCiclo = Date.now() - inicioCiclo;
 
       //Promover cicloActual → ciclos[] (FIFO, cap CICLOS_MAX) y persistir.
+      //Usamos la versión async + await porque si recargás la pestaña justo
+      //después de terminar un ciclo, queremos que el push esté en disco
+      //antes de seguir. Antes era fire-and-forget y se perdía el ciclo en
+      //la ventana de ~10-50ms hasta que chrome.storage.local.set completa.
       if (cicloActual) {
         cicloActual.fin = Date.now();
         cicloActual.duracion = duracionCiclo;
@@ -1858,12 +2312,26 @@
         ciclos.push(cicloActual);
         while (ciclos.length > CICLOS_MAX) ciclos.shift();
         cicloActual = null;
-        guardarHistorial();
+        await guardarHistorialAsync();
         actualizarIndicadorVivo();
       }
 
       //Si el usuario pausó durante el ciclo, no programamos el siguiente.
       if (core.isPaused()) return;
+
+      //CAPTCHA pendiente → NO programamos siguiente tick. El bot queda
+      //esperando al humano; cuando aprieta "Ya resolví" la sincronización
+      //llama a programarSiguienteTick(0) para retomar el ciclo. Si pasan
+      //10 min sin click, el listener de onCaptchaTimeout pausa todo.
+      if (core.isCaptchaActive()) {
+        core.log(
+          "recoleccion",
+          `ciclo #${nCiclo} interrumpido por CAPTCHA · duró ${core.formatDuracion(duracionCiclo / 1000)} · esperando al humano`,
+          "warn"
+        );
+        actualizarEstadoCard();
+        return;
+      }
 
       //Compensación de duración del ciclo: el siguiente tick se programa
       //para que el INICIO del ciclo siguiente caiga (en promedio) a
@@ -1881,40 +2349,35 @@
       //y al principio del N+1), el server rechaza el claim y el bot lo
       //interpreta como CAPTCHA falso. El margen mínimo de 3s cubre eso.
       const baseMs = tiempoCicloMinutos() * 60 * 1000;
-      let tiempoEspera;
-      if (core.isCaptchaActive()) {
-        tiempoEspera = 30 * 1000;
-      } else {
-        //Espera estándar: el próximo ciclo arranca al MISMO instante que
-        //el actual + baseMs (compensa duracionCiclo + jitter anti-bot).
-        const esperaNormal = baseMs - duracionCiclo + jitter(3 * 1000, 30 * 1000);
-        let esperaAjustada = esperaNormal;
-        //Si en este ciclo hubo aldeas saltadas por cooldown y la próxima
-        //se libera ANTES del próximo tick normal (típicamente porque el
-        //ciclo arrancó tras un reload con cooldown a medias), adelantamos
-        //el siguiente tick para no perder yield. +5s coincide con el
-        //margen que usa cooldownMs (Fase 2) — pegamos al server justo
-        //después de que libera.
-        if (stats && isFinite(stats.proximaLiberacionSeg)) {
-          const esperaServer = stats.proximaLiberacionSeg * 1000 + 5_000;
-          if (esperaServer < esperaAjustada) {
-            core.log(
-              "recoleccion",
-              `próxima aldea libre en ${core.formatDuracion(stats.proximaLiberacionSeg)} — adelantando próximo ciclo (en vez de esperar ${core.formatDuracion(esperaNormal / 1000)})`,
-              "ok"
-            );
-            esperaAjustada = esperaServer;
-          }
+      //Espera estándar: el próximo ciclo arranca al MISMO instante que
+      //el actual + baseMs (compensa duracionCiclo + jitter anti-bot).
+      const esperaNormal = baseMs - duracionCiclo + jitter(3 * 1000, 30 * 1000);
+      let esperaAjustada = esperaNormal;
+      //Si en este ciclo hubo aldeas saltadas por cooldown y la próxima
+      //se libera ANTES del próximo tick normal (típicamente porque el
+      //ciclo arrancó tras un reload con cooldown a medias), adelantamos
+      //el siguiente tick para no perder yield. +5s coincide con el
+      //margen que usa cooldownMs (Fase 2) — pegamos al server justo
+      //después de que libera.
+      if (stats && isFinite(stats.proximaLiberacionSeg)) {
+        const esperaServer = stats.proximaLiberacionSeg * 1000 + 5_000;
+        if (esperaServer < esperaAjustada) {
+          core.log(
+            "recoleccion",
+            `próxima aldea libre en ${core.formatDuracion(stats.proximaLiberacionSeg)} — adelantando próximo ciclo (en vez de esperar ${core.formatDuracion(esperaNormal / 1000)})`,
+            "ok"
+          );
+          esperaAjustada = esperaServer;
         }
-        //Piso 30s: si la próxima aldea está libre en <30s no tickeamos
-        //inmediato — damos margen para que el server termine de procesar
-        //el último claim y para no spammear si hay timing extraño.
-        tiempoEspera = Math.max(30 * 1000, esperaAjustada);
       }
+      //Piso 30s: si la próxima aldea está libre en <30s no tickeamos
+      //inmediato — damos margen para que el server termine de procesar
+      //el último claim y para no spammear si hay timing extraño.
+      const tiempoEspera = Math.max(30 * 1000, esperaAjustada);
 
       core.log(
         "recoleccion",
-        `ciclo #${nCiclo} OK · duró ${core.formatDuracion(duracionCiclo / 1000)} · próximo en ${core.formatDuracion(tiempoEspera / 1000)}${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`,
+        `ciclo #${nCiclo} OK · duró ${core.formatDuracion(duracionCiclo / 1000)} · próximo en ${core.formatDuracion(tiempoEspera / 1000)}`,
         "ok"
       );
 
@@ -1976,12 +2439,15 @@
       //recolectarCiudad cuando hay aldeas saltadas por cooldown. Lo usamos
       //al final para reprogramar el próximo tick si es antes del intervalo
       //normal — evita perder yield después de un reload.
-      const cicloState = { probeCaptchaUsado: false, proximaLiberacionSeg: Infinity };
+      const cicloState = { proximaLiberacionSeg: Infinity };
       //Lista de aldeas para reintentar al final del ciclo. Se popula en
       //recolectarCiudad cuando el server rechaza (success:false) o el fetch
       //tira un error transitorio (timeout, abort, network).
       const pendientes = [];
-      for (const ciudad of ciudadesOrdenadas) {
+      let abortedByCaptcha = false;
+      let idxCiudadActual = 0;
+      for (idxCiudadActual = 0; idxCiudadActual < ciudadesOrdenadas.length; idxCiudadActual++) {
+        const ciudad = ciudadesOrdenadas[idxCiudadActual];
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
         acumuladoCiclo[ciudad.codigoCiudad] = { wood: 0, stone: 0, iron: 0, claims: 0 };
         //Banner azul por ciudad — mismo formato que el banner de ciclo pero
@@ -2001,9 +2467,47 @@
           pendientes
         );
         if (core.isCaptchaActive()) {
-          core.logWarn("recoleccion", "CAPTCHA activo — abortando ciclo");
+          abortedByCaptcha = true;
+          core.logWarn("recoleccion", "CAPTCHA activo — bot detenido, esperando al humano");
           break;
         }
+      }
+
+      //Si se abortó por CAPTCHA, mergear al contexto del core las ciudades
+      //que NO llegamos a procesar + las aldeas no claimeadas de la ciudad
+      //parcial actual. La sincronización post-resolver va a refrescar TODAS
+      //las ciudades del jugador igual, así que esto es sobre todo para que
+      //el cartel muestre cuántas aldeas quedaron en cola.
+      if (abortedByCaptcha) {
+        const pend = [];
+        const ahora = Date.now();
+        for (let i = idxCiudadActual; i < ciudadesOrdenadas.length; i++) {
+          const c = ciudadesOrdenadas[i];
+          const cfg = getConfigCiudad(c.codigoCiudad);
+          const cooldownMs = cfg.minutos * 60 * 1000;
+          //Filtrar las aldeas ya claimeadas en este ciclo (lastClaimAt
+          //reciente). En la ciudad parcial actual hay aldeas que ya se
+          //procesaron antes de la que disparó el captcha — no queremos
+          //que aparezcan como "pendientes" en el cartel.
+          const aldeasNoClaimeadas = (c.aldeas || []).filter((a) => {
+            const last = lastClaimAtPorAldea[a.id] || 0;
+            return last === 0 || (ahora - last) >= cooldownMs;
+          }).map((a) => ({
+            id: a.id,
+            nombre: a.name || `farm_${a.id}`,
+          }));
+          if (aldeasNoClaimeadas.length) {
+            pend.push({
+              ciudadId: c.codigoCiudad,
+              ciudadNombre: c.nombreCiudad || c.codigoCiudad,
+              aldeas: aldeasNoClaimeadas,
+            });
+          }
+        }
+        //Llamar al core con ctx solo para mergear `pendientes` — captcha ya
+        //está activo, así que el flujo "ya estábamos en pending" hace merge
+        //sin reiniciar timeout.
+        core.onCaptchaDetectado({ feature: "recoleccion", ciclo: nCiclo, pendientes: pend });
       }
 
       //Retry diferido — máx 3 intentos por aldea (1 inicial + 2 reintentos),
@@ -2140,32 +2644,26 @@
         }
 
         if (last > 0 && transcurrido < cooldownMs) {
-          //Cuando estamos en modo CAPTCHA y todas las aldeas están en
-          //cooldown, sin probe el bot quedaría atascado: nunca claim →
-          //nunca detecta resolución. Forzamos UN probe por ciclo (a nivel
-          //global, compartido entre ciudades vía cicloState). Si el probe
-          //sale OK (Town presente), recolectarAldea llama a
-          //onCaptchaResuelto y el ciclo continúa normal.
-          if (core.isCaptchaActive() && !cicloState.probeCaptchaUsado) {
-            cicloState.probeCaptchaUsado = true;
-            core.log(
-              "recoleccion",
-              `aldea ${aldea.id} (${ciudad.nombreCiudad || ciudad.codigoCiudad}): probe de CAPTCHA (cooldown ignorado)`
-            );
-            //cae al procesamiento normal abajo
-          } else {
-            saltadasPorCooldown += 1;
-            const restante = Math.round((cooldownMs - transcurrido) / 1000);
-            if (restante < restanteMinSeg) restanteMinSeg = restante;
-            registrarClaim({
-              aldeaId: aldea.id, ciudadId: ciudad.codigoCiudad,
-              ciudadNombre: ciudad.nombreCiudad || ciudad.codigoCiudad,
-              aldeaNombre: aldea.name || `farm_${aldea.id}`,
-              ciclo: nCiclo, status: "saltada-cooldown",
-              esperaSeg: restante,
-            });
-            continue;
-          }
+          //Antes había un "probe forzado" cuando captcha activo: una aldea
+          //en cooldown se claimeaba igual para detectar si el captcha se
+          //resolvió. Eso generaba un bucle: el probe disparaba un nuevo
+          //CAPTCHA cada 30s y el ciclo se reabortaba.
+          //
+          //Nuevo flujo (post-rediseño): ya no hay probes. Cuando se detecta
+          //CAPTCHA el bot queda esperando al humano (cartel + botón "Ya
+          //resolví"). La sincronización post-resolver refresca el server y
+          //continúa el ciclo. Acá simplemente respetamos el cooldown.
+          saltadasPorCooldown += 1;
+          const restante = Math.round((cooldownMs - transcurrido) / 1000);
+          if (restante < restanteMinSeg) restanteMinSeg = restante;
+          registrarClaim({
+            aldeaId: aldea.id, ciudadId: ciudad.codigoCiudad,
+            ciudadNombre: ciudad.nombreCiudad || ciudad.codigoCiudad,
+            aldeaNombre: aldea.name || `farm_${aldea.id}`,
+            ciclo: nCiclo, status: "saltada-cooldown",
+            esperaSeg: restante,
+          });
+          continue;
         }
 
         try {
@@ -2306,21 +2804,63 @@
       response = await response.json();
 
       if (!response.json["success"]) {
+        //Extraer mensaje de error de los varios campos posibles donde el
+        //server lo puede poner (Grepolis no es consistente).
+        const r = response.json || {};
+        const errorMsg =
+          (r.errors && r.errors[0]) ||
+          r.error_msg ||
+          (r.response && r.response.error) ||
+          "success=false";
+
+        //Detectar específicamente "Tu petición no está lista aún." (o el
+        //equivalente en otros idiomas) — eso significa que el server
+        //tiene cooldown vivo. Causas típicas:
+        //  - claim manual del usuario que el bot no registró
+        //  - cooldown server más largo del configurado (ciudad con
+        //    Lealtad de los aldeanos pero config en 5min)
+        //  - drift de reloj cliente/server
+        //En cualquier caso lo correcto es ASUMIR que la aldea acaba de
+        //ser claimeada (lastClaimAtPorAldea = ahora) y NO entrar al
+        //retry loop. Antes el bot mandaba 3× requests inútiles en 30s.
+        const esCooldownServer = typeof errorMsg === "string" &&
+          /no est[áa] lista|not ready|cooldown|already claim/i.test(errorMsg);
+
+        if (esCooldownServer) {
+          core.logWarn(
+            "recoleccion",
+            `aldea ${farmTownId} (${ciudadNombreSafe}): server reporta cooldown vivo ("${errorMsg}") — aprendiendo, no reintentar este ciclo`
+          );
+          //Tratar como recién claimeada — el próximo ciclo respeta el
+          //cooldownMs completo desde ahora sin volver a pegarle al server.
+          lastClaimAtPorAldea[farmTownId] = Date.now();
+          guardarLastClaimAt();
+          registrarClaim({
+            aldeaId: farmTownId, ciudadId: codigoCiudad,
+            ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
+            ciclo: nCiclo, status: "descartar",
+            errorMsg: `cooldown server: ${errorMsg}`,
+          });
+          return { status: "descartar" };
+        }
+
+        //Otros errores (rate limit transitorio, etc): retry diferido como
+        //antes — vale la pena darle otra chance.
         core.logWarn(
           "recoleccion",
           `aldea ${farmTownId} (${ciudadNombreSafe}): server respondió success=false`,
           {
-            errors: response.json.errors,
-            error_msg: response.json.error_msg,
-            notifications: response.json.notifications,
-            response: response.json,
+            errors: r.errors,
+            error_msg: r.error_msg,
+            notifications: r.notifications,
+            response: r,
           }
         );
         registrarClaim({
           aldeaId: farmTownId, ciudadId: codigoCiudad,
           ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
           ciclo: nCiclo, status: "reintentar",
-          errorMsg: (response.json && response.json.error_msg) || "success=false",
+          errorMsg,
         });
         return { status: "reintentar" };
       }
@@ -2341,19 +2881,41 @@
           `sin notificación 'Town' para aldea ${farmTownId} — probable CAPTCHA`,
           response.json.notifications
         );
-        core.onCaptchaDetectado();
+        //Pasamos contexto al core: quién falló + ciclo. Las pendientes
+        //(aldeas no procesadas del ciclo) se mergean en recolectarCiudad y
+        //recolectarCiudades cuando ven que rompimos el loop por captcha.
+        core.onCaptchaDetectado({
+          feature: "recoleccion",
+          ciclo: nCiclo,
+          ciudad: { id: codigoCiudad, nombre: ciudadNombreSafe },
+          aldea: { id: farmTownId, nombre: aldeaNombreSafe },
+        });
         registrarClaim({
           aldeaId: farmTownId, ciudadId: codigoCiudad,
           ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
           ciclo: nCiclo, status: "descartar",
           errorMsg: "sin Town notification (probable CAPTCHA)",
         });
-        //CAPTCHA → descartar (no reintentar este ciclo). El probe del
-        //próximo ciclo se encargará de detectar si se resolvió.
+        //CAPTCHA → descartar (no reintentar este ciclo). El bot queda
+        //esperando al humano (cartel + botón "Ya resolví" en la UI).
         return { status: "descartar" };
       }
 
-      if (core.isCaptchaActive()) core.onCaptchaResuelto();
+      //NO disparamos onCaptchaResuelto desde acá. El usuario tiene control
+      //explícito vía el botón "Ya resolví" en la UI: ahí se hace la
+      //sincronización del estado del server. Reanudar solo porque un fetch
+      //salió OK sería ruido (y quitaría al usuario el control que pidió).
+
+      //Refresca el ícono "disponible" sobre la aldea en el mapa de isla.
+      //El response no trae notification de FarmTownPlayerRelation, así que
+      //sin esto el ícono verde se queda visible hasta el próximo cambio de
+      //ciudad. El bridge reinicia lootable_at/last_looted_at del modelo y
+      //Backbone re-renderea la vista.
+      window.dispatchEvent(
+        new CustomEvent("JamBot:markFarmTownClaimed", {
+          detail: { relationId },
+        })
+      );
 
       const town = JSON.parse(townNotification.param_str)["Town"];
       const { storage, last_wood, last_iron, last_stone, resources } = town;
@@ -2510,6 +3072,10 @@
         ciudadesConAldeas.push({
           codigoCiudad: ciudad.id,
           nombreCiudad: ciudad.name,
+          //islandId: lo necesitamos para refrescar las aldeas vía
+          //island_info en la sincronización post-CAPTCHA (sin esto,
+          //tendríamos que rehacer obtenerCiudadesConAldeas completo).
+          islandId: ciudad.island_id,
           aldeas: aldeasCiudad,
         });
 

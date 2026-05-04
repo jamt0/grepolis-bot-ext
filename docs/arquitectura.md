@@ -97,7 +97,7 @@ El content-script vive en un **world aislado** (no comparte `window` con la pág
   - Hace `model.set(subjectData)` sobre los modelos Backbone correspondientes — la UI del juego se refresca sola.
 - **Vigila CAPTCHA** con polling de `Game.bot_check` cada 2s:
   - Si cambia, dispara `window.postMessage({type: "JamBot:captchaState", active})`.
-  - Lo escucha `core.js` → `onCaptchaDetectado()` / `onCaptchaResuelto()`.
+  - Lo escucha `core.js`: `active=true` → `onCaptchaDetectado()` (sin contexto, fallback). `active=false` → `notificarCaptchaLimpioEnJuego()` (NO reanuda — solo pinta el cartel de verde para resaltar el botón "Ya resolví"; el usuario tiene control explícito).
 
 ---
 
@@ -110,7 +110,9 @@ window.JamBot = {
   core: {                  // poblado por core.js
     init,
     log, logWarn, logError, logCiclo,
-    isCaptchaActive, onCaptcha, onCaptchaDetectado, onCaptchaResuelto,
+    isCaptchaActive, getCaptchaState, getCaptchaContext, isCaptchaResueltoEnJuego,
+    onCaptcha, onCaptchaContextChange, onCaptchaTimeout,
+    onCaptchaDetectado, onCaptchaResuelto,
     isPaused, onPlayPauseChange, setPaused, togglePlayPause,
     registrarBoton, formatDuracion, delaySeconds,
     getErrores, clearErrores,

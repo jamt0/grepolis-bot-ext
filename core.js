@@ -207,6 +207,32 @@
     console.groupEnd();
   }
 
+  //—— Detección de contexto invalidado ————————————————————————————————
+  //
+  //Cuando la extensión se recarga (chrome://extensions reload, auto-update,
+  //disable/enable) mientras una pestaña con content script viejo sigue
+  //abierta, el content script queda huérfano: cada chrome.storage.* tira
+  //"Extension context invalidated". El bot sigue corriendo en memoria pero
+  //nada se persiste — y peor, cada operación del loop (1 historial + 1
+  //lastClaimAt por aldea) spamea warnings. Esta función detecta el caso una
+  //sola vez, loggea un error claro pidiendo recargar la pestaña, y pausa el
+  //bot para que el ciclo termine limpio. Llamarla como guard antes de
+  //cualquier chrome.storage.* en hot paths.
+  let extInvalidNotificado = false;
+
+  function isExtensionContextValid() {
+    let valid = false;
+    try { valid = !!(chrome && chrome.runtime && chrome.runtime.id); } catch (_) { valid = false; }
+    if (!valid && !extInvalidNotificado) {
+      extInvalidNotificado = true;
+      //logError persiste en chrome.storage también, pero su set() está en
+      //try/catch silencioso — no genera warning extra.
+      logError("core", "extensión recargada — recargá la pestaña del juego (F5) para continuar");
+      try { setPaused(true); } catch (_) { /* no debería tirar, defensivo */ }
+    }
+    return valid;
+  }
+
   //Captura errores no manejados y unhandled promise rejections. Filtra por
   //URL del archivo: solo registra los que vienen de la propia extensión, así
   //no nos contaminamos con errores del juego (game.min.js, jquery, etc).
@@ -229,17 +255,67 @@
   }
 
   //—— Estado de CAPTCHA ——————————————————————————————————————————————————
+  //
+  //Flujo (post-rediseño): cuando una request del bot vuelve sin la
+  //notificación esperada, asumimos CAPTCHA y entramos en modo "pending":
+  //paramos TODO (no programamos siguiente tick), guardamos el contexto
+  //(qué aldea falló, qué quedó pendiente del ciclo), arrancamos un timeout
+  //de 10 min y mostramos el cartel + botón "Ya resolví" en la UI.
+  //
+  //El bridge sigue avisando cuando Game.bot_check vuelve a null (humano
+  //resolvió en el juego) — ese evento NO reanuda el bot solo; únicamente
+  //prende el flag `resueltoEnJuego` para que la UI resalte el botón. El
+  //usuario tiene que apretar "Ya resolví" explícitamente: ahí la feature
+  //hace la sincronización (refresh del server, detectar qué aldeas claimeó
+  //el humano) y reanuda. Si el humano nunca apreta y pasan 10 min, entramos
+  //en estado "timeout" — el bot se pausa de hecho y un nuevo Iniciar
+  //arranca un ciclo limpio.
+  //
+  //Estados:
+  //   "none"    sin captcha
+  //   "pending" detectado, esperando que el humano resuelva + click
+  //   "timeout" pasaron 10 min sin click — bot detenido, cartel de error
+
+  const CAPTCHA_TIMEOUT_MS = 10 * 60 * 1000;
 
   let captchaActive = false;
-  const captchaListeners = new Set(); //fn(active: bool)
+  let captchaState = "none";
+  let captchaContext = null;       //{ feature, ciclo, ciudad, aldea, pendientes:[{ciudadId,ciudadNombre,aldeas:[{id,nombre}]}], deteccionTs }
+  let captchaResueltoEnJuego = false; //true cuando el bridge avisó active:false
+  let captchaTimeoutId = null;
+  const captchaListeners = new Set();        //fn(active: bool)
+  const captchaContextListeners = new Set(); //fn() — UI pinta de nuevo
+  const captchaTimeoutListeners = new Set(); //fn() — feature pausa
 
   function isCaptchaActive() {
     return captchaActive;
   }
 
+  function getCaptchaState() {
+    return captchaState;
+  }
+
+  function getCaptchaContext() {
+    return captchaContext;
+  }
+
+  function isCaptchaResueltoEnJuego() {
+    return captchaResueltoEnJuego;
+  }
+
   function onCaptcha(listener) {
     captchaListeners.add(listener);
     return () => captchaListeners.delete(listener);
+  }
+
+  function onCaptchaContextChange(listener) {
+    captchaContextListeners.add(listener);
+    return () => captchaContextListeners.delete(listener);
+  }
+
+  function onCaptchaTimeout(listener) {
+    captchaTimeoutListeners.add(listener);
+    return () => captchaTimeoutListeners.delete(listener);
   }
 
   function emitCaptchaChange(active) {
@@ -248,23 +324,111 @@
     }
   }
 
-  function onCaptchaDetectado() {
-    if (captchaActive) return;
-    captchaActive = true;
-    logWarn("core", "CAPTCHA detectado — el ciclo seguirá con probes cada 30s");
-    iniciarFlashTitulo();
-    sonarAlerta();
-    chrome.runtime.sendMessage({ type: "JamBot:badge", text: "!", color: "#c0392b" });
-    emitCaptchaChange(true);
+  function emitCaptchaContextChange() {
+    for (const fn of captchaContextListeners) {
+      try { fn(); } catch (e) { logError("core", "listener captchaContext falló", e); }
+    }
+  }
+
+  function emitCaptchaTimeout() {
+    for (const fn of captchaTimeoutListeners) {
+      try { fn(); } catch (e) { logError("core", "listener captchaTimeout falló", e); }
+    }
+  }
+
+  /**
+   * Marca CAPTCHA detectado con el contexto del fallo. `ctx` es opcional
+   * pero recomendado:
+   *   { feature, ciclo, ciudad:{id,nombre}, aldea:{id,nombre},
+   *     pendientes:[{ciudadId, ciudadNombre, aldeas:[{id,nombre}]}] }
+   * Si ya estábamos en estado pending y se vuelve a llamar (e.g. otra aldea
+   * más adelante también falló), mergeamos el contexto pero NO reseteamos
+   * el timeout — sigue contando desde la primera detección.
+   */
+  function onCaptchaDetectado(ctx) {
+    const ahora = Date.now();
+    if (!captchaActive) {
+      captchaActive = true;
+      captchaState = "pending";
+      captchaResueltoEnJuego = false;
+      captchaContext = ctx ? { ...ctx, deteccionTs: ahora } : { deteccionTs: ahora };
+      logWarn(
+        "core",
+        `CAPTCHA detectado — bot detenido, esperando al humano (timeout ${Math.round(CAPTCHA_TIMEOUT_MS/60000)}min)`
+      );
+      iniciarFlashTitulo();
+      sonarAlerta();
+      try { chrome.runtime.sendMessage({ type: "JamBot:badge", text: "!", color: "#c0392b" }); } catch (_) { /* page-context */ }
+      //Timeout 10min — si el humano no apreta "Ya resolví", entramos en
+      //estado "timeout": el cartel cambia a error, las features se pausan,
+      //el siguiente Iniciar arranca un ciclo limpio.
+      if (captchaTimeoutId) clearTimeout(captchaTimeoutId);
+      captchaTimeoutId = setTimeout(() => {
+        captchaTimeoutId = null;
+        if (captchaState !== "pending") return;
+        captchaState = "timeout";
+        logError("core", `CAPTCHA timeout — pasaron ${Math.round(CAPTCHA_TIMEOUT_MS/60000)}min sin resolver, bot detenido`);
+        emitCaptchaTimeout();
+        emitCaptchaContextChange();
+      }, CAPTCHA_TIMEOUT_MS);
+      emitCaptchaChange(true);
+      emitCaptchaContextChange();
+    } else if (ctx) {
+      //Ya estábamos en pending; mergear el nuevo contexto (otra aldea
+      //también cayó). No tocamos timeout ni deteccionTs — siguen del primer
+      //disparo.
+      captchaContext = mergeCaptchaContext(captchaContext, ctx);
+      emitCaptchaContextChange();
+    }
+  }
+
+  function mergeCaptchaContext(prev, nuevo) {
+    if (!prev) return { ...nuevo, deteccionTs: Date.now() };
+    const merged = { ...prev, ...nuevo, deteccionTs: prev.deteccionTs };
+    //Mergear listas de pendientes por ciudadId — sin duplicar aldeas.
+    const porCiudad = new Map();
+    for (const p of prev.pendientes || []) porCiudad.set(p.ciudadId, { ...p, aldeas: [...(p.aldeas || [])] });
+    for (const p of nuevo.pendientes || []) {
+      const ya = porCiudad.get(p.ciudadId);
+      if (!ya) {
+        porCiudad.set(p.ciudadId, { ...p, aldeas: [...(p.aldeas || [])] });
+      } else {
+        const idsExistentes = new Set(ya.aldeas.map((a) => a.id));
+        for (const a of p.aldeas || []) if (!idsExistentes.has(a.id)) ya.aldeas.push(a);
+      }
+    }
+    merged.pendientes = Array.from(porCiudad.values());
+    return merged;
   }
 
   function onCaptchaResuelto() {
     if (!captchaActive) return;
     captchaActive = false;
+    captchaState = "none";
+    captchaContext = null;
+    captchaResueltoEnJuego = false;
+    if (captchaTimeoutId) {
+      clearTimeout(captchaTimeoutId);
+      captchaTimeoutId = null;
+    }
     log("core", "CAPTCHA resuelto — operación normal", "ok");
     pararFlashTitulo();
-    chrome.runtime.sendMessage({ type: "JamBot:badge", text: "" });
+    try { chrome.runtime.sendMessage({ type: "JamBot:badge", text: "" }); } catch (_) { /* page-context */ }
     emitCaptchaChange(false);
+    emitCaptchaContextChange();
+  }
+
+  /**
+   * Lo llama el bridge cuando Game.bot_check vuelve a null. NO reanuda el
+   * bot — solo prende un flag para que el cartel resalte el botón "Ya
+   * resolví". El usuario tiene control explícito sobre cuándo reanudar.
+   */
+  function notificarCaptchaLimpioEnJuego() {
+    if (!captchaActive) return;
+    if (captchaResueltoEnJuego) return;
+    captchaResueltoEnJuego = true;
+    log("core", "bridge: Game.bot_check limpio — esperando confirmación del usuario", "ok");
+    emitCaptchaContextChange();
   }
 
   //—— Estado de play/pause global ———————————————————————————————————————
@@ -363,10 +527,12 @@
     //z-index bajo (5) para que NUNCA quede encima de modales del juego —
     //antes estaba en 1000 y los clicks dirigidos al chat/foro/mensajería
     //a veces aterrizaban en el botón ▶/⏸ y pausaban el bot sin querer.
-    //Position bottom:90px → los botones quedan justo encima del pulpo
-    //(ícono de selector de unidades en la esquina inferior izquierda).
+    //Position bottom:45px;left:80px → la card queda alineada con el pulpo
+    //(esquina inferior izquierda), justo a la derecha del pulpo y el ícono
+    //de mute, sin taparlos. El bottom de 45px deja libre la barra "Resumen"
+    //que el juego puede mostrar pegada al borde inferior.
     cont.style.cssText =
-      "position:absolute;bottom:90px;left:10px;z-index:5;" +
+      "position:absolute;bottom:45px;left:80px;z-index:5;" +
       "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
     document.body.appendChild(cont);
     return cont;
@@ -429,13 +595,20 @@
     }
     log("core", `bootstrap world=${world_id} town=${townId} player=${player_id}`, "ok");
 
-    //Escuchar el bridge para detectar cambios de bot_check
+    //Escuchar el bridge para detectar cambios de bot_check.
+    //  active=true  → onCaptchaDetectado() sin contexto (la feature que
+    //                 estaba haciendo la request es la que tiene que
+    //                 enriquecer el contexto via su propio onCaptchaDetectado
+    //                 — la detección por bridge es un fallback).
+    //  active=false → NO reanudar; solo prender flag "resueltoEnJuego" para
+    //                 que la UI resalte el botón "Ya resolví". El usuario
+    //                 sigue teniendo que apretar para gatillar la sincro.
     window.addEventListener("message", (e) => {
       if (e.source !== window) return;
       const msg = e.data;
       if (!msg || msg.type !== "JamBot:captchaState") return;
       if (msg.active) onCaptchaDetectado();
-      else onCaptchaResuelto();
+      else notificarCaptchaLimpioEnJuego();
     });
 
     return {
@@ -443,7 +616,12 @@
       game: { csrfToken, world_id, townId, player_id },
       core: {
         isCaptchaActive,
+        getCaptchaState,
+        getCaptchaContext,
+        isCaptchaResueltoEnJuego,
         onCaptcha,
+        onCaptchaContextChange,
+        onCaptchaTimeout,
         onCaptchaDetectado,
         onCaptchaResuelto,
         registrarBoton,
@@ -453,6 +631,7 @@
         onPlayPauseChange,
         setPaused,
         togglePlayPause,
+        isExtensionContextValid,
         log,
         logWarn,
         logError,
@@ -464,7 +643,12 @@
   JamBot.core = {
     init,
     isCaptchaActive,
+    getCaptchaState,
+    getCaptchaContext,
+    isCaptchaResueltoEnJuego,
     onCaptcha,
+    onCaptchaContextChange,
+    onCaptchaTimeout,
     onCaptchaDetectado,
     onCaptchaResuelto,
     registrarBoton,
@@ -474,6 +658,7 @@
     onPlayPauseChange,
     setPaused,
     togglePlayPause,
+    isExtensionContextValid,
     log,
     logWarn,
     logError,

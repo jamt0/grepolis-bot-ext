@@ -56,6 +56,38 @@
   });
 
   /**
+   * Marca una FarmTownPlayerRelation como recién claimeada y reinicia su
+   * cooldown visual. El response del endpoint de claim no incluye una
+   * notification para este modelo, así que el ícono verde de "disponible"
+   * sobre la aldea quedaba visible hasta que el jugador cambiara de ciudad
+   * (eso reinyecta las relaciones desde island_info). Acá replicamos ese
+   * efecto seteando lootable_at / last_looted_at — Backbone dispara `change`
+   * y la vista del mapa se re-renderea sola.
+   *
+   * El cooldown se infiere del propio modelo (lootable_at - last_looted_at),
+   * que es estable por ciudad (5 o 10 min). Así el bridge no tiene que
+   * conocer la config del bot.
+   */
+  window.addEventListener("JamBot:markFarmTownClaimed", function (e) {
+    const relationId = e && e.detail && e.detail.relationId;
+    if (relationId == null) return;
+    if (!window.MM || typeof window.MM.getModels !== "function") return;
+    const rels = window.MM.getModels().FarmTownPlayerRelation;
+    if (!rels) return;
+    const rel = rels[relationId] || rels[String(relationId)];
+    if (!rel || typeof rel.set !== "function") return;
+    const a = rel.attributes || {};
+    const cooldown = (a.lootable_at || 0) - (a.last_looted_at || 0);
+    if (cooldown <= 0) return;
+    const nowSec = Math.floor(Date.now() / 1000);
+    rel.set({
+      last_looted_at: nowSec,
+      lootable_at: nowSec + cooldown,
+      updated_at: nowSec,
+    });
+  });
+
+  /**
    * Permite al content script preguntar los recursos actuales de un Town
    * cargado en MM. Útil para refrescar el baseline del diff al inicio de
    * cada ciclo y evitar que el primer claim arrastre 5 minutos de

@@ -149,8 +149,10 @@ Estos NO traen `filename`. Los registramos todos sin filtrar — son raros y sie
 ## 7. Otros usos del log en `core.js`
 
 - `setPaused(true|false)` → `core.log("core", "PAUSADO" | "REANUDADO")`. Además dispara un `console.trace` para que en DevTools puedas ver de dónde vino el cambio (útil cuando "el bot se pausa solo" — el stack te dice si fue un click humano o algo programático).
-- `onCaptchaDetectado()` → `logWarn("core", "CAPTCHA detectado — el ciclo seguirá con probes cada 30s")`.
+- `onCaptchaDetectado(ctx)` → `logWarn("core", "CAPTCHA detectado — bot detenido, esperando al humano (timeout 10min)")`.
 - `onCaptchaResuelto()` → `log("core", "CAPTCHA resuelto — operación normal", "ok")`.
+- Si pasan 10 min sin resolver → `logError("core", "CAPTCHA timeout — pasaron 10min sin resolver, bot detenido")`. El listener `onCaptchaTimeout` de cada feature pausa lo que corresponda (recolección llama `setPaused(true)`).
+- Cuando el bridge avisa que `Game.bot_check` se limpió → `log("core", "bridge: Game.bot_check limpio — esperando confirmación del usuario", "ok")`. NO reanuda — solo pinta el cartel de verde.
 
 ---
 

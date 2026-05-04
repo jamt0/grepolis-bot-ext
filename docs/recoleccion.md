@@ -148,19 +148,21 @@ En `recolectarRecursos`, después de procesar todo:
 ```js
 const baseMs = tiempoCicloMinutos() * 60 * 1000;  // 5 o 10 min según config
 
-if (core.isCaptchaActive()) {
-  tiempoEspera = 30 * 1000;        // probe cada 30s
-} else {
-  let esperaAjustada = baseMs - duracionCiclo + jitter(3-30s);
+// CAPTCHA pendiente → NO se programa siguiente tick. El bot queda
+// esperando al humano; cuando aprieta "Ya resolví" en el cartel, la
+// sincronización post-captcha llama a programarSiguienteTick(~2s) para
+// retomar el ciclo (ver §10).
+if (core.isCaptchaActive()) return;
 
-  // Adelantar si hay aldeas listas antes del intervalo normal
-  if (stats.proximaLiberacionSeg < ∞) {
-    const esperaServer = stats.proximaLiberacionSeg * 1000 + 5000;
-    if (esperaServer < esperaAjustada) esperaAjustada = esperaServer;
-  }
+let esperaAjustada = baseMs - duracionCiclo + jitter(3-30s);
 
-  tiempoEspera = Math.max(30 * 1000, esperaAjustada);   // piso 30s
+// Adelantar si hay aldeas listas antes del intervalo normal
+if (stats.proximaLiberacionSeg < ∞) {
+  const esperaServer = stats.proximaLiberacionSeg * 1000 + 5000;
+  if (esperaServer < esperaAjustada) esperaAjustada = esperaServer;
 }
+
+tiempoEspera = Math.max(30 * 1000, esperaAjustada);   // piso 30s
 ```
 
 **Compensación de duración**: el próximo tick arranca al MISMO instante (en promedio) que el actual + `baseMs`, no al fin del actual + `baseMs`. Sin esto, cada vuelta acumularía `duracionCiclo` (~30s) como gap permanente vs el cooldown del server.
@@ -231,14 +233,34 @@ Cubre cualquier escenario donde el `setTimeout` principal no dispare (Chrome thr
 ### Detección
 Hay 2 vías:
 
-1. **Polling de `Game.bot_check`** (`gameBridge.js`): cada 2s, si `Game.bot_check` cambia de null a object, dispara `JamBot:captchaState`. → `core.onCaptchaDetectado()`.
-2. **Heurística post-claim**: si `success:true` pero falta la notification `Town`, asumimos CAPTCHA (a Grepolis le pasa raramente que devuelve un response válido pero sin Town cuando hay CAPTCHA encubierto).
+1. **Polling de `Game.bot_check`** (`gameBridge.js`): cada 2s, si `Game.bot_check` cambia de null a object, dispara `JamBot:captchaState`. → `core.onCaptchaDetectado()` (sin contexto).
+2. **Heurística post-claim** (la más útil): si la respuesta del fetch de claim no trae notification `Town`, asumimos CAPTCHA. La feature dispara `core.onCaptchaDetectado({ ciclo, ciudad, aldea })` con el contexto del fallo, y al romper el loop del ciclo agrega las aldeas pendientes que quedaron sin procesar.
 
-### Comportamiento durante CAPTCHA
-- Botón del bot pasa a ⚠ rojo.
-- Flash del título de la pestaña + bip de audio.
-- El scheduler tickea cada 30s en vez de 5/10 min.
-- En cada ciclo, el bot hace **un solo "probe"** ignorando el cooldown — si el probe vuelve OK, dispara `core.onCaptchaResuelto()` y vuelve al ritmo normal.
+### Comportamiento durante CAPTCHA pendiente
+
+El flujo viejo (probes cada 30s) generaba un bucle: cada probe disparaba un nuevo CAPTCHA. El nuevo flujo es **explícitamente humano-en-el-loop**:
+
+1. **Bot detenido** — no se programa siguiente tick. No hay probes.
+2. **Cartel grande** arriba del tab Recolección con: ciclo, ciudad/aldea que falló, lista de aldeas pendientes en cola, countdown del timeout (10 min) y botón "Ya resolví".
+3. **Pulpo** (card flotante en la esquina inferior izquierda) cambia a ⚠ rojo + nombre de la aldea sugerida; click abre el panel directamente en Recolección.
+4. **Flash del título** de la pestaña + bip de audio (igual que antes).
+5. El bridge sigue vigilando `Game.bot_check`. Cuando el humano resuelve el CAPTCHA del juego y `bot_check` vuelve a `null`, **NO** se reanuda automáticamente — solo se prende un flag `resueltoEnJuego` que pinta el cartel de verde y resalta el botón. El usuario tiene control explícito.
+
+### Resolución por el usuario
+
+Click en "Ya resolví" → `resolverCaptchaPorUsuario()`:
+
+1. Refetch `island_info` de cada ciudad → lee el campo `loot` (timestamp Unix sec del próximo claim disponible) de cada aldea.
+2. **Reconcilia gaps** con `lastClaimAtPorAldea`: si `loot - now ≈ cooldown - (now - lastClaimAt)` (±90s), el claim ya está registrado por el bot. Si no coincide, el HUMANO claimeó esa aldea — inferimos el ts del claim como `loot - cooldown` y lo guardamos en `lastClaimAtPorAldea`. Esto evita que el bot pegue al server antes del cooldown real (cada aldea con su propio ts, aunque el humano las haya claimeado con varios minutos de diferencia).
+3. `core.onCaptchaResuelto()` → cierra el estado captcha.
+4. `programarSiguienteTick(~2s)` → tick inmediato para procesar lo que falte del ciclo.
+
+### Timeout (10 min)
+
+Si el humano no apreta "Ya resolví" en 10 min, entramos en estado `"timeout"`:
+- `core.onCaptchaTimeout` dispara → la feature de recolección llama `core.setPaused(true)` para detener el bot.
+- El cartel cambia a gris con el texto "TIMEOUT — bot detenido".
+- El botón Iniciar del header se habilita (en `pending` está bloqueado). Apretarlo limpia el estado captcha (`core.onCaptchaResuelto`) y arranca un ciclo nuevo. Los cooldowns por aldea siguen vivos en `lastClaimAtPorAldea` — no se pierde sincronización.
 
 ---
 
