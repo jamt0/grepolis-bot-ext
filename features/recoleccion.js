@@ -136,6 +136,22 @@
     const histData = await cargarHistorial();
     historialPorAldea = histData.porAldea;
     ciclos = histData.ciclos;
+    //Recuperar ciclo interrumpido. Si el ciclo anterior se cortó a media
+    //tanda (F5, extensión recargada, crash) el storage tiene un snapshot de
+    //cicloActual con `fin: null` y aldeasCompletadas > 0. Lo promovemos a
+    //ciclos[] marcado como interrumpido para que aparezca en el historial.
+    //Si aldeasCompletadas == 0 lo descartamos: significa que el ciclo se
+    //inicializó pero murió antes del primer claim — cero info útil.
+    let cicloRecuperado = 0;
+    if (histData.cicloEnCurso && histData.cicloEnCurso.aldeasCompletadas > 0) {
+      const c = histData.cicloEnCurso;
+      c.interrumpido = true;
+      c.fin = c.ultimoClaimAt || c.inicio;
+      c.duracion = c.fin - c.inicio;
+      ciclos.push(c);
+      while (ciclos.length > CICLOS_MAX) ciclos.shift();
+      cicloRecuperado = c.aldeasCompletadas;
+    }
     const resumenAuto = (() => {
       let ok = 0, fb = 0, c5 = 0, c10 = 0;
       for (const v of Object.values(cooldownPorCiudad)) {
@@ -144,9 +160,10 @@
       }
       return `auto=${ok}/fallback=${fb} · 5min=${c5} · 10min=${c10}`;
     })();
+    const sufijoRecup = cicloRecuperado > 0 ? ` · ciclo interrumpido recuperado (${cicloRecuperado} aldeas)` : "";
     core.log(
       "recoleccion",
-      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · cooldown ${resumenAuto} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas · ciclos persistidos=${ciclos.length}`,
+      `carga OK · ciudades=${ciudadesConAldeas.length} · relaciones=${Object.keys(data.relacionPorAldea || {}).length} · cooldown ${resumenAuto} · lastClaimAt persistidos=${Object.keys(lastClaimAtPorAldea).length} · historial=${Object.keys(historialPorAldea).length} aldeas · ciclos persistidos=${ciclos.length}${sufijoRecup}`,
       "ok"
     );
 
@@ -204,9 +221,22 @@
           resolve({
             porAldea: blob.porAldea || {},
             ciclos: ciclos,
+            //cicloEnCurso: snapshot del ciclo que estaba corriendo cuando la
+            //pestaña se cerró/recargó. Si tiene aldeasCompletadas > 0 lo
+            //promovemos a ciclos[] como interrumpido en el bootstrap, así no
+            //se pierde el progreso parcial. Ver flujo en líneas ~136-160.
+            cicloEnCurso: blob.cicloEnCurso || null,
           });
         });
       });
+    }
+
+    //Snapshot persistible de cicloActual. JSON.parse(JSON.stringify) garantiza
+    //que las mutaciones in-memory posteriores al set() no afecten el blob ya
+    //serializado por chrome.storage. Sin esto, dos guardarHistorial() casi
+    //simultáneos podrían escribir referencias compartidas y truncarse mal.
+    function snapshotCicloActual() {
+      return cicloActual ? JSON.parse(JSON.stringify(cicloActual)) : null;
     }
 
     function guardarHistorial() {
@@ -216,6 +246,7 @@
           [STORAGE_KEY_HISTORIAL]: {
             porAldea: historialPorAldea,
             ciclos: ciclos,
+            cicloEnCurso: snapshotCicloActual(),
           },
         });
       } catch (e) {
@@ -236,6 +267,7 @@
             [STORAGE_KEY_HISTORIAL]: {
               porAldea: historialPorAldea,
               ciclos: ciclos,
+              cicloEnCurso: snapshotCicloActual(),
             },
           }, resolve);
         } catch (e) {
@@ -1535,11 +1567,18 @@
           : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
         const claims = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
         const completo = claims === total;
+        //Ciclos interrumpidos (recuperados del storage tras un corte) se
+        //marcan amarillos: no son un fail real, pero tampoco un ciclo
+        //completo — el corte sucedió por causas externas (reload, F5).
+        const interrumpido = ultimoCiclo.interrumpido === true;
+        const icono = interrumpido ? "⚠" : (completo ? "✓" : "✗");
+        const color = interrumpido ? "#f39c12" : (completo ? "#27ae60" : "#e74c3c");
+        const tituloSufijo = interrumpido ? " (interrumpido)" : "";
         body.appendChild(seccionColapsable(
           headerCiclo({
-            icono: completo ? "✓" : "✗",
-            color: completo ? "#27ae60" : "#e74c3c",
-            titulo: `Último ciclo #${ultimoCiclo.n}`,
+            icono,
+            color,
+            titulo: `Último ciclo #${ultimoCiclo.n}${tituloSufijo}`,
             ratio: `${claims}/${total} aldeas`,
             hora: formatHoraCorta(ultimoCiclo.fin),
             duracion: core.formatDuracion((ultimoCiclo.duracion || 0) / 1000),
@@ -1547,7 +1586,7 @@
           uiColapso.ciclos.ultimo,
           (v) => uiColapso.ciclos.ultimo = v,
           () => renderResumenCiclo(ultimoCiclo, false),
-          completo ? "#27ae60" : "#e74c3c"
+          color
         ));
       }
 
@@ -1862,11 +1901,15 @@
           : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
         const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
         const completo = claims === total;
+        const interrumpido = c.interrumpido === true;
+        const icono = interrumpido ? "⚠" : (completo ? "✓" : "✗");
+        const color = interrumpido ? "#f39c12" : (completo ? "#27ae60" : "#e74c3c");
+        const tituloSufijo = interrumpido ? " (interrumpido)" : "";
         wrap.appendChild(seccionColapsable(
           headerCiclo({
-            icono: completo ? "✓" : "✗",
-            color: completo ? "#27ae60" : "#e74c3c",
-            titulo: `Ciclo #${c.n}`,
+            icono,
+            color,
+            titulo: `Ciclo #${c.n}${tituloSufijo}`,
             ratio: `${claims}/${total} aldeas`,
             hora: formatHoraCorta(c.fin),
             duracion: core.formatDuracion((c.duracion || 0) / 1000),
@@ -1874,7 +1917,7 @@
           uiColapso.cicloPorN[c.n] === true,
           (v) => uiColapso.cicloPorN[c.n] = v,
           () => renderResumenCiclo(c, false),
-          completo ? "#27ae60" : "#e74c3c"
+          color
         ));
       }
       return wrap;
@@ -2332,8 +2375,17 @@
         ciudadesCompletadas: 0,
         totalAldeas: ciudadesConAldeas.length * 6,
         aldeasCompletadas: 0,
+        //Timestamp del último claim ok dentro del ciclo. Lo usamos para
+        //estimar el `fin` cuando el ciclo se recupera del storage tras una
+        //interrupción (extensión recargada, F5 a media tanda, etc). Sin
+        //esto el ciclo recuperado mostraría duracion=0 o duracion absurda.
+        ultimoClaimAt: null,
       };
       actualizarIndicadorVivo();
+      //Persistir el ciclo recién creado ANTES del primer claim. Si la pestaña
+      //se cierra entre acá y el primer registrarClaim el storage queda con
+      //un ciclo vacío en curso que el bootstrap descarta (aldeasCompletadas=0).
+      guardarHistorial();
 
       const stats = await recolectarCiudades();
       const duracionCiclo = Date.now() - inicioCiclo;
@@ -2371,25 +2423,44 @@
         return;
       }
 
-      //Compensación de duración del ciclo: el siguiente tick se programa
-      //para que el INICIO del ciclo siguiente caiga (en promedio) a
-      //tiempoCicloMinutos del inicio del actual, no de su fin. Sin esto,
-      //cada vuelta acumula `duracionCiclo` como gap permanente vs el
-      //cooldown del server (5/10min reales).
+      //Espera = baseMs (cooldown nominal del server) + jitter, MEDIDO DESDE
+      //EL FIN DEL CICLO. Esto garantiza que la ÚLTIMA aldea procesada en este
+      //ciclo (la que tiene el cooldown más fresco) ya haya cumplido sus
+      //5/10min individuales cuando arranque el ciclo siguiente.
+      //
+      //La versión anterior calculaba `baseMs - duracionCiclo + jitter` con la
+      //idea de "compensar la duración" para que el INICIO del ciclo siguiente
+      //cayera a baseMs del INICIO del actual. Esa compensación está mal: el
+      //server NO mide el cooldown desde el inicio del ciclo, lo mide desde
+      //el momento exacto en que cada aldea fue procesada. Como las 18 aldeas
+      //se reparten a lo largo de ~45s (jitter 2-2.5s entre cada una), solo
+      //la PRIMERA aldea procesada llega al ciclo siguiente con 10min completos
+      //— las demás llegan con CD parcial (la última, con baseMs − duracionCiclo)
+      //y el server las rechaza. Eso producía el patrón "ciclo largo + ciclo
+      //corto adelantado" cada ~30s, donde el corto recogía las 3-4 aldeas
+      //que el largo había saltado.
+      //
+      //Con `baseMs + jitter` desde el fin del ciclo:
+      //  - aldea procesada en `inicio + 0s` ───► CD = baseMs + duracionCiclo + jitter (libre)
+      //  - aldea procesada en `inicio + 45s` ──► CD = baseMs + jitter (libre, margen jitter)
+      //
+      //Trade-off: el loop completo dura `duracionCiclo + baseMs + jitter`
+      //(~10:41 con 18 aldeas a 10min) en vez del par 10:30 anterior. Yield
+      //por aldea: ~5.62 claims/h vs 5.71 (~1.6% menos), pero a cambio de
+      //18/18 en cada ciclo, sin requests rechazadas y sin warnings espurios
+      //de "1/6 aldeas en cooldown".
+      //
+      //Margen de seguridad +3-30s: el server libera el cooldown EXACTAMENTE
+      //a los 5 o 10min desde el último claim. El jitter mínimo de 3s cubre
+      //drift de reloj cliente↔server, latencia round-trip y jitter del
+      //setTimeout. Mantiene la huella anti-bot variando el offset entre
+      //ciclos.
       //
       //Base = mínimo de tiempos configurados (5 o 10). Si todas las
       //ciudades están en 10min, el ciclo tickea cada 10 — no nos
       //despertamos cada 5min para no hacer nada.
-      //
-      //Margen de seguridad +3-30s: el server libera el cooldown EXACTAMENTE
-      //a los 5 o 10min desde el último claim de cada aldea. Si el ciclo se
-      //solapa demasiado (peor caso: aldea procesada al final del ciclo N
-      //y al principio del N+1), el server rechaza el claim y el bot lo
-      //interpreta como CAPTCHA falso. El margen mínimo de 3s cubre eso.
       const baseMs = tiempoCicloMinutos() * 60 * 1000;
-      //Espera estándar: el próximo ciclo arranca al MISMO instante que
-      //el actual + baseMs (compensa duracionCiclo + jitter anti-bot).
-      const esperaNormal = baseMs - duracionCiclo + jitter(3 * 1000, 30 * 1000);
+      const esperaNormal = baseMs + jitter(3 * 1000, 30 * 1000);
       let esperaAjustada = esperaNormal;
       //Si en este ciclo hubo aldeas saltadas por cooldown y la próxima
       //se libera ANTES del próximo tick normal (típicamente porque el
@@ -3123,6 +3194,7 @@
           c.iron += claimDeltas.dI;
         }
         cicloActual.aldeasCompletadas += 1;
+        cicloActual.ultimoClaimAt = Date.now();
         if (c.claims >= c.esperado) cicloActual.ciudadesCompletadas += 1;
       }
       actualizarIndicadorVivo();

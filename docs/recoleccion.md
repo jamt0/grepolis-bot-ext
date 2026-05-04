@@ -166,7 +166,7 @@ const baseMs = tiempoCicloMinutos() * 60 * 1000;  // 5 o 10 min según config
 // retomar el ciclo (ver §10).
 if (core.isCaptchaActive()) return;
 
-let esperaAjustada = baseMs - duracionCiclo + jitter(3-30s);
+let esperaAjustada = baseMs + jitter(3-30s);  // medido desde el FIN del ciclo
 
 // Adelantar si hay aldeas listas antes del intervalo normal
 if (stats.proximaLiberacionSeg < ∞) {
@@ -177,9 +177,35 @@ if (stats.proximaLiberacionSeg < ∞) {
 tiempoEspera = Math.max(30 * 1000, esperaAjustada);   // piso 30s
 ```
 
-**Compensación de duración**: el próximo tick arranca al MISMO instante (en promedio) que el actual + `baseMs`, no al fin del actual + `baseMs`. Sin esto, cada vuelta acumularía `duracionCiclo` (~30s) como gap permanente vs el cooldown del server.
+### Por qué `baseMs + jitter` y no `baseMs - duracionCiclo + jitter`
 
-**Adelantar** (clave después de un reload): si en este ciclo todas las aldeas estaban en cooldown y la próxima se libera en 4 min, no esperamos 10 min — adelantamos a 4m05s. Recuperamos yield perdido por el reload.
+La versión anterior **descontaba** `duracionCiclo` de la espera, con la idea de que el siguiente ciclo arranque a `baseMs` del INICIO del actual (no del fin). Eso parecía evitar perder los ~30-45s del ciclo en cada vuelta. **Es un cálculo incorrecto** y producía el patrón "ciclo largo + ciclo corto adelantado" que se observaba en producción.
+
+**El error conceptual**: el server no mide el cooldown desde el inicio del ciclo del bot. Lo mide desde el momento exacto en que **cada aldea individualmente** fue procesada. Como el ciclo reparte 18 aldeas a lo largo de ~45s (jitter de 2-2.5s entre cada una), solo la **primera** aldea del ciclo previo llega al siguiente con 10min completos. Las demás llegan con CD parcial:
+
+| Aldea procesada en | CD acumulado al inicio del ciclo siguiente (cálculo viejo) |
+|---|---|
+| `inicio + 0s` (primera) | `baseMs + jitter` ✓ libre |
+| `inicio + 22s` (mitad) | `baseMs - 22s + jitter` ✗ aún en CD |
+| `inicio + 45s` (última) | `baseMs - 45s + jitter` ✗ aún en CD |
+
+Resultado en producción: 3-4 aldeas saltadas por ciclo (las últimas del orden de procesamiento). El bot detectaba que las saltadas se liberaban en ~25s y disparaba el ciclo corto adelantado para recogerlas — un parche que rescataba el yield, pero generaba dos ciclos en lugar de uno y una segunda tanda de requests al server cada 10min.
+
+**Fix**: medir la espera desde el **fin** del ciclo, no del inicio. Así la última aldea procesada (la que tiene el cooldown más fresco) ya cumplió sus 10min cuando arranca el siguiente:
+
+| Aldea procesada en | CD acumulado al inicio del ciclo siguiente (cálculo nuevo) |
+|---|---|
+| `inicio + 0s` (primera) | `duracionCiclo + baseMs + jitter` ✓ libre con 45s+ de margen |
+| `inicio + 22s` (mitad) | `duracionCiclo - 22s + baseMs + jitter` ✓ libre |
+| `inicio + 45s` (última) | `baseMs + jitter` ✓ libre con jitter de margen |
+
+**Trade-off**: el loop completo pasa de 10:30 (par largo+corto) a 10:41 (un solo ciclo). Yield por aldea: ~5.62 claims/h vs 5.71 antes (−1.6%). A cambio:
+- 18/18 aldeas en cada ciclo, sin saltadas.
+- Sin requests rechazadas por el server (el viejo patrón generaba `success:false` en 3 aldeas de cada ciclo largo).
+- Sin warnings espurios de "1/6 aldeas en cooldown" en los logs.
+- La mitad de requests al server (1 ciclo por loop en lugar de 2).
+
+**Adelantar** (clave después de un reload): si en este ciclo todas las aldeas estaban en cooldown y la próxima se libera en 4 min, no esperamos 10 min — adelantamos a 4m05s. Recuperamos yield perdido por el reload. Este mecanismo sigue activo aunque ya no se dispare en operación normal: solo aplica cuando el ciclo arranca con cooldowns desfasados (post-reload, post-CAPTCHA, primer arranque tras instalación).
 
 ---
 
