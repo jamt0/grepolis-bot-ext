@@ -40,10 +40,72 @@
 
     let proximoTickId = null;
     let corriendo = false;
+    let proximoTickAt = null;
     //La feature se habilita/deshabilita desde el toggle del panel ⚙. El
     //valor inicial viene de chrome.storage (si el usuario ya lo configuró
     //alguna vez) o cae al default de data.json (`finalizarGratis: true`).
     let habilitada = await cargarHabilitada();
+
+    //—— Estado expuesto al panel (data.construccion) —————————————————————
+    //
+    //La tab "Construcción" del panel ⚙ lee este objeto. Lo refrescamos en
+    //cada ciclo. `ultimoCiclo` y `finalizadas` también persisten en
+    //chrome.storage.local para sobrevivir al reload — `ultimaCola` se
+    //recalcula al primer tick, no vale la pena persistirla.
+    const FINALIZADAS_MAX = 20;
+    const STORAGE_KEY_CONSTR = `jambotConstruccion_${world_id}`;
+    data.construccion = data.construccion || {
+      habilitada,
+      proximoTickAt: null,
+      ultimoCiclo: null,
+      ultimaCola: [],
+      finalizadas: [],
+    };
+
+    //Restaurar persistencia
+    await new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(STORAGE_KEY_CONSTR, (obj) => {
+          const blob = (obj && obj[STORAGE_KEY_CONSTR]) || {};
+          data.construccion.ultimoCiclo = blob.ultimoCiclo || null;
+          data.construccion.finalizadas = Array.isArray(blob.finalizadas) ? blob.finalizadas : [];
+          resolve();
+        });
+      } catch (_) { resolve(); }
+    });
+
+    function persistirConstruccion() {
+      try {
+        chrome.storage.local.set({
+          [STORAGE_KEY_CONSTR]: {
+            ultimoCiclo: data.construccion.ultimoCiclo,
+            finalizadas: data.construccion.finalizadas,
+          },
+        });
+      } catch (e) {
+        core.logWarn("finalizar", "no pude persistir estado de construcción", e);
+      }
+    }
+
+    function registrarFinalizada(orden, mensaje, town_nombre) {
+      data.construccion.finalizadas.push({
+        ts: Date.now(),
+        town_id: orden.town_id,
+        town_nombre: town_nombre || String(orden.town_id),
+        id: orden.id,
+        building_type: orden.building_type,
+        mensaje: mensaje || "",
+      });
+      while (data.construccion.finalizadas.length > FINALIZADAS_MAX) {
+        data.construccion.finalizadas.shift();
+      }
+      persistirConstruccion();
+    }
+
+    function nombreCiudad(town_id) {
+      const c = (data.ciudadesConAldeas || []).find((x) => x.codigoCiudad == town_id);
+      return c ? (c.nombreCiudad || String(town_id)) : String(town_id);
+    }
 
     function cargarHabilitada() {
       return new Promise((resolve) => {
@@ -62,12 +124,15 @@
     //corre solo cuando ambas condiciones se dan: habilitada Y bot no
     //pausado. Cualquier cambio dispara reconciliar().
     function reconciliar() {
+      data.construccion.habilitada = habilitada;
       const debeCorrer = habilitada && !core.isPaused();
       if (debeCorrer && !proximoTickId && !corriendo) {
         ejecutarCiclo();
       } else if (!debeCorrer && proximoTickId) {
         clearTimeout(proximoTickId);
         proximoTickId = null;
+        proximoTickAt = null;
+        data.construccion.proximoTickAt = null;
       }
     }
 
@@ -81,20 +146,28 @@
         : data.finalizarGratis === true;
       if (flag === habilitada) return;
       habilitada = flag;
-      console.log(`[JamBot/finalizar] feature ${habilitada ? "habilitada" : "deshabilitada"} desde el panel`);
+      core.log(
+        "finalizar",
+        `feature ${habilitada ? "habilitada" : "deshabilitada"} desde el panel`,
+        habilitada ? "ok" : "info"
+      );
       reconciliar();
     });
 
     if (!habilitada) {
-      console.log("[JamBot/finalizar] feature deshabilitada — no arrancará hasta que se active en el panel ⚙");
+      core.log("finalizar", "feature deshabilitada — no arrancará hasta que se active en el panel ⚙");
     }
 
     //—— Scheduler ———————————————————————————————————————————————————————
 
     function programarSiguienteTick(ms) {
       if (proximoTickId) clearTimeout(proximoTickId);
+      proximoTickAt = Date.now() + ms;
+      data.construccion.proximoTickAt = proximoTickAt;
       proximoTickId = setTimeout(async () => {
         proximoTickId = null;
+        proximoTickAt = null;
+        data.construccion.proximoTickAt = null;
         await ejecutarCiclo();
       }, ms);
     }
@@ -112,9 +185,26 @@
       if (corriendo) return; //evitar reentradas
       if (!habilitada || core.isPaused()) return;
       corriendo = true;
+      const inicioCiclo = Date.now();
       try {
         const colas = await obtenerColasConstruccion();
         const ahora = Math.floor(Date.now() / 1000);
+
+        //Snapshot de la cola actual para el panel (Construcción → Cola
+        //actual). Anotamos restante y si está en ventana de "free finish"
+        //para que el render no recompute en cada refresh.
+        data.construccion.ultimaCola = colas
+          .filter((o) => o.finish_time && (o.finish_time - ahora) > 0)
+          .map((o) => ({
+            id: o.id,
+            town_id: o.town_id,
+            town_nombre: nombreCiudad(o.town_id),
+            building_type: o.building_type,
+            finish_time: o.finish_time,
+            segundosRestantes: o.finish_time - ahora,
+            enVentana: (o.finish_time - ahora) <= VENTANA_SEGUNDOS,
+          }))
+          .sort((a, b) => a.segundosRestantes - b.segundosRestantes);
 
         //Separar en dos grupos: las que hay que finalizar ya, y la siguiente
         //que va a entrar en ventana (para reagendar).
@@ -140,13 +230,13 @@
 
         for (const orden of ordenFinalizacion) {
           if (core.isCaptchaActive()) {
-            console.warn("[JamBot/finalizar] CAPTCHA activo — abortando ciclo");
+            core.logWarn("finalizar", "CAPTCHA activo — abortando ciclo");
             break;
           }
           //Si el usuario pausó o deshabilitó la feature mid-tanda, parar
           //inmediatamente sin procesar la siguiente orden.
           if (core.isPaused() || !habilitada) {
-            console.log("[JamBot/finalizar] pausa/deshabilitación detectada mid-ciclo — corto");
+            core.log("finalizar", "pausa/deshabilitación detectada mid-ciclo — corto");
             break;
           }
           const ok = await finalizarGratis(orden);
@@ -158,9 +248,25 @@
           : 5 * 60;
         const msEspera = core.isCaptchaActive() ? 30 * 1000 : segundosHastaProximo * 1000;
 
-        console.log(
-          `[JamBot/finalizar] ciclo OK: ${colas.length} órdenes en cola, ${finalizadas}/${aFinalizar.length} finalizadas. Próximo tick en ${core.formatDuracion(msEspera / 1000)}${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`
+        core.log(
+          "finalizar",
+          `ciclo OK: ${colas.length} órdenes en cola, ${finalizadas}/${aFinalizar.length} finalizadas · próximo tick en ${core.formatDuracion(msEspera / 1000)}${core.isCaptchaActive() ? " (modo CAPTCHA)" : ""}`,
+          finalizadas > 0 ? "ok" : "info"
         );
+
+        //Snapshot del último ciclo para el panel.
+        const finCiclo = Date.now();
+        data.construccion.ultimoCiclo = {
+          inicio: inicioCiclo,
+          fin: finCiclo,
+          duracion: finCiclo - inicioCiclo,
+          ordenesEnCola: colas.length,
+          ordenesEnVentana: aFinalizar.length,
+          finalizadas: finalizadas,
+          captchaDurante: core.isCaptchaActive(),
+        };
+        persistirConstruccion();
+
         //Respetar pausa/deshabilitación que pudo ocurrir durante el ciclo.
         if (habilitada && !core.isPaused()) {
           programarSiguienteTick(msEspera);
@@ -234,23 +340,31 @@
           parsed.json.collections[NOMBRE_COLECCION].data) ||
         [];
 
-      return items.map((item) => {
-        const o = item.d || item;
-        return {
-          id: o.id,
-          town_id: o.town_id,
-          finish_time: o.to_be_completed_at,
-          building_type: o.building_type,
-          tear_down: !!o.tear_down,
-        };
-      });
+      //El bridge devuelve TODAS las órdenes del jugador desde cualquier
+      //ciudad consultada, no solo las de `cityId`. Filtramos para que cada
+      //ciudad aporte únicamente las suyas; sin esto las órdenes se duplican
+      //×N (una por cada ciudad consultada) y el ciclo intenta finalizar la
+      //misma orden varias veces — la 1ra OK, las siguientes "ya no existe".
+      return items
+        .map((item) => {
+          const o = item.d || item;
+          return {
+            id: o.id,
+            town_id: o.town_id,
+            finish_time: o.to_be_completed_at,
+            building_type: o.building_type,
+            tear_down: !!o.tear_down,
+          };
+        })
+        .filter((o) => o.town_id === cityId);
     }
 
     async function obtenerColasConstruccion() {
       const ciudades = obtenerListaCiudades();
       if (!ciudades.length) {
-        console.warn(
-          "[JamBot/finalizar] no hay ciudades en data.ciudadesConAldeas — recoleccion todavía no las cargó?"
+        core.logWarn(
+          "finalizar",
+          "no hay ciudades en data.ciudadesConAldeas — recoleccion todavía no las cargó?"
         );
         return [];
       }
@@ -263,7 +377,7 @@
 
       for (let i = 0; i < orden.length; i++) {
         if (core.isCaptchaActive()) {
-          console.warn("[JamBot/finalizar] CAPTCHA activo — corto la consulta de colas");
+          core.logWarn("finalizar", "CAPTCHA activo — corto la consulta de colas");
           break;
         }
         const cityId = orden[i];
@@ -273,17 +387,23 @@
           todas.push(...ordenes);
         } catch (e) {
           errores += 1;
-          console.warn(`[JamBot/finalizar] error leyendo cola town=${cityId}:`, e);
+          core.logWarn("finalizar", `error leyendo cola town=${cityId}`, e);
         }
         //Espacio entre fetches para suavizar la huella. Sin delay tras la última.
         if (i < orden.length - 1) await delayMs(jitter(300, 800));
       }
 
-      console.log(
-        `[JamBot/finalizar] colas consultadas: ${ciudades.length} ciudades, ${conOrdenes} con órdenes, ${todas.length} órdenes totales` +
+      //Dedupe defensivo por id. Con el filtro por town_id en fetchColaCiudad
+      //no debería haber duplicados, pero si el server cambia el shape de la
+      //respuesta evitamos volver a disparar buyInstant sobre la misma orden.
+      const unicas = Array.from(new Map(todas.map((o) => [o.id, o])).values());
+
+      core.log(
+        "finalizar",
+        `colas consultadas: ${ciudades.length} ciudades, ${conOrdenes} con órdenes, ${unicas.length} órdenes totales` +
           (errores ? ` (${errores} con error)` : "")
       );
-      return todas;
+      return unicas;
     }
 
     //—— Disparo de la finalización gratis ————————————————————————————————
@@ -334,13 +454,14 @@
         );
         response = await res.json();
       } catch (e) {
-        console.error(`[JamBot/finalizar] fetch falló (town=${orden.town_id} id=${orden.id}):`, e);
+        core.logError("finalizar", `fetch falló (town=${orden.town_id} id=${orden.id})`, e);
         return false;
       }
 
       if (!response || !response.json || !response.json.success) {
-        console.warn(
-          `[JamBot/finalizar] respuesta sin success (town=${orden.town_id} id=${orden.id}):`,
+        core.logWarn(
+          "finalizar",
+          `respuesta sin success (town=${orden.town_id} id=${orden.id})`,
           response
         );
         return false;
@@ -355,9 +476,13 @@
         );
       }
 
-      console.log(
-        `[JamBot/finalizar] ✓ town=${orden.town_id} id=${orden.id} (${orden.building_type}) — "${response.json.success}"`
+      const town_nombre = nombreCiudad(orden.town_id);
+      core.log(
+        "finalizar",
+        `✓ ${town_nombre} ← ${orden.building_type} (id ${orden.id}) — "${response.json.success}"`,
+        "ok"
       );
+      registrarFinalizada(orden, String(response.json.success || ""), town_nombre);
       return true;
     }
   }
