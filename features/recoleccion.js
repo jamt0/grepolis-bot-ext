@@ -327,7 +327,7 @@
         c = document.createElement("div");
         c.id = "jambot-buttons";
         c.style.cssText =
-          "position:absolute;bottom:90px;left:10px;z-index:5;" +
+          "position:absolute;bottom:40px;left:10px;z-index:5;" +
           "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
         document.body.appendChild(c);
         return c;
@@ -356,7 +356,8 @@
            <circle cx="15.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
          </svg>
          <span>Jam</span>
-         <span id="jambot-card-estado" style="margin-left:4px;font-size:14px"></span>`;
+         <span id="jambot-card-estado" style="margin-left:4px;font-size:14px"></span>
+         <span id="jambot-card-countdown" style="margin-left:6px;font-size:11px;font-family:monospace;color:#7a8aa0;font-weight:normal"></span>`;
       card.addEventListener("mouseenter", () => {
         card.style.background = "#26344a";
         card.style.borderColor = "#3498db";
@@ -365,26 +366,67 @@
         card.style.background = "#1f2a36";
         card.style.borderColor = "#2c3a4d";
       });
-      card.addEventListener("click", () => togglePanelConfig(panelConfig));
+      card.addEventListener("click", () => {
+        //Click en la card siempre lleva al Dashboard. Si el panel está
+        //cerrado, lo abre en Dashboard; si está abierto en otro tab, salta
+        //a Dashboard sin cerrar; si ya está abierto en Dashboard, cierra.
+        const panel = document.getElementById("panelConfigJam");
+        const cerrado = !panel || panel.style.display === "none";
+        if (cerrado) {
+          tabActivo = "dashboard";
+          window.localStorage.setItem(STORAGE_KEY_TAB, "dashboard");
+          abrirPanel(panelConfig);
+        } else if (tabActivo !== "dashboard") {
+          tabActivo = "dashboard";
+          window.localStorage.setItem(STORAGE_KEY_TAB, "dashboard");
+          renderPanelConfig(panelConfig);
+        } else {
+          cerrarPanel(panelConfig);
+        }
+      });
       cont.appendChild(card);
       return card;
     }
 
     function actualizarEstadoCard() {
       const span = document.getElementById("jambot-card-estado");
-      if (!span) return;
-      if (core.isCaptchaActive()) {
-        span.textContent = "⚠";
-        span.style.color = "#e74c3c";
-      } else if (core.isPaused()) {
-        span.textContent = "▶";
-        span.style.color = "#27ae60";
-      } else {
-        span.textContent = "⏸";
-        span.style.color = "#3498db";
+      if (span) {
+        if (core.isCaptchaActive()) {
+          span.textContent = "⚠";
+          span.style.color = "#e74c3c";
+        } else if (core.isPaused()) {
+          span.textContent = "▶";
+          span.style.color = "#27ae60";
+        } else {
+          span.textContent = "⏸";
+          span.style.color = "#3498db";
+        }
+      }
+
+      //Countdown del próximo ciclo / progreso del ciclo en curso. Solo
+      //aparece cuando hay algo que mostrar — si está pausado y sin tick
+      //programado, se oculta para no ensuciar la card.
+      const cd = document.getElementById("jambot-card-countdown");
+      if (cd) {
+        if (core.isCaptchaActive()) {
+          cd.textContent = "";
+        } else if (cicloActual) {
+          cd.textContent = `${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas}`;
+          cd.style.color = "#f39c12";
+        } else if (proximoTickAt && !core.isPaused()) {
+          const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
+          cd.textContent = core.formatDuracion(seg);
+          cd.style.color = "#7a8aa0";
+        } else {
+          cd.textContent = "";
+        }
       }
     }
     actualizarEstadoCard();
+    //Refresh cada 1s del countdown — independiente del setInterval del
+    //panel (que solo corre cuando el panel está abierto). La card es
+    //siempre visible, así que su countdown necesita su propio tick.
+    setInterval(actualizarEstadoCard, 1000);
 
     //Reaccionar al play/pause global: cancelar tick al pausar, arrancar al
     //despausar. El estado se sincroniza con `core.isPaused()`.
@@ -465,6 +507,36 @@
     };
 
     function crearPanelConfig() {
+      //Inyectar el <style> block una sola vez. Inline-style no soporta
+      //pseudo-clases (:hover) ni transitions complejas — necesitamos CSS
+      //real. Lo agregamos al <head> con id para no duplicar si la feature
+      //se reinicializa.
+      if (!document.getElementById("jambot-styles")) {
+        const style = document.createElement("style");
+        style.id = "jambot-styles";
+        style.textContent = `
+          .pcj-row { transition: background 0.12s; }
+          .pcj-row:hover { background: rgba(255,255,255,0.04) !important; }
+          #panelConfigJam button:focus { outline: 2px solid #3498db44; outline-offset: 1px; }
+
+          /* Scrollbar custom alineado con el dark theme del panel.
+             Solo aplica al body con scroll y a cualquier descendiente que
+             scrollee. Webkit-only — Firefox usa scrollbar-width/color. */
+          #panelConfigJam *::-webkit-scrollbar { width: 8px; height: 8px; }
+          #panelConfigJam *::-webkit-scrollbar-track { background: transparent; }
+          #panelConfigJam *::-webkit-scrollbar-thumb {
+            background: #2c3a4d;
+            border-radius: 4px;
+            border: 1px solid #1f2a36;
+          }
+          #panelConfigJam *::-webkit-scrollbar-thumb:hover { background: #3498db; }
+          #panelConfigJam *::-webkit-scrollbar-corner { background: transparent; }
+          #panelConfigJam { scrollbar-width: thin; scrollbar-color: #2c3a4d transparent; }
+          #panelConfigJam *  { scrollbar-width: thin; scrollbar-color: #2c3a4d transparent; }
+        `;
+        document.head.appendChild(style);
+      }
+
       const panel = document.createElement("div");
       panel.id = "panelConfigJam";
       //Layout: ~70% del viewport en alto y ancho.
@@ -545,12 +617,6 @@
       document.addEventListener("mousedown", outsideClickHandler, true);
     }
 
-    function togglePanelConfig(panel) {
-      const visible = panel.style.display !== "none";
-      if (visible) cerrarPanel(panel);
-      else abrirPanel(panel);
-    }
-
     function renderPanelConfig(panel) {
       panel.innerHTML = "";
 
@@ -586,11 +652,12 @@
 
       panel.appendChild(titulo);
 
-      //Header: estado + countdown
+      //Header de control: pill de estado + countdown + botón play/pause.
+      //FIJO en todos los tabs (antes vivía solo en el Dashboard).
       const header = document.createElement("div");
       header.id = "panelHeaderEstado";
       header.style.cssText =
-        "padding:8px 12px;border-bottom:1px solid #2c3a4d;font-size:11px;line-height:1.6;background:#1a232e";
+        "padding:10px 12px;border-bottom:1px solid #2c3a4d;background:#1a232e";
       panel.appendChild(header);
       actualizarHeaderPanel(panel);
 
@@ -658,14 +725,10 @@
       const header = panel.querySelector("#panelHeaderEstado");
       if (!header) return;
 
-      let estadoIcono, estadoTexto, estadoColor;
-      if (core.isCaptchaActive()) {
-        estadoIcono = "⚠"; estadoTexto = "CAPTCHA"; estadoColor = "#e74c3c";
-      } else if (core.isPaused()) {
-        estadoIcono = "▶"; estadoTexto = "Pausado"; estadoColor = "#27ae60";
-      } else {
-        estadoIcono = "⏸"; estadoTexto = "Corriendo"; estadoColor = "#3498db";
-      }
+      const captcha = core.isCaptchaActive();
+      const pausado = core.isPaused();
+      const color = captcha ? "#e74c3c" : pausado ? "#27ae60" : "#3498db";
+      const label = captcha ? "CAPTCHA" : pausado ? "Pausado" : "Corriendo";
 
       let proximoTexto = "—";
       let proximoColor = "#cdd5e0";
@@ -673,231 +736,193 @@
         proximoTexto = `en curso · ${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciud · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
         proximoColor = "#f39c12";
       } else if (proximoTickAt) {
-        proximoTexto = core.formatDuracion((proximoTickAt - Date.now()) / 1000);
+        proximoTexto = "próximo en " + core.formatDuracion((proximoTickAt - Date.now()) / 1000);
       }
 
-      header.innerHTML =
-        `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:11.5px">` +
-        `  <span><span style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.8px;font-size:10px;font-weight:bold">Estado</span>` +
-        `        <span style="color:${estadoColor};font-weight:bold;margin-left:6px">${estadoIcono} ${estadoTexto}</span></span>` +
-        `  <span><span style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.8px;font-size:10px;font-weight:bold">Próximo ciclo</span>` +
-        `        <span style="color:${proximoColor};font-weight:bold;margin-left:6px">${proximoTexto}</span></span>` +
-        `</div>`;
-    }
-
-    //—— Tab Dashboard ——————————————————————————————————————————————————
-    //
-    //Vista resumen + control central. Por defecto al abrir el panel.
-    //Concentra:
-    //  - Botón play/pause grande (antes era flotante)
-    //  - Resumen 1-vistazo de Recolección (próximo ciclo, último ciclo)
-    //  - Resumen 1-vistazo de Construcción (próximo tick, cola, última)
-    //  - Errores recientes resumidos
-    //
-    //Idea: si solo querés saber "cómo va el bot", no hace falta saltar
-    //entre tabs.
-
-    function renderTabDashboard(body) {
-      //Botón play/pause grande, colorizado según estado
-      body.appendChild(renderControlPlayPause());
-
-      //Resumen Recolección
-      body.appendChild(crearSeparador());
-      body.appendChild(crearTituloSeccion("📦  Recolección"));
-      body.appendChild(renderResumenRecoleccion());
-
-      //Resumen Construcción
-      body.appendChild(crearSeparador());
-      body.appendChild(crearTituloSeccion("🏗  Construcción"));
-      body.appendChild(renderResumenConstruccion());
-
-      //Errores recientes (siempre visible, top 5)
-      body.appendChild(crearSeparador());
-      const errores = core.getErrores ? core.getErrores().slice(-5).reverse() : [];
-      const tituloE = crearTituloSeccion(`⚠  Últimos errores  (${errores.length})`);
-      body.appendChild(tituloE);
-      body.appendChild(renderErroresCompactos(errores));
-    }
-
-    function renderControlPlayPause() {
+      header.innerHTML = "";
       const wrap = document.createElement("div");
-      wrap.style.cssText =
-        "display:flex;align-items:center;gap:12px;padding:8px 0";
+      wrap.style.cssText = "display:flex;align-items:center;gap:10px";
 
-      const captcha = core.isCaptchaActive();
-      const pausado = core.isPaused();
-      const estadoLabel = captcha ? "⚠ CAPTCHA detectado"
-        : pausado ? "▶  Pausado"
-        : "⏸  Corriendo";
-      const estadoColor = captcha ? "#e74c3c" : pausado ? "#27ae60" : "#3498db";
-
-      const estadoTxt = document.createElement("div");
-      estadoTxt.style.cssText = `flex:1;font-weight:bold;font-size:14px;color:${estadoColor}`;
-      estadoTxt.textContent = estadoLabel;
-      wrap.appendChild(estadoTxt);
+      const izq = document.createElement("div");
+      izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      izq.innerHTML =
+        statusPill(label, color) +
+        `<span style="color:${proximoColor};font-size:11.5px">${proximoTexto}</span>`;
+      wrap.appendChild(izq);
 
       const btn = document.createElement("button");
       const accion = pausado ? "Iniciar" : "Pausar";
       btn.textContent = (pausado ? "▶  " : "⏸  ") + accion;
       btn.style.cssText =
-        `padding:8px 18px;background:${estadoColor};color:#fff;border:none;` +
-        "border-radius:4px;cursor:pointer;font-weight:bold;font-size:13px;" +
-        "letter-spacing:0.3px;transition:opacity 0.15s";
+        `padding:6px 14px;background:${color};color:#fff;border:none;` +
+        "border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;" +
+        "letter-spacing:0.3px;transition:opacity 0.15s;flex-shrink:0";
       if (captcha) {
         btn.disabled = true;
-        btn.style.opacity = "0.6";
+        btn.style.opacity = "0.5";
         btn.style.cursor = "not-allowed";
         btn.title = "Resolvé el CAPTCHA en el juego primero";
       }
       btn.addEventListener("click", () => {
         if (captcha) return;
         core.togglePlayPause();
-        //Re-render del tab actual para reflejar el cambio inmediato
-        const bodyEl = document.querySelector("#panelConfigJam .pcj-body");
-        if (bodyEl) renderTabDashboard(bodyEl);
+        //Repaint inmediato del header — sin esto el botón se quedaba con
+        //el label viejo hasta el siguiente tick del setInterval (1s),
+        //como si el click no hubiera tomado.
+        actualizarHeaderPanel(panel);
       });
       wrap.appendChild(btn);
-      return wrap;
+
+      header.appendChild(wrap);
     }
 
-    function renderResumenRecoleccion() {
-      const wrap = document.createElement("div");
-      wrap.style.cssText = "font-size:12px;line-height:1.7";
-      const linea = (label, val, color) => {
-        const d = document.createElement("div");
-        d.innerHTML = `<span style="color:#8a96a6;display:inline-block;min-width:140px">${label}</span>` +
-          `<span style="color:${color || "#cdd5e0"}">${val}</span>`;
-        return d;
-      };
+    //—— Tab Dashboard ——————————————————————————————————————————————————
+    //
+    //Vista mínima de "cómo va el bot": agregados de los ciclos persistidos.
+    //Sin contadores en vivo que cambien cada segundo (eso vive en los tabs
+    //específicos), solo métricas que cambian al cierre de cada ciclo.
+    //
+    //IMPORTANTE: este render LIMPIA el body al inicio. El bug previo era
+    //que el setInterval del panel y el botón play/pause re-renderizaban
+    //sin limpiar → cada segundo se duplicaba todo el contenido (ciclo
+    //infinito visual).
 
-      //Próximo ciclo
-      let proximoTxt = "—";
-      let proximoColor;
-      if (cicloActual) {
-        proximoTxt = `en curso · ${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciudades · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
-        proximoColor = "#f39c12";
-      } else if (proximoTickAt) {
-        proximoTxt = core.formatDuracion((proximoTickAt - Date.now()) / 1000);
-        proximoColor = "#3498db";
-      }
-      wrap.appendChild(linea("Próximo ciclo:", proximoTxt, proximoColor));
+    function renderTabDashboard(body) {
+      body.innerHTML = "";
+      //La barra de estado + botón play/pause vive en el header global del
+      //panel (visible en TODOS los tabs), no acá. Antes estaba duplicada
+      //en este Dashboard — quedaba inconsistente al saltar a otros tabs.
 
-      //Último ciclo
-      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
-      if (ultimo) {
-        const total = (ultimo.totalAldeas != null) ? ultimo.totalAldeas
-          : Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
-        const claims = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
-        const completo = claims === total;
-        wrap.appendChild(linea(
-          "Último ciclo:",
-          `${completo ? "✓" : "✗"} #${ultimo.n} · ${claims}/${total} aldeas · ${formatHoraCorta(ultimo.fin)}`,
-          completo ? "#27ae60" : "#e74c3c"
-        ));
-        const totWood = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.wood || 0), 0);
-        const totStone = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.stone || 0), 0);
-        const totIron = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.iron || 0), 0);
-        wrap.appendChild(linea("Recursos último ciclo:", `+${totWood} mad / +${totStone} pie / +${totIron} pla`));
-      } else {
-        wrap.appendChild(linea("Último ciclo:", "(todavía no hubo ninguno en esta sesión)", "#8a96a6"));
-      }
+      //Métricas de Recolección
+      body.appendChild(crearTituloSeccion("Recolección"));
+      body.appendChild(renderMetricasRecoleccion());
 
-      //Acumulado de la sesión (sumando todos los ciclos persistidos)
-      if (ciclos.length > 0) {
-        let totWood = 0, totStone = 0, totIron = 0;
-        for (const c of ciclos) {
-          for (const cd of Object.values(c.ciudades || {})) {
-            totWood += cd.wood || 0;
-            totStone += cd.stone || 0;
-            totIron += cd.iron || 0;
-          }
+      //Métricas de Construcción
+      body.appendChild(crearTituloSeccion("Construcción"));
+      body.appendChild(renderMetricasConstruccion());
+    }
+
+    function renderMetricasRecoleccion() {
+      //Calcular agregados sobre TODOS los ciclos persistidos.
+      let aldeasOk = 0;
+      let aldeasError = 0;
+      let totWood = 0, totStone = 0, totIron = 0;
+      let ciclosCompletos = 0;
+      for (const c of ciclos) {
+        let cicloOk = true;
+        for (const cd of Object.values(c.ciudades || {})) {
+          aldeasOk += cd.claims || 0;
+          aldeasError += Math.max(0, (cd.esperado || 6) - (cd.claims || 0));
+          totWood += cd.wood || 0;
+          totStone += cd.stone || 0;
+          totIron += cd.iron || 0;
+          if ((cd.claims || 0) < (cd.esperado || 6)) cicloOk = false;
         }
-        wrap.appendChild(linea(
-          `Acumulado (${ciclos.length} ciclos):`,
-          `+${totWood} mad / +${totStone} pie / +${totIron} pla`,
-          "#27ae60"
-        ));
+        if (cicloOk) ciclosCompletos += 1;
       }
+      const aldeasTotal = aldeasOk + aldeasError;
+      const tasa = aldeasTotal > 0 ? Math.round((aldeasOk / aldeasTotal) * 100) : 100;
 
-      wrap.appendChild(linea("Ciudades:", `${ciudadesConAldeas.length}`));
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:14px";
+      wrap.appendChild(stat(
+        "Ciclos OK",
+        ciclos.length === 0 ? "0" : `${ciclosCompletos}/${ciclos.length}`,
+        ciclos.length === 0 ? null : (ciclosCompletos === ciclos.length ? "#27ae60" : "#f39c12")
+      ));
+      wrap.appendChild(stat(
+        "Tasa de éxito",
+        `${tasa}%`,
+        aldeasTotal === 0 ? null : (tasa >= 95 ? "#27ae60" : tasa >= 80 ? "#f39c12" : "#e74c3c")
+      ));
+      wrap.appendChild(stat("Aldeas farmeadas", String(aldeasOk), aldeasOk > 0 ? "#27ae60" : null));
+      wrap.appendChild(stat("Aldeas con error", String(aldeasError), aldeasError > 0 ? "#e74c3c" : null));
+
+      //Recursos en card ancha (con íconos)
+      const card = document.createElement("div");
+      card.style.cssText =
+        "grid-column:1 / -1;padding:8px 12px;background:#172029;" +
+        "border-left:3px solid #27ae60;border-radius:3px";
+      card.innerHTML =
+        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold;margin-bottom:4px">Recursos acumulados</div>` +
+        `<div style="font-size:13px;color:#e6e9ee;font-weight:bold">${recursosConIconos(totWood, totStone, totIron)}</div>`;
+      wrap.appendChild(card);
 
       return wrap;
     }
 
-    function renderResumenConstruccion() {
-      const wrap = document.createElement("div");
-      wrap.style.cssText = "font-size:12px;line-height:1.7";
-      const linea = (label, val, color) => {
-        const d = document.createElement("div");
-        d.innerHTML = `<span style="color:#8a96a6;display:inline-block;min-width:140px">${label}</span>` +
-          `<span style="color:${color || "#cdd5e0"}">${val}</span>`;
-        return d;
-      };
-
+    function renderMetricasConstruccion() {
       const ds = data.construccion;
-      if (!ds) {
-        wrap.appendChild(linea("Estado:", "(feature no inicializada)", "#8a96a6"));
-        return wrap;
-      }
+      const finalizadas = (ds && ds.finalizadas) || [];
+      const ultima = finalizadas[finalizadas.length - 1];
 
-      const estado = !ds.habilitada ? "Deshabilitada"
-        : core.isPaused() ? "En pausa (bot pausado)"
-        : "Activa";
-      const estadoColor = !ds.habilitada ? "#8a96a6"
-        : core.isPaused() ? "#27ae60" : "#3498db";
-      wrap.appendChild(linea("Estado:", estado, estadoColor));
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px";
 
-      let proximoTxt = "—";
-      if (ds.proximoTickAt) {
-        const seg = Math.max(0, Math.round((ds.proximoTickAt - Date.now()) / 1000));
-        proximoTxt = core.formatDuracion(seg);
-      }
-      wrap.appendChild(linea("Próximo tick:", proximoTxt));
-
-      const cola = ds.ultimaCola || [];
-      const enVentana = cola.filter((o) => o.enVentana || (o.segundosRestantes != null && o.segundosRestantes <= 290)).length;
-      wrap.appendChild(linea(
-        "En cola:",
-        `${cola.length} órdenes` + (enVentana ? ` · ${enVentana} en ventana free` : ""),
-        enVentana ? "#f39c12" : undefined
+      const habilitada = ds && ds.habilitada;
+      wrap.appendChild(stat(
+        "Estado",
+        habilitada ? "Activa" : "Deshabilitada",
+        habilitada ? "#3498db" : "#7a8aa0"
+      ));
+      wrap.appendChild(stat(
+        "Edificios finalizados",
+        String(finalizadas.length),
+        finalizadas.length > 0 ? "#27ae60" : null
       ));
 
-      const finalizadas = ds.finalizadas || [];
-      if (finalizadas.length) {
-        const ultima = finalizadas[finalizadas.length - 1];
-        wrap.appendChild(linea(
-          "Última finalizada:",
-          `${ultima.town_nombre || ultima.town_id} ← ${ultima.building_type} · ${formatHoraCorta(ultima.ts)}`,
-          "#27ae60"
-        ));
+      if (ultima) {
+        const card = document.createElement("div");
+        card.style.cssText =
+          "grid-column:1 / -1;padding:8px 12px;background:#172029;" +
+          "border-left:3px solid #27ae60;border-radius:3px";
+        card.innerHTML =
+          `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold;margin-bottom:4px">Última finalizada</div>` +
+          `<div style="font-size:12.5px;color:#e6e9ee">` +
+          `<span style="font-weight:bold">${escapeHtml(ultima.town_nombre || ultima.town_id)}</span>` +
+          ` <span style="color:#7a8aa0">←</span> ` +
+          `<span style="font-family:monospace;color:#cdd5e0">${escapeHtml(ultima.building_type)}</span>` +
+          ` <span style="color:#7a8aa0">·</span> ` +
+          `<span style="color:#7a8aa0;font-size:11px">hace ${formatRelativo(ultima.ts)}</span>` +
+          `</div>`;
+        wrap.appendChild(card);
       }
-      wrap.appendChild(linea(`Total finalizadas:`, `${finalizadas.length}`));
 
       return wrap;
     }
 
-    function renderErroresCompactos(errores) {
-      const wrap = document.createElement("div");
-      if (!errores.length) {
-        const v = document.createElement("div");
-        v.textContent = "Sin errores ni warnings.";
-        v.style.cssText = "opacity:0.6;font-style:italic;padding:4px 0;font-size:11.5px";
-        wrap.appendChild(v);
-        return wrap;
-      }
-      wrap.style.cssText = "font-family:monospace;font-size:10.5px";
-      for (const e of errores) {
-        const c = e.nivel === "error" ? "#e74c3c" : "#f39c12";
-        const fila = document.createElement("div");
-        fila.style.cssText =
-          "display:flex;gap:8px;padding:2px 0;border-bottom:1px solid #1a232e";
-        fila.innerHTML =
-          `<span style="color:#8a96a6;min-width:42px">${formatHoraCorta(e.ts)}</span>` +
-          `<span style="color:${c};min-width:50px">[${escapeHtml(e.scope)}]</span>` +
-          `<span style="flex:1;color:#cdd5e0">${escapeHtml(e.mensaje)}</span>`;
-        wrap.appendChild(fila);
-      }
-      return wrap;
+    //Helper compartido: card de métrica con label uppercase + valor grande
+    function stat(label, val, color) {
+      const d = document.createElement("div");
+      d.style.cssText =
+        `padding:8px 10px;background:#172029;border-radius:3px;` +
+        `border-left:3px solid ${color || "#3498db"}`;
+      d.innerHTML =
+        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">${escapeHtml(label)}</div>` +
+        `<div style="color:${color || "#e6e9ee"};font-weight:bold;font-size:16px;margin-top:3px">${escapeHtml(val)}</div>`;
+      return d;
+    }
+
+    //Helper: status pill (chip uppercase con bg semi-transparente del color)
+    function statusPill(label, color) {
+      return `<span style="background:${color}22;color:${color};padding:3px 10px;` +
+        `border-radius:11px;font-size:10.5px;text-transform:uppercase;` +
+        `letter-spacing:0.8px;font-weight:bold;border:1px solid ${color}55;` +
+        `display:inline-block">${escapeHtml(label)}</span>`;
+    }
+
+    //Helper: recursos con íconos universales (sin depender de assets del juego)
+    //  🌲 madera (verde), 🪨 piedra (gris), 🪙 plata (dorado).
+    //  Acepta números y los formatea con separador de miles.
+    function recursosConIconos(w, s, i) {
+      const num = (n) => Number(n || 0).toLocaleString("es-AR");
+      return `<span style="color:#27ae60">🌲 ${num(w)}</span>` +
+        ` <span style="color:#5a6776">·</span> ` +
+        `<span style="color:#cdd5e0">🪨 ${num(s)}</span>` +
+        ` <span style="color:#5a6776">·</span> ` +
+        `<span style="color:#f39c12">🪙 ${num(i)}</span>`;
     }
 
     //—— Tab Settings (configuración) ——————————————————————————————————————
@@ -919,12 +944,11 @@
       body.appendChild(renderFooterVersion());
     }
 
-    //Paleta cíclica para colorear cada ciudad en la lista de tiempos.
-    //Da jerarquía visual sin que dependa del nombre de la ciudad.
-    const PALETA_CIUDAD = [
-      "#3498db", "#27ae60", "#f39c12", "#9b59b6", "#e74c3c",
-      "#1abc9c", "#e67e22", "#34495e",
-    ];
+    //Color único para todas las ciudades. Antes había una paleta cíclica
+    //multicolor pero quedaba "circo" — el color por ciudad no aporta
+    //información, solo confunde. Azul (#3498db = info) es coherente con
+    //el resto del panel.
+    const COLOR_CIUDAD = "#3498db";
 
     function renderTiemposPorCiudad() {
       const wrap = document.createElement("div");
@@ -942,9 +966,9 @@
         (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
       );
 
-      ciudadesOrden.forEach((ciudad, i) => {
+      ciudadesOrden.forEach((ciudad) => {
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
-        const color = PALETA_CIUDAD[i % PALETA_CIUDAD.length];
+        const color = COLOR_CIUDAD;
         const minutos = cfg.minutos;
 
         const card = document.createElement("div");
@@ -1342,6 +1366,7 @@
         const color = enVentana ? "#f39c12" : "#7a8aa0";
 
         const fila = document.createElement("div");
+        fila.className = "pcj-row";
         fila.style.cssText =
           "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
           "background:#172029;border-radius:3px;border-left:3px solid " + color;
@@ -1386,6 +1411,7 @@
       }
       for (const f of finalizadas) {
         const fila = document.createElement("div");
+        fila.className = "pcj-row";
         fila.style.cssText =
           "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
           "background:#172029;border-radius:3px;border-left:3px solid #27ae60";
@@ -1505,6 +1531,7 @@
         const icon = sinClaims ? "·" : enProgreso ? "↻" : completa ? "✓" : "✗";
 
         const fila = document.createElement("div");
+        fila.className = "pcj-row";
         fila.style.cssText =
           "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
           "background:#172029;border-radius:3px;border-left:3px solid " + color;
