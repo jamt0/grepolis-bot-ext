@@ -994,8 +994,18 @@
 
     function renderMetricasRecoleccion() {
       //Calcular agregados sobre TODOS los ciclos persistidos.
+      //
+      //"esperado" se decrementa cuando una aldea responde con cupo
+      //diario alcanzado, "no te pertenece" o cuando la ciudad tiene
+      //almacén lleno, así que `aldeasError` naturalmente excluye esos
+      //casos: solo cuenta yield perdido real (sin Town / retry agotado /
+      //sin relation_id). Las advertencias tienen tiles propios para que
+      //el usuario distinga estado del juego de errores reales.
       let aldeasOk = 0;
       let aldeasError = 0;
+      let aldeasSinRecursos = 0; //cupo diario alcanzado
+      let aldeasNoObtenidas = 0; //"no te pertenece"
+      let aldeasCiudadLlena = 0; //ciudad con almacén lleno
       let totWood = 0, totStone = 0, totIron = 0;
       let ciclosCompletos = 0;
       for (const c of ciclos) {
@@ -1003,6 +1013,9 @@
         for (const cd of Object.values(c.ciudades || {})) {
           aldeasOk += cd.claims || 0;
           aldeasError += Math.max(0, (cd.esperado || 6) - (cd.claims || 0));
+          aldeasSinRecursos += cd.limiteDiario || 0;
+          aldeasNoObtenidas += cd.bloqueadas || 0;
+          aldeasCiudadLlena += cd.recursosLlenos || 0;
           totWood += cd.wood || 0;
           totStone += cd.stone || 0;
           totIron += cd.iron || 0;
@@ -1028,6 +1041,24 @@
       ));
       wrap.appendChild(stat("Aldeas farmeadas", String(aldeasOk), aldeasOk > 0 ? "#27ae60" : null));
       wrap.appendChild(stat("Aldeas con error", String(aldeasError), aldeasError > 0 ? "#e74c3c" : null));
+      //Tiles de estados-no-error: el server respondió con motivo legítimo
+      //(cupo diario o aldea no propia). Naranja para que se diferencien
+      //del verde "OK" pero sin la alarma del rojo "error".
+      wrap.appendChild(stat(
+        "Recolecciones sin recursos",
+        String(aldeasSinRecursos),
+        aldeasSinRecursos > 0 ? "#f39c12" : null
+      ));
+      wrap.appendChild(stat(
+        "Aldeas no obtenidas",
+        String(aldeasNoObtenidas),
+        aldeasNoObtenidas > 0 ? "#f39c12" : null
+      ));
+      wrap.appendChild(stat(
+        "Saltadas por ciudad llena",
+        String(aldeasCiudadLlena),
+        aldeasCiudadLlena > 0 ? "#f39c12" : null
+      ));
 
       //Recursos en card ancha (con íconos)
       const card = document.createElement("div");
@@ -1891,10 +1922,32 @@
         const total = (c.totalAldeas != null) ? c.totalAldeas
           : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
         const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
-        const completo = claims === total;
+        const sCool = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.saltadasCooldown || 0), 0);
+        //Cubrimos cuando claims + cooldown legítimo ≥ total esperado
+        //(que ya excluye no-pertenece y cupo diario). Sin esto, un
+        //ciclo con todas las aldeas en cooldown se pintaba ✗ rojo.
+        const cubierto = (claims + sCool) >= total;
         const interrumpido = c.interrumpido === true;
-        const icono = interrumpido ? "⚠" : (completo ? "✓" : "✗");
-        const color = interrumpido ? "#f39c12" : (completo ? "#27ae60" : "#e74c3c");
+        const tieneAdvertencia = Object.values(c.ciudades || {})
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+
+        let icono, color;
+        if (interrumpido) {
+          icono = "⚠"; color = "#f39c12";
+        } else if (cubierto) {
+          if (tieneAdvertencia) {
+            icono = "⚠"; color = "#f39c12";
+          } else if (claims === 0) {
+            //Todo el ciclo cubierto solo por cooldown — no es fallo,
+            //es estado del juego. Gris ⏱ para distinguirlo del ✓ verde
+            //(que implica recolección efectiva).
+            icono = "⏱"; color = "#8a96a6";
+          } else {
+            icono = "✓"; color = "#27ae60";
+          }
+        } else {
+          icono = "✗"; color = "#e74c3c";
+        }
         const tituloSufijo = interrumpido ? " (interrumpido)" : "";
         wrap.appendChild(seccionColapsable(
           headerCiclo({
@@ -1921,11 +1974,41 @@
         .sort((a, b) => (a.nombre || "").localeCompare(b.nombre || "", undefined, { numeric: true }));
       uiColapso.cicloCiudades[ciclo.n] = uiColapso.cicloCiudades[ciclo.n] || {};
       for (const c of ciudadesArr) {
-        const completa = c.claims >= (c.esperado || 6);
-        const enProgreso = enCurso && c.claims < (c.esperado || 6);
-        const sinClaims = enCurso && c.claims === 0;
-        const color = sinClaims ? "#7a8aa0" : enProgreso ? "#f39c12" : completa ? "#27ae60" : "#e74c3c";
-        const icon = sinClaims ? "·" : enProgreso ? "↻" : completa ? "✓" : "✗";
+        const totalEsp = c.esperado || 6;
+        const claimsOk = c.claims || 0;
+        const sCool = c.saltadasCooldown || 0;
+        const tieneAdvertencia = (c.limiteDiario || 0) > 0 || (c.recursosLlenos || 0) > 0;
+        //Estado "cubierto" = todas las aldeas farmeables están
+        //contabilizadas (claim OK o saltadas por cooldown legítimo). El
+        //esperado ya viene decrementado por bloqueadas, cupo diario y
+        //ciudad llena.
+        const cubierta = (claimsOk + sCool) >= totalEsp;
+        const enProgreso = enCurso && !cubierta;
+        const sinClaims = enCurso && claimsOk === 0;
+
+        //Decisión de color/ícono. Orden importa: primero cubrimos los
+        //estados "en curso" (gris/naranja), después el caso terminado.
+        //Cuando terminó y todo está cubierto, distinguimos:
+        //  - advertencia (cupo diario / ciudad llena) → ⚠ naranja
+        //  - 0 claims, todo cooldown                  → ⏱ gris (no es error)
+        //  - hubo claims                              → ✓ verde
+        //Si no está cubierto, es fallo real → ✗ rojo.
+        let color, icon;
+        if (sinClaims) {
+          color = "#7a8aa0"; icon = "·";
+        } else if (enProgreso) {
+          color = "#f39c12"; icon = "↻";
+        } else if (cubierta) {
+          if (tieneAdvertencia) {
+            color = "#f39c12"; icon = "⚠";
+          } else if (claimsOk === 0) {
+            color = "#8a96a6"; icon = "⏱";
+          } else {
+            color = "#27ae60"; icon = "✓";
+          }
+        } else {
+          color = "#e74c3c"; icon = "✗";
+        }
 
         //Header HTML que replica la fila plana anterior: badge + nombre +
         //ratio + recursos. seccionColapsable agrega su propio arrow.
@@ -1988,12 +2071,21 @@
     //"saltada-cooldown" suelto en la UI.
     function presentarStatus(status) {
       switch (status) {
-        case "ok":               return { label: "OK",          color: "#27ae60", icono: "✓" };
-        case "reintentar":       return { label: "Pendiente",   color: "#f39c12", icono: "↻" };
-        case "descartar":        return { label: "Descartada",  color: "#e74c3c", icono: "✗" };
-        case "saltada-cooldown": return { label: "En cooldown", color: "#8a96a6", icono: "⏱" };
-        case "no-pertenece":     return { label: "Sin acceso",  color: "#8a96a6", icono: "⊘" };
-        default:                 return { label: "—",           color: "#8a96a6", icono: "·" };
+        case "ok":               return { label: "OK",            color: "#27ae60", icono: "✓" };
+        case "reintentar":       return { label: "Pendiente",     color: "#f39c12", icono: "↻" };
+        case "descartar":        return { label: "Descartada",    color: "#e74c3c", icono: "✗" };
+        case "saltada-cooldown": return { label: "En cooldown",   color: "#8a96a6", icono: "⏱" };
+        //Los tres siguientes son ADVERTENCIAS, no errores: la aldea no
+        //recolectó por estado del juego, no por un fallo. Naranja con ⚠
+        //para que se vea distinto del verde "OK" pero sin alarmar como
+        //"Descartada" (rojo).
+        //  - no-pertenece:    aldea sin acceso (ciudad recién fundada).
+        //  - limite-diario:   server respondió con cupo diario alcanzado.
+        //  - recursos-llenos: ciudad con almacén lleno → no entra nada más.
+        case "no-pertenece":     return { label: "Sin acceso",    color: "#f39c12", icono: "⚠" };
+        case "limite-diario":    return { label: "Sin recursos",  color: "#f39c12", icono: "⚠" };
+        case "recursos-llenos":  return { label: "Ciudad llena",  color: "#f39c12", icono: "⚠" };
+        default:                 return { label: "—",             color: "#8a96a6", icono: "·" };
       }
     }
 
@@ -2011,13 +2103,33 @@
           ? [...histo].reverse().find((e) => e.ciclo === cicloN)
           : histo[histo.length - 1];
         const p = presentarStatus(entradaCiclo && entradaCiclo.status);
-        //Layout: status (badge) a la izquierda · nombre + hace-tiempo debajo
+        //Mostrar el mensaje de la última llamada en la barra del nombre
+        //(sin tener que expandir el historial). Para status OK no hay
+        //mensaje útil — mantenemos solo "hace Xm". Para los demás, si
+        //hay errorMsg lo agregamos truncado para que no rompa el layout.
+        let detalle = `hace ${escapeHtml(desde)}`;
+        if (entradaCiclo) {
+          let mensaje = "";
+          if (entradaCiclo.errorMsg) {
+            mensaje = String(entradaCiclo.errorMsg);
+          } else if (entradaCiclo.status === "saltada-cooldown" && entradaCiclo.esperaSeg) {
+            mensaje = `falta ${core.formatDuracion(entradaCiclo.esperaSeg)}`;
+          }
+          if (mensaje) {
+            //Truncado a 80 chars para que el row no crezca demasiado.
+            //La versión completa sigue disponible al expandir.
+            const cap = 80;
+            const mostrado = mensaje.length > cap ? mensaje.slice(0, cap - 1) + "…" : mensaje;
+            detalle += ` · ${escapeHtml(mostrado)}`;
+          }
+        }
+        //Layout: status (badge) a la izquierda · nombre + hace-tiempo+msg debajo
         const headerTxt =
           `<div style="display:flex;align-items:center;gap:10px;width:100%">` +
           `  <span style="color:${p.color};font-weight:bold;font-size:11px;min-width:62px;flex-shrink:0">${p.icono} ${escapeHtml(p.label)}</span>` +
           `  <div style="flex:1;line-height:1.25;min-width:0">` +
           `    <div style="color:#e6e9ee">${escapeHtml(aldea.name || `id ${aldea.id}`)}</div>` +
-          `    <div style="color:#7a8aa0;font-size:9.5px;margin-top:1px">hace ${escapeHtml(desde)}</div>` +
+          `    <div style="color:#7a8aa0;font-size:9.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${detalle}</div>` +
           `  </div>` +
           `</div>`;
         wrap.appendChild(seccionColapsable(
@@ -2353,6 +2465,26 @@
           esperado: 6,
           wood: 0, stone: 0, iron: 0,
           aldeasFalladas: [],
+          //Aldeas que respondieron "Se ha alcanzado la cantidad diaria
+          //máxima de recursos" — no es error, es estado del juego (la
+          //aldea ya entregó su cupo del día). Las flaggeamos para que el
+          //header de ciudad en el resumen del ciclo muestre ⚠ naranja
+          //en vez de ✓ verde, aunque numéricamente esté completa.
+          limiteDiario: 0,
+          //Aldeas que el server reportó como "no te pertenece" — la
+          //ciudad todavía no las desbloqueó. Trackearlas acá (además del
+          //decremento de `esperado`) habilita un tile dedicado en el
+          //Dashboard y diferenciarlas de errores reales.
+          bloqueadas: 0,
+          //Aldeas saltadas por cooldown (gate cliente o server) — no
+          //hay claim, pero tampoco fallo. Trackearlas acá habilita
+          //pintar el header como ⏱ gris cuando todas las aldeas de la
+          //ciudad están en cooldown, en vez del ✗ rojo "0/6".
+          saltadasCooldown: 0,
+          //Aldeas saltadas porque la ciudad tiene almacén lleno — no
+          //es fallo, es estado del juego. Mismo tratamiento que
+          //limiteDiario: ⚠ naranja en el header del ciclo.
+          recursosLlenos: 0,
         };
       }
       cicloActual = {
@@ -2560,16 +2692,19 @@
       //Contadores por ciudad para el resumen final:
       //  claims               aldeas claimeadas con éxito en este ciclo
       //  saltadasCooldown     aldeas en cooldown vivo (cliente o server) — esperado, no es error
-      //  descartadasOtras     errores no recuperables: recursosLlenos, sin relation_id, sin Town/CAPTCHA
+      //  descartadasOtras     errores no recuperables: sin relation_id, sin Town/CAPTCHA
       //  reintentadasFallidas success=false que tras 3 intentos siguen fallando
       //  bloqueadas           aldeas que el server reporta como "no te pertenece" — la ciudad
       //                       todavía no las desbloqueó (típico en ciudades recién fundadas con
       //                       <6 aldeas vasallas conquistadas). No es error: se descuentan del
       //                       total esperado para no marcar la tanda como incompleta.
+      //  recursosLlenos       aldeas saltadas porque la ciudad tiene almacén lleno —
+      //                       advertencia, no error. Mismo trato que bloqueadas/limiteDiario.
       //
-      //"tanda incompleta" (rojo) solo si claims+saltadasCooldown < (6 - bloqueadas) — o sea,
-      //si hubo descartes o reintentos agotados. Si todas las que faltaron
-      //estaban en cooldown legítimo o sin acceso, la tanda es OK (verde).
+      //"tanda incompleta" (rojo) solo si claims+saltadasCooldown < (6 - bloqueadas - limiteDiario - recursosLlenos)
+      //— o sea, si hubo descartes o reintentos agotados. Si todas las que
+      //faltaron estaban en cooldown legítimo, sin acceso, sin recursos o
+      //por ciudad llena, la tanda es OK (verde).
       for (const ciudad of ciudadesOrdenadas) {
         acumuladoCiclo[ciudad.codigoCiudad] = {
           wood: 0, stone: 0, iron: 0, claims: 0,
@@ -2577,6 +2712,12 @@
           descartadasOtras: 0,
           reintentadasFallidas: 0,
           bloqueadas: 0,
+          //Aldeas con cupo diario alcanzado — expected, no es error.
+          //Cuentan como "esperado" para el chequeo de tanda completa.
+          limiteDiario: 0,
+          //Aldeas saltadas por ciudad con almacén lleno — expected, no
+          //es error. Mismo tratamiento que limiteDiario.
+          recursosLlenos: 0,
         };
       }
 
@@ -2667,8 +2808,8 @@
           });
         }
         //status === "descartar": no-op (recolectarAldea ya lo gestionó —
-        //recursosLlenos / sin relation / cooldown server / no-pertenece /
-        //CAPTCHA).
+        //recursos-llenos / sin relation / cooldown server / no-pertenece /
+        //limite-diario / CAPTCHA).
       };
 
       const manejarErrorClaim = (t, e) => {
@@ -2700,8 +2841,34 @@
         //Si una response previa marcó la ciudad como llena, saltamos las
         //aldeas restantes de ESA ciudad. Sigue procesando otras ciudades —
         //no abortamos el ciclo entero. La ciudad llena se va a desbloquear
-        //sola cuando el jugador construya / haga upgrades.
-        if (t.ciudad.recursosLlenos) continue;
+        //sola cuando el jugador construya / haga upgrades. Registramos el
+        //claim como "recursos-llenos" (advertencia naranja, no error rojo)
+        //y descontamos del esperado del ciclo — patrón análogo a
+        //limite-diario / no-pertenece. Sin esto, la aldea quedaba mostrando
+        //el status del ciclo anterior y la card se veía como "Descartada"
+        //sin mensaje, confundiendo el diagnóstico.
+        if (t.ciudad.recursosLlenos) {
+          registrarClaim({
+            aldeaId: t.aldea.id, ciudadId: t.ciudad.codigoCiudad,
+            ciudadNombre: t.ciudad.nombreCiudad || t.ciudad.codigoCiudad,
+            aldeaNombre: t.aldea.name || `farm_${t.aldea.id}`,
+            ciclo: nCiclo, status: "recursos-llenos",
+            errorMsg: "ciudad con almacén lleno",
+          });
+          if (t.acumulador) t.acumulador.recursosLlenos += 1;
+          if (cicloActual && cicloActual.ciudades[t.ciudad.codigoCiudad]) {
+            const cc = cicloActual.ciudades[t.ciudad.codigoCiudad];
+            const eraCompleta = cc.claims >= cc.esperado;
+            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+            if (!eraCompleta && cc.claims >= cc.esperado) {
+              cicloActual.ciudadesCompletadas += 1;
+            }
+            actualizarIndicadorVivo();
+          }
+          continue;
+        }
 
         //═══ Gating de cooldown AL MOMENTO DEL FIRE ═══
         //
@@ -2727,6 +2894,14 @@
           if (t.aldea.loot > ahoraSec) {
             const restante = t.aldea.loot - ahoraSec;
             t.acumulador.saltadasCooldown += 1;
+            //Espejo el contador en cicloActual.ciudades para que el
+            //resumen del ciclo en la UI sepa cuántas aldeas quedaron en
+            //cooldown legítimo y pueda pintar la ciudad ⏱ gris en vez
+            //de ✗ rojo cuando claims=0.
+            if (cicloActual && cicloActual.ciudades[t.ciudad.codigoCiudad]) {
+              const cc = cicloActual.ciudades[t.ciudad.codigoCiudad];
+              cc.saltadasCooldown = (cc.saltadasCooldown || 0) + 1;
+            }
             registrarClaim({
               aldeaId: t.aldea.id, ciudadId: t.ciudad.codigoCiudad,
               ciudadNombre: t.ciudad.nombreCiudad || t.ciudad.codigoCiudad,
@@ -2744,6 +2919,10 @@
         if (last > 0 && transcurrido < cooldownGateMs) {
           const restante = Math.round((cooldownGateMs - transcurrido) / 1000);
           t.acumulador.saltadasCooldown += 1;
+          if (cicloActual && cicloActual.ciudades[t.ciudad.codigoCiudad]) {
+            const cc = cicloActual.ciudades[t.ciudad.codigoCiudad];
+            cc.saltadasCooldown = (cc.saltadasCooldown || 0) + 1;
+          }
           registrarClaim({
             aldeaId: t.aldea.id, ciudadId: t.ciudad.codigoCiudad,
             ciudadNombre: t.ciudad.nombreCiudad || t.ciudad.codigoCiudad,
@@ -2919,29 +3098,32 @@
         if (!acc) continue;
         //Skip ciudades sin actividad (no debería pasar — todas tienen 6
         //aldeas — pero es defensivo).
-        const total = acc.claims + acc.saltadasCooldown + acc.descartadasOtras + acc.reintentadasFallidas + acc.bloqueadas;
+        const total = acc.claims + acc.saltadasCooldown + acc.descartadasOtras + acc.reintentadasFallidas + acc.bloqueadas + acc.limiteDiario + acc.recursosLlenos;
         if (total === 0) continue;
 
         const nombre = ciudad.nombreCiudad || ciudad.codigoCiudad;
         const recursos = `${fmt(acc.wood)}/${fmt(acc.stone)}/${fmt(acc.iron)}`;
 
         //Desglose: claims OK + saltadas por cooldown legítimo (cliente o
-        //server) + bloqueadas (sin acceso) cuentan como "esperado". Solo
-        //es tanda incompleta REAL si hubo descartes (recursosLlenos / sin
-        //relation / sin Town / CAPTCHA) o reintentos agotados — esos sí
-        //son yield perdido.
+        //server) + bloqueadas (sin acceso) + cupo diario alcanzado +
+        //ciudad llena cuentan como "esperado". Solo es tanda incompleta
+        //REAL si hubo descartes (sin relation / sin Town / CAPTCHA) o
+        //reintentos agotados — esos sí son yield perdido.
         const partes = [`${acc.claims} ok`];
         if (acc.saltadasCooldown) partes.push(`${acc.saltadasCooldown} en cooldown`);
+        if (acc.limiteDiario) partes.push(`${acc.limiteDiario} sin recursos`);
+        if (acc.recursosLlenos) partes.push(`${acc.recursosLlenos} ciudad llena`);
         if (acc.bloqueadas) partes.push(`${acc.bloqueadas} sin acceso`);
         if (acc.reintentadasFallidas) partes.push(`${acc.reintentadasFallidas} fallaron tras retry`);
         if (acc.descartadasOtras) partes.push(`${acc.descartadasOtras} descartadas`);
         const desglose = partes.join(", ");
 
-        //Las bloqueadas (no le pertenecen al jugador) no son aldeas
+        //Las bloqueadas (no le pertenecen al jugador), las que pegaron el
+        //cupo diario y las saltadas por ciudad llena no son fallos
         //farmeables: las descontamos del total esperado para que una
-        //ciudad recién fundada con 4/6 aldeas conquistadas no marque la
-        //tanda como incompleta cada ciclo.
-        const esperadoCiudad = TOTAL_ESPERADO - acc.bloqueadas;
+        //ciudad con 1/6 OK + 5/6 ciudad-llena no marque la tanda como
+        //incompleta.
+        const esperadoCiudad = TOTAL_ESPERADO - acc.bloqueadas - acc.limiteDiario - acc.recursosLlenos;
         const esperado = acc.claims + acc.saltadasCooldown;
         const fallasReales = acc.reintentadasFallidas + acc.descartadasOtras;
 
@@ -2985,8 +3167,12 @@
      *   - 'ok'         claim exitoso (server confirmó con notification 'Town')
      *   - 'reintentar' fallo recuperable (success:false del server) — vale la
      *                  pena reintentar al final del ciclo
-     *   - 'descartar'  fallo no recuperable en este ciclo (sin relation_id,
-     *                  almacén lleno, CAPTCHA, sin Town) — no reintentar
+     *   - 'descartar'  no procesable en este ciclo (sin relation_id, almacén
+     *                  lleno, CAPTCHA, sin Town, sin acceso, cupo diario) — no
+     *                  reintentar. Algunos casos son advertencias (no errores):
+     *                  registran status "recursos-llenos" / "no-pertenece" /
+     *                  "limite-diario" en historial pero el contrato del
+     *                  retorno sigue siendo 'descartar' para el caller.
      * El caller (manejarResultadoClaim en recolectarCiudades) usa el status
      * para decidir si actualiza lastClaimAtPorAldea y/o si encola la aldea
      * para retry.
@@ -2999,15 +3185,29 @@
       if (recursosLlenos) {
         core.logWarn(
           "recoleccion",
-          `aldea ${aldea.id} (${ciudadNombreSafe}): saltada porque ciudad tiene recursosLlenos=true`
+          `aldea ${aldea.id} (${ciudadNombreSafe}): saltada porque ciudad tiene almacén lleno`
         );
         registrarClaim({
           aldeaId: aldea.id, ciudadId: codigoCiudad,
           ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
-          ciclo: nCiclo, status: "descartar",
-          errorMsg: "ciudad con recursosLlenos",
+          ciclo: nCiclo, status: "recursos-llenos",
+          errorMsg: "ciudad con almacén lleno",
         });
-        if (acumulador) acumulador.descartadasOtras += 1;
+        if (acumulador) acumulador.recursosLlenos += 1;
+        //Mismo ajuste de `esperado`/ciudadesCompletadas que en
+        //no-pertenece y limite-diario: la aldea queda fuera del
+        //denominador del ciclo porque no pudo entregar (no es fallo).
+        if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+          const cc = cicloActual.ciudades[codigoCiudad];
+          const eraCompleta = cc.claims >= cc.esperado;
+          cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+          cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
+          cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+          if (!eraCompleta && cc.claims >= cc.esperado) {
+            cicloActual.ciudadesCompletadas += 1;
+          }
+          actualizarIndicadorVivo();
+        }
         return { status: "descartar" };
       }
 
@@ -3119,6 +3319,10 @@
           //dice "todavía no toca". No es error, es expected — cuenta como
           //saltada-cooldown para que el resumen no pinte la tanda en rojo.
           if (acumulador) acumulador.saltadasCooldown += 1;
+          if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+            const cc = cicloActual.ciudades[codigoCiudad];
+            cc.saltadasCooldown = (cc.saltadasCooldown || 0) + 1;
+          }
           return { status: "descartar" };
         }
 
@@ -3158,6 +3362,50 @@
             const cc = cicloActual.ciudades[codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
             cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.bloqueadas = (cc.bloqueadas || 0) + 1;
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+            if (!eraCompleta && cc.claims >= cc.esperado) {
+              cicloActual.ciudadesCompletadas += 1;
+            }
+            actualizarIndicadorVivo();
+          }
+          return { status: "descartar" };
+        }
+
+        //Detectar específicamente "Se ha alcanzado la cantidad diaria
+        //máxima de recursos para esta aldea". Es expected — el server
+        //tiene un cap por aldea por día, así que volver a pegarle no
+        //sirve. Trato análogo a "no te pertenece": descarte silencioso
+        //(log info, no warn), sin retry, y nuevo status "limite-diario"
+        //en el historial → la UI lo pinta como ⚠ naranja "Sin recursos"
+        //y el resumen de tanda no lo cuenta como fallo. Diferencia con
+        //"no-pertenece": acá vale la pena que la ciudad muestre orange
+        //⚠ (no verde) en el resumen del ciclo para que se vea que
+        //pegó el cap — `cc.limiteDiario` habilita ese override en el
+        //renderer.
+        const esLimiteDiario = typeof errorMsg === "string" &&
+          /cantidad diaria m[áa]xima|daily.*max(?:imum)?.*resource|max(?:imum)?.*daily.*resource|tagesh[öo]chstmenge/i.test(errorMsg);
+
+        if (esLimiteDiario) {
+          core.log(
+            "recoleccion",
+            `aldea ${farmTownId} (${ciudadNombreSafe}): cupo diario alcanzado — ${errorMsg}`
+          );
+          registrarClaim({
+            aldeaId: farmTownId, ciudadId: codigoCiudad,
+            ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
+            ciclo: nCiclo, status: "limite-diario",
+            errorMsg,
+          });
+          if (acumulador) acumulador.limiteDiario += 1;
+          //Mismo ajuste de `esperado`/ciudadesCompletadas que en
+          //no-pertenece (ver comentario arriba) — la aldea queda fuera
+          //del denominador del ciclo porque ya cumplió su cupo del día.
+          if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+            const cc = cicloActual.ciudades[codigoCiudad];
+            const eraCompleta = cc.claims >= cc.esperado;
+            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.limiteDiario = (cc.limiteDiario || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
               cicloActual.ciudadesCompletadas += 1;
