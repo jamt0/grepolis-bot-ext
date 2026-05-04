@@ -41,7 +41,7 @@ Funciona como **extensión local cargada en modo desarrollador**. No se publica 
 ### Anti-detección / CAPTCHA
 - Espera **2-2.5 s entre claims** con jitter aleatorio (rompe el patrón de "request exactamente cada N ms").
 - Mezcla el orden de las aldeas dentro de cada ciudad cada ciclo.
-- Si Grepolis dispara el CAPTCHA anti-bot, el bot **detecta**, **avisa con sonido + flash del título de la pestaña**, y mientras está activo solo hace un *probe* cada 30s para detectar resolución. Una vez que vos resolvés el CAPTCHA en el juego, el bot reanuda sin que tengas que hacer nada.
+- Si Grepolis dispara el CAPTCHA anti-bot, el bot **se detiene** (no hace más requests) y avisa con sonido + flash del título de la pestaña + cartel grande en el panel. Vos resolvés el CAPTCHA del juego manualmente y apretás el botón **"Ya resolví"**: el bot refresca el estado del server (detecta qué aldeas claimeaste vos en el medio para respetar sus cooldowns) y reanuda. Si pasan 10 min sin que aprietes el botón, queda pausado y el siguiente *Iniciar* arranca un ciclo limpio.
 
 ---
 
@@ -88,7 +88,7 @@ En la esquina superior derecha activá el toggle **"Modo de desarrollador"** (en
 1. Abrí Grepolis en el navegador (`https://es144.grepolis.com/...` o tu mundo).
 2. **Logueate y entrá a una ciudad** (no te quedes en la pantalla de selección de mundo).
 3. Esperá ~3 segundos.
-4. En la esquina inferior izquierda deberían aparecer **dos botones cuadrados**: el verde con `▶` (play del bot) y el blanco con `⚙` (configuración).
+4. En la esquina inferior izquierda, al costado del pulpo del juego, debería aparecer una **card "Jam"** con un slime verde. Esa card es el "abridor" del panel — todo (play/pause, configuración, estadísticas) vive adentro del panel.
 
 Si no aparecen:
 - Abrí DevTools (`F12`) → tab **Console** y buscá errores con prefijo `[JamBot/...]`.
@@ -100,23 +100,27 @@ Si no aparecen:
 
 ### Arrancar y parar el bot
 
-| Acción | Botón |
-|--------|-------|
-| Iniciar la recolección | Click en el ▶ (verde) — pasa a ⏸ (azul) |
-| Pausar | Click en el ⏸ — vuelve a ▶ verde |
-| Abrir/cerrar panel | Click en el ⚙ (blanco) |
+| Acción | Cómo |
+|--------|------|
+| Abrir panel | Click en la card **Jam** (esquina inferior izquierda, al lado del pulpo). |
+| Iniciar la recolección | Abrí el panel → arriba a la derecha, botón **▶ Iniciar**. Pasa a azul "Pausar". |
+| Pausar | Botón **⏸ Pausar** del header del panel. |
+| Cerrar panel | Click en la **✕** del header, o click fuera del panel. |
 
-**El bot arranca pausado** después de cada recarga de la pestaña — tenés que apretar play manualmente. Eso es a propósito: evita que se dispare claims sin querer si solo abriste Grepolis para mirar algo.
+**El bot arranca pausado** después de cada recarga de la pestaña — tenés que apretar Iniciar manualmente. Eso es a propósito: evita que se dispare claims sin querer si solo abriste Grepolis para mirar algo.
 
-### Indicador en tiempo real
+### Indicador en tiempo real (en la card Jam)
 
-Mientras hay un ciclo en curso, debajo de los botones aparece:
+La card "Jam" siempre visible muestra el estado del bot sin abrir el panel:
 
-```
-🍎 2/3 ciudades · 9/18 aldeas
-```
-
-Se actualiza con cada aldea farmeada y desaparece cuando el ciclo termina. **Te muestra el progreso sin necesidad de abrir el panel.**
+| Estado de la card | Significa |
+|-------------------|-----------|
+| Card normal con `▶` verde | Pausado. |
+| Card normal sin icono + countdown a la derecha (`5m 12s`) | Corriendo, esperando próximo ciclo. |
+| Card normal con spinner naranja girando | Ciclo en curso. |
+| Card con borde rojo y `⚠` + nombre de aldea | CAPTCHA pendiente — click en la card para abrir el cartel "Ya resolví". |
+| Card con borde verde y `⚠` | CAPTCHA pendiente, pero el bridge ya detectó que lo resolviste en el juego — falta confirmar con "Ya resolví". |
+| Card con borde gris y `⏱` | CAPTCHA en timeout (10 min sin resolver). El bot está detenido. |
 
 ---
 
@@ -133,7 +137,7 @@ Cada ciudad tiene un cooldown propio del servidor para los claims rápidos:
 
 ### Cómo configurar
 
-1. Click en el botón ⚙ → tab **"Settings"**.
+1. Click en la card **Jam** para abrir el panel → tab **"Settings"**.
 2. En la sección **"Tiempo de recolección por ciudad"** ves cada ciudad con un selector `5 min` / `10 min`.
 3. Para cada ciudad, elegí el valor que coincida con su cooldown real:
    - Si la ciudad tiene Lealtad → **10 min**
@@ -154,12 +158,16 @@ Cada ciudad tiene un cooldown propio del servidor para los claims rápidos:
 
 ## 6. El panel de información
 
-El botón ⚙ abre un panel con 3 tabs:
+La card **Jam** abre un panel con 4 tabs (default: Dashboard):
+
+### Tab "Dashboard"
+Vista resumen de un golpe de vista — totales del último ciclo, próximo, errores recientes. Es el tab que se abre por default cuando hacés click en la card sin captcha activo.
 
 ### Tab "Settings"
 Configuración (ver punto 5).
 
 ### Tab "Recolección"
+- **Cartel CAPTCHA** (solo si hay captcha pendiente o en timeout): qué ciudad/aldea disparó el CAPTCHA, lista de aldeas pendientes en cola, countdown del timeout (10 min) y botón **"Ya resolví"** para sincronizar y reanudar.
 - **Ciclo en curso** (mientras corre): qué ciudades ya se procesaron y cuáles faltan, en color naranja.
 - **Último ciclo**: resumen del último ciclo terminado — verde si fue completo (6/6 en cada ciudad), rojo si alguna ciudad quedó incompleta.
 - **Ciclos anteriores** (colapsable): los últimos 36 ciclos persistidos (~6 horas a 10 min/ciclo). Click en cada uno para ver el detalle.
@@ -182,13 +190,13 @@ Configuración (ver punto 5).
 
 ## 7. Solución de problemas frecuentes
 
-### "Los botones del bot no aparecen"
+### "La card Jam no aparece"
 - Asegurate de estar en la página del juego (no en el foro, wiki, ni en la selección de mundos).
 - Verificá en `chrome://extensions` que la extensión está activada.
 - Recargá la pestaña. Si sigue sin aparecer, abrí DevTools (F12) y mirá errores `[JamBot/bootstrap]`.
 
 ### "El bot dice 'CAPTCHA detectado' pero yo no veo nada"
-- Grepolis dispara el CAPTCHA en una notificación dentro del juego — buscala. Una vez resuelto, el bot reanuda solo en menos de 30s.
+- Grepolis dispara el CAPTCHA en una notificación dentro del juego — buscala. Una vez resuelto, **apretá el botón "Ya resolví" en el cartel del tab Recolección** (o click en la card Jam, que te lleva directo al cartel). El bot va a refrescar el estado del server y retomar el ciclo. Si pasan 10 min sin que aprietes, queda pausado.
 
 ### "Una tanda salió en rojo (3/6 aldeas)"
 - Pasa de vez en cuando por borde de cooldown server. El retry automático (3 intentos) debería recuperarla en el siguiente ciclo.
@@ -198,7 +206,10 @@ Configuración (ver punto 5).
 - Es el comportamiento esperado durante hasta ~10 min (el tiempo del cooldown más largo). El bot ya sabe que las aldeas están en cooldown y espera; el panel muestra `próxima en X minutos`. Si una aldea se libera antes del próximo ciclo normal, el bot **adelanta el tick** automáticamente.
 
 ### "Quiero pausar pero la pestaña tiene que seguir abierta"
-- Sí — la extensión vive en la pestaña. Si cerrás la pestaña, el bot deja de funcionar. Si solo querés que pare por un rato, click en ⏸.
+- Sí — la extensión vive en la pestaña. Si cerrás la pestaña, el bot deja de funcionar. Si solo querés que pare por un rato, abrí el panel y apretá ⏸ Pausar.
+
+### "Recargué la extensión desde chrome://extensions y el bot empezó a tirar errores"
+- Cuando recargás la extensión sin recargar la pestaña del juego, el content-script viejo queda huérfano. El bot detecta el caso, loguea una vez "extensión recargada — recargá la pestaña del juego (F5) para continuar" y se pausa solo. **Recargá la pestaña con F5** y el bot vuelve a arrancar limpio.
 
 ### "Los datos del panel desaparecen después de cerrar el navegador"
 - No deberían: persisten en `chrome.storage.local`. Si pasa, verificá que no tenés activado "Borrar cookies al cerrar" para Grepolis.
