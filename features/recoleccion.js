@@ -308,13 +308,83 @@
     }
 
     //—— UI ——————————————————————————————————————————————————————————————
+    //
+    //Una sola "card" arriba de los islotes inferiores: ícono slime + "Jam"
+    //+ estado (▶/⏸/⚠). Click en cualquier parte abre el panel. El
+    //play/pause y la configuración viven AHORA dentro del panel — antes
+    //eran 2 botones flotantes separados que ocupaban espacio y se podían
+    //clickear sin querer. Esta card es solo un "abridor".
 
-    const boton = core.registrarBoton({
-      id: "botonRecolectarRecursos",
-      label: "▶",
-      onClick: () => core.togglePlayPause(),
-    });
-    pintarEstadoBoton("pausado");
+    const panelConfig = crearPanelConfig();
+    crearCardJam();
+
+    function crearCardJam() {
+      //Reusamos el contenedor #jambot-buttons que crea core.js (sigue
+      //existiendo para que el indicador en tiempo real pueda anclar ahí).
+      const cont = (function () {
+        let c = document.getElementById("jambot-buttons");
+        if (c) return c;
+        c = document.createElement("div");
+        c.id = "jambot-buttons";
+        c.style.cssText =
+          "position:absolute;bottom:90px;left:10px;z-index:5;" +
+          "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
+        document.body.appendChild(c);
+        return c;
+      })();
+
+      const card = document.createElement("div");
+      card.id = "jambot-card";
+      card.style.cssText =
+        "display:flex;align-items:center;gap:8px;padding:7px 12px 7px 8px;" +
+        "background:#1f2a36;color:#cdd5e0;border:1px solid #2c3a4d;" +
+        "border-radius:6px;cursor:pointer;user-select:none;" +
+        "font-family:'Segoe UI',sans-serif;font-size:13px;font-weight:bold;" +
+        "letter-spacing:0.3px;box-shadow:0 2px 6px rgba(0,0,0,0.3);" +
+        "transition:background 0.15s,border-color 0.15s";
+      //SVG slime: blob verde con dos ojitos. No hay emoji estándar de
+      //slime; un SVG inline queda más limpio que cualquier emoji forzado.
+      card.innerHTML =
+        `<svg width="22" height="22" viewBox="0 0 24 24" style="flex-shrink:0">
+           <ellipse cx="12" cy="19" rx="10" ry="3" fill="rgba(0,0,0,0.25)"/>
+           <path d="M3 17 Q3 7 12 5 Q21 7 21 17 Q21 20 12 20 Q3 20 3 17 Z"
+                 fill="#27ae60" stroke="#1e8449" stroke-width="0.8"/>
+           <path d="M5 12 Q12 4 19 12 Q12 9 5 12 Z" fill="rgba(255,255,255,0.18)"/>
+           <circle cx="9" cy="13" r="1.6" fill="#fff"/>
+           <circle cx="15" cy="13" r="1.6" fill="#fff"/>
+           <circle cx="9.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
+           <circle cx="15.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
+         </svg>
+         <span>Jam</span>
+         <span id="jambot-card-estado" style="margin-left:4px;font-size:14px"></span>`;
+      card.addEventListener("mouseenter", () => {
+        card.style.background = "#26344a";
+        card.style.borderColor = "#3498db";
+      });
+      card.addEventListener("mouseleave", () => {
+        card.style.background = "#1f2a36";
+        card.style.borderColor = "#2c3a4d";
+      });
+      card.addEventListener("click", () => togglePanelConfig(panelConfig));
+      cont.appendChild(card);
+      return card;
+    }
+
+    function actualizarEstadoCard() {
+      const span = document.getElementById("jambot-card-estado");
+      if (!span) return;
+      if (core.isCaptchaActive()) {
+        span.textContent = "⚠";
+        span.style.color = "#e74c3c";
+      } else if (core.isPaused()) {
+        span.textContent = "▶";
+        span.style.color = "#27ae60";
+      } else {
+        span.textContent = "⏸";
+        span.style.color = "#3498db";
+      }
+    }
+    actualizarEstadoCard();
 
     //Reaccionar al play/pause global: cancelar tick al pausar, arrancar al
     //despausar. El estado se sincroniza con `core.isPaused()`.
@@ -325,19 +395,11 @@
         proximoTickId = null;
         proximoTickAt = null;
         watchdogId = null;
-        pintarEstadoBoton("pausado");
+        actualizarEstadoCard();
       } else {
-        pintarEstadoBoton("corriendo");
+        actualizarEstadoCard();
         recolectarRecursos();
       }
-    });
-
-    //Botón ⚙ + panel de config por ciudad
-    const panelConfig = crearPanelConfig();
-    core.registrarBoton({
-      id: "botonConfigJam",
-      label: "⚙",
-      onClick: () => togglePanelConfig(panelConfig),
     });
 
     //Indicador en tiempo real bajo los botones — muestra "🍎 X/Y ciudades ·
@@ -388,9 +450,9 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["settings", "recoleccion", "construccion"];
-    let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "settings";
-    if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "settings";
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion"];
+    let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
+    if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
     //  ciclos: { actual: bool, ultimo: bool }   true = expandido
     //  ciudades: { [id]: bool }                 true = expandido
@@ -444,10 +506,11 @@
       if (!panel || panel.style.display === "none") return;
       //Click dentro del panel → no cerrar.
       if (panel.contains(e.target)) return;
-      //Click sobre el botón ⚙ → no cerrar acá; el handler del botón se
-      //encarga del toggle (sino quedaría abre/cierra/abre en el mismo click).
-      const botonConfig = document.getElementById("botonConfigJam");
-      if (botonConfig && botonConfig.contains(e.target)) return;
+      //Click sobre la card "Jam" → no cerrar acá; el handler de la card
+      //se encarga del toggle (sino quedaría abre/cierra/abre en el mismo
+      //click).
+      const cardJam = document.getElementById("jambot-card");
+      if (cardJam && cardJam.contains(e.target)) return;
       cerrarPanel(panel);
     };
 
@@ -473,7 +536,8 @@
         //es estático y no necesita repintar.
         const body = panel.querySelector(".pcj-body");
         if (!body) return;
-        if (tabActivo === "recoleccion") renderTabRecoleccion(body);
+        if (tabActivo === "dashboard") renderTabDashboard(body);
+        else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
         else if (tabActivo === "construccion") renderTabConstruccion(body);
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
@@ -535,6 +599,7 @@
       tabs.className = "pcj-tabs";
       tabs.style.cssText =
         "display:flex;border-bottom:1px solid #2c3a4d;background:#172029";
+      tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
@@ -558,9 +623,21 @@
       b.textContent = label;
       const activo = tabActivo === id;
       b.style.cssText =
-        `flex:1;padding:8px 12px;background:${activo ? "#1f2a36" : "transparent"};` +
-        `color:${activo ? "#3498db" : "#8a96a6"};border:none;border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
-        "cursor:pointer;font-weight:bold;font-size:12px;transition:all 0.15s";
+        `flex:1;padding:10px 12px;background:${activo ? "#1f2a36" : "transparent"};` +
+        `color:${activo ? "#3498db" : "#7a8aa0"};border:none;` +
+        `border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
+        "cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:0.3px;" +
+        "transition:all 0.15s";
+      if (!activo) {
+        b.addEventListener("mouseenter", () => {
+          b.style.background = "#1a232e";
+          b.style.color = "#cdd5e0";
+        });
+        b.addEventListener("mouseleave", () => {
+          b.style.background = "transparent";
+          b.style.color = "#7a8aa0";
+        });
+      }
       b.addEventListener("click", () => {
         tabActivo = id;
         window.localStorage.setItem(STORAGE_KEY_TAB, id);
@@ -571,7 +648,8 @@
 
     function renderTabActivo(body) {
       body.innerHTML = "";
-      if (tabActivo === "settings") renderTabSettings(body);
+      if (tabActivo === "dashboard") renderTabDashboard(body);
+      else if (tabActivo === "settings") renderTabSettings(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
       else renderTabRecoleccion(body);
     }
@@ -580,28 +658,246 @@
       const header = panel.querySelector("#panelHeaderEstado");
       if (!header) return;
 
-      let estadoTexto, estadoColor;
+      let estadoIcono, estadoTexto, estadoColor;
       if (core.isCaptchaActive()) {
-        estadoTexto = "⚠ CAPTCHA";
-        estadoColor = "#e74c3c";
+        estadoIcono = "⚠"; estadoTexto = "CAPTCHA"; estadoColor = "#e74c3c";
       } else if (core.isPaused()) {
-        estadoTexto = "▶ Pausado";
-        estadoColor = "#27ae60";
+        estadoIcono = "▶"; estadoTexto = "Pausado"; estadoColor = "#27ae60";
       } else {
-        estadoTexto = "⏸ Corriendo";
-        estadoColor = "#3498db";
+        estadoIcono = "⏸"; estadoTexto = "Corriendo"; estadoColor = "#3498db";
       }
 
       let proximoTexto = "—";
+      let proximoColor = "#cdd5e0";
       if (cicloActual) {
-        proximoTexto = `<span style="color:#f39c12">en curso (${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciudades · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas)</span>`;
+        proximoTexto = `en curso · ${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciud · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
+        proximoColor = "#f39c12";
       } else if (proximoTickAt) {
         proximoTexto = core.formatDuracion((proximoTickAt - Date.now()) / 1000);
       }
 
       header.innerHTML =
-        `<div><strong>Estado:</strong> <span style="color:${estadoColor}">${estadoTexto}</span></div>` +
-        `<div><strong>Próximo ciclo:</strong> ${proximoTexto}</div>`;
+        `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:11.5px">` +
+        `  <span><span style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.8px;font-size:10px;font-weight:bold">Estado</span>` +
+        `        <span style="color:${estadoColor};font-weight:bold;margin-left:6px">${estadoIcono} ${estadoTexto}</span></span>` +
+        `  <span><span style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.8px;font-size:10px;font-weight:bold">Próximo ciclo</span>` +
+        `        <span style="color:${proximoColor};font-weight:bold;margin-left:6px">${proximoTexto}</span></span>` +
+        `</div>`;
+    }
+
+    //—— Tab Dashboard ——————————————————————————————————————————————————
+    //
+    //Vista resumen + control central. Por defecto al abrir el panel.
+    //Concentra:
+    //  - Botón play/pause grande (antes era flotante)
+    //  - Resumen 1-vistazo de Recolección (próximo ciclo, último ciclo)
+    //  - Resumen 1-vistazo de Construcción (próximo tick, cola, última)
+    //  - Errores recientes resumidos
+    //
+    //Idea: si solo querés saber "cómo va el bot", no hace falta saltar
+    //entre tabs.
+
+    function renderTabDashboard(body) {
+      //Botón play/pause grande, colorizado según estado
+      body.appendChild(renderControlPlayPause());
+
+      //Resumen Recolección
+      body.appendChild(crearSeparador());
+      body.appendChild(crearTituloSeccion("📦  Recolección"));
+      body.appendChild(renderResumenRecoleccion());
+
+      //Resumen Construcción
+      body.appendChild(crearSeparador());
+      body.appendChild(crearTituloSeccion("🏗  Construcción"));
+      body.appendChild(renderResumenConstruccion());
+
+      //Errores recientes (siempre visible, top 5)
+      body.appendChild(crearSeparador());
+      const errores = core.getErrores ? core.getErrores().slice(-5).reverse() : [];
+      const tituloE = crearTituloSeccion(`⚠  Últimos errores  (${errores.length})`);
+      body.appendChild(tituloE);
+      body.appendChild(renderErroresCompactos(errores));
+    }
+
+    function renderControlPlayPause() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:flex;align-items:center;gap:12px;padding:8px 0";
+
+      const captcha = core.isCaptchaActive();
+      const pausado = core.isPaused();
+      const estadoLabel = captcha ? "⚠ CAPTCHA detectado"
+        : pausado ? "▶  Pausado"
+        : "⏸  Corriendo";
+      const estadoColor = captcha ? "#e74c3c" : pausado ? "#27ae60" : "#3498db";
+
+      const estadoTxt = document.createElement("div");
+      estadoTxt.style.cssText = `flex:1;font-weight:bold;font-size:14px;color:${estadoColor}`;
+      estadoTxt.textContent = estadoLabel;
+      wrap.appendChild(estadoTxt);
+
+      const btn = document.createElement("button");
+      const accion = pausado ? "Iniciar" : "Pausar";
+      btn.textContent = (pausado ? "▶  " : "⏸  ") + accion;
+      btn.style.cssText =
+        `padding:8px 18px;background:${estadoColor};color:#fff;border:none;` +
+        "border-radius:4px;cursor:pointer;font-weight:bold;font-size:13px;" +
+        "letter-spacing:0.3px;transition:opacity 0.15s";
+      if (captcha) {
+        btn.disabled = true;
+        btn.style.opacity = "0.6";
+        btn.style.cursor = "not-allowed";
+        btn.title = "Resolvé el CAPTCHA en el juego primero";
+      }
+      btn.addEventListener("click", () => {
+        if (captcha) return;
+        core.togglePlayPause();
+        //Re-render del tab actual para reflejar el cambio inmediato
+        const bodyEl = document.querySelector("#panelConfigJam .pcj-body");
+        if (bodyEl) renderTabDashboard(bodyEl);
+      });
+      wrap.appendChild(btn);
+      return wrap;
+    }
+
+    function renderResumenRecoleccion() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "font-size:12px;line-height:1.7";
+      const linea = (label, val, color) => {
+        const d = document.createElement("div");
+        d.innerHTML = `<span style="color:#8a96a6;display:inline-block;min-width:140px">${label}</span>` +
+          `<span style="color:${color || "#cdd5e0"}">${val}</span>`;
+        return d;
+      };
+
+      //Próximo ciclo
+      let proximoTxt = "—";
+      let proximoColor;
+      if (cicloActual) {
+        proximoTxt = `en curso · ${cicloActual.ciudadesCompletadas}/${cicloActual.totalCiudades} ciudades · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
+        proximoColor = "#f39c12";
+      } else if (proximoTickAt) {
+        proximoTxt = core.formatDuracion((proximoTickAt - Date.now()) / 1000);
+        proximoColor = "#3498db";
+      }
+      wrap.appendChild(linea("Próximo ciclo:", proximoTxt, proximoColor));
+
+      //Último ciclo
+      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
+      if (ultimo) {
+        const total = (ultimo.totalAldeas != null) ? ultimo.totalAldeas
+          : Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
+        const claims = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
+        const completo = claims === total;
+        wrap.appendChild(linea(
+          "Último ciclo:",
+          `${completo ? "✓" : "✗"} #${ultimo.n} · ${claims}/${total} aldeas · ${formatHoraCorta(ultimo.fin)}`,
+          completo ? "#27ae60" : "#e74c3c"
+        ));
+        const totWood = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.wood || 0), 0);
+        const totStone = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.stone || 0), 0);
+        const totIron = Object.values(ultimo.ciudades || {}).reduce((s, c) => s + (c.iron || 0), 0);
+        wrap.appendChild(linea("Recursos último ciclo:", `+${totWood} mad / +${totStone} pie / +${totIron} pla`));
+      } else {
+        wrap.appendChild(linea("Último ciclo:", "(todavía no hubo ninguno en esta sesión)", "#8a96a6"));
+      }
+
+      //Acumulado de la sesión (sumando todos los ciclos persistidos)
+      if (ciclos.length > 0) {
+        let totWood = 0, totStone = 0, totIron = 0;
+        for (const c of ciclos) {
+          for (const cd of Object.values(c.ciudades || {})) {
+            totWood += cd.wood || 0;
+            totStone += cd.stone || 0;
+            totIron += cd.iron || 0;
+          }
+        }
+        wrap.appendChild(linea(
+          `Acumulado (${ciclos.length} ciclos):`,
+          `+${totWood} mad / +${totStone} pie / +${totIron} pla`,
+          "#27ae60"
+        ));
+      }
+
+      wrap.appendChild(linea("Ciudades:", `${ciudadesConAldeas.length}`));
+
+      return wrap;
+    }
+
+    function renderResumenConstruccion() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "font-size:12px;line-height:1.7";
+      const linea = (label, val, color) => {
+        const d = document.createElement("div");
+        d.innerHTML = `<span style="color:#8a96a6;display:inline-block;min-width:140px">${label}</span>` +
+          `<span style="color:${color || "#cdd5e0"}">${val}</span>`;
+        return d;
+      };
+
+      const ds = data.construccion;
+      if (!ds) {
+        wrap.appendChild(linea("Estado:", "(feature no inicializada)", "#8a96a6"));
+        return wrap;
+      }
+
+      const estado = !ds.habilitada ? "Deshabilitada"
+        : core.isPaused() ? "En pausa (bot pausado)"
+        : "Activa";
+      const estadoColor = !ds.habilitada ? "#8a96a6"
+        : core.isPaused() ? "#27ae60" : "#3498db";
+      wrap.appendChild(linea("Estado:", estado, estadoColor));
+
+      let proximoTxt = "—";
+      if (ds.proximoTickAt) {
+        const seg = Math.max(0, Math.round((ds.proximoTickAt - Date.now()) / 1000));
+        proximoTxt = core.formatDuracion(seg);
+      }
+      wrap.appendChild(linea("Próximo tick:", proximoTxt));
+
+      const cola = ds.ultimaCola || [];
+      const enVentana = cola.filter((o) => o.enVentana || (o.segundosRestantes != null && o.segundosRestantes <= 290)).length;
+      wrap.appendChild(linea(
+        "En cola:",
+        `${cola.length} órdenes` + (enVentana ? ` · ${enVentana} en ventana free` : ""),
+        enVentana ? "#f39c12" : undefined
+      ));
+
+      const finalizadas = ds.finalizadas || [];
+      if (finalizadas.length) {
+        const ultima = finalizadas[finalizadas.length - 1];
+        wrap.appendChild(linea(
+          "Última finalizada:",
+          `${ultima.town_nombre || ultima.town_id} ← ${ultima.building_type} · ${formatHoraCorta(ultima.ts)}`,
+          "#27ae60"
+        ));
+      }
+      wrap.appendChild(linea(`Total finalizadas:`, `${finalizadas.length}`));
+
+      return wrap;
+    }
+
+    function renderErroresCompactos(errores) {
+      const wrap = document.createElement("div");
+      if (!errores.length) {
+        const v = document.createElement("div");
+        v.textContent = "Sin errores ni warnings.";
+        v.style.cssText = "opacity:0.6;font-style:italic;padding:4px 0;font-size:11.5px";
+        wrap.appendChild(v);
+        return wrap;
+      }
+      wrap.style.cssText = "font-family:monospace;font-size:10.5px";
+      for (const e of errores) {
+        const c = e.nivel === "error" ? "#e74c3c" : "#f39c12";
+        const fila = document.createElement("div");
+        fila.style.cssText =
+          "display:flex;gap:8px;padding:2px 0;border-bottom:1px solid #1a232e";
+        fila.innerHTML =
+          `<span style="color:#8a96a6;min-width:42px">${formatHoraCorta(e.ts)}</span>` +
+          `<span style="color:${c};min-width:50px">[${escapeHtml(e.scope)}]</span>` +
+          `<span style="flex:1;color:#cdd5e0">${escapeHtml(e.mensaje)}</span>`;
+        wrap.appendChild(fila);
+      }
+      return wrap;
     }
 
     //—— Tab Settings (configuración) ——————————————————————————————————————
@@ -611,102 +907,203 @@
       body.appendChild(crearTituloSeccion("Funciones"));
       body.appendChild(crearFilaToggleFinalizar());
 
-      body.appendChild(crearSeparador());
-
       //Sección: tiempo por ciudad
       body.appendChild(crearTituloSeccion("Tiempo de recolección por ciudad"));
+      body.appendChild(renderTiemposPorCiudad());
+
+      //Sección: mantenimiento (acciones destructivas)
+      body.appendChild(crearTituloSeccion("Mantenimiento"));
+      body.appendChild(renderMantenimiento());
+
+      //Footer con nombre + versión
+      body.appendChild(renderFooterVersion());
+    }
+
+    //Paleta cíclica para colorear cada ciudad en la lista de tiempos.
+    //Da jerarquía visual sin que dependa del nombre de la ciudad.
+    const PALETA_CIUDAD = [
+      "#3498db", "#27ae60", "#f39c12", "#9b59b6", "#e74c3c",
+      "#1abc9c", "#e67e22", "#34495e",
+    ];
+
+    function renderTiemposPorCiudad() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:6px";
 
       if (!ciudadesConAldeas.length) {
         const vacio = document.createElement("div");
         vacio.textContent = "Cargando ciudades...";
-        vacio.style.opacity = "0.7";
-        body.appendChild(vacio);
-        return;
+        vacio.style.cssText = "opacity:0.7;font-style:italic;padding:6px 0";
+        wrap.appendChild(vacio);
+        return wrap;
       }
 
       const ciudadesOrden = ciudadesConAldeas.slice().sort((a, b) =>
         (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
       );
-      for (const ciudad of ciudadesOrden) {
+
+      ciudadesOrden.forEach((ciudad, i) => {
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
-        const fila = document.createElement("div");
-        fila.style.cssText =
-          "display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0";
+        const color = PALETA_CIUDAD[i % PALETA_CIUDAD.length];
+        const minutos = cfg.minutos;
 
-        const nombre = document.createElement("span");
-        nombre.textContent = ciudad.nombreCiudad || ciudad.codigoCiudad;
-        nombre.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        const card = document.createElement("div");
+        card.style.cssText =
+          "display:flex;align-items:center;gap:10px;padding:8px 10px;" +
+          `background:#172029;border:1px solid #2c3a4d;border-left:3px solid ${color};` +
+          "border-radius:4px;transition:background 0.15s";
+        card.addEventListener("mouseenter", () => card.style.background = "#1c2733");
+        card.addEventListener("mouseleave", () => card.style.background = "#172029");
 
-        const select = document.createElement("select");
-        select.style.cssText =
-          "background:#0f1620;color:#e6e9ee;border:1px solid #2c3a4d;padding:3px 6px;border-radius:3px";
-        const op5 = document.createElement("option");
-        op5.value = "5"; op5.textContent = "5 min";
-        const op10 = document.createElement("option");
-        op10.value = "10"; op10.textContent = "10 min";
-        select.appendChild(op5);
-        select.appendChild(op10);
-        select.value = String(cfg.minutos);
+        //Bullet circular con el color de la ciudad — refuerza la jerarquía
+        const bullet = document.createElement("div");
+        bullet.style.cssText =
+          `width:28px;height:28px;border-radius:50%;background:${color}22;` +
+          `border:2px solid ${color};display:flex;align-items:center;justify-content:center;` +
+          `flex-shrink:0;color:${color};font-weight:bold;font-size:11px`;
+        //Mostramos los últimos 2 dígitos del codigoCiudad o las primeras 2
+        //letras del nombre — lo que sea más identificable.
+        const nombre = ciudad.nombreCiudad || String(ciudad.codigoCiudad);
+        const matchNum = nombre.match(/(\d+)/);
+        bullet.textContent = matchNum ? matchNum[1].slice(-2) : nombre.slice(0, 2).toUpperCase();
+        card.appendChild(bullet);
 
-        select.addEventListener("change", async () => {
-          const minutos = parseInt(select.value, 10);
-          configPorCiudad[ciudad.codigoCiudad] = { minutos, opcion: 1 };
-          await guardarConfigPorCiudad();
-          core.log(
-            "recoleccion",
-            `config ${ciudad.nombreCiudad || ciudad.codigoCiudad}: ${minutos}min`,
-            "ok"
-          );
+        //Nombre + cantidad de aldeas
+        const info = document.createElement("div");
+        info.style.cssText = "flex:1;min-width:0";
+        const nombreEl = document.createElement("div");
+        nombreEl.textContent = nombre;
+        nombreEl.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
+        const subEl = document.createElement("div");
+        subEl.textContent = `${(ciudad.aldeas || []).length} aldeas farmeables`;
+        subEl.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
+        info.appendChild(nombreEl);
+        info.appendChild(subEl);
+        card.appendChild(info);
+
+        //Toggle visual 5 / 10 min — más expresivo que un select
+        const tabs = document.createElement("div");
+        tabs.style.cssText =
+          "display:flex;background:#0f1620;border:1px solid #2c3a4d;border-radius:4px;overflow:hidden";
+        [5, 10].forEach((m) => {
+          const b = document.createElement("button");
+          const activo = m === minutos;
+          b.textContent = `${m} min`;
+          b.style.cssText =
+            `padding:5px 12px;border:none;cursor:pointer;font-size:11px;font-weight:bold;` +
+            `background:${activo ? color : "transparent"};` +
+            `color:${activo ? "#fff" : "#7a8aa0"};transition:all 0.15s`;
+          b.addEventListener("click", async () => {
+            if (m === minutos) return;
+            configPorCiudad[ciudad.codigoCiudad] = { minutos: m, opcion: 1 };
+            await guardarConfigPorCiudad();
+            core.log("recoleccion", `config ${nombre}: ${m}min`, "ok");
+            //Re-render para reflejar el cambio inmediato
+            renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
+          });
+          tabs.appendChild(b);
         });
+        card.appendChild(tabs);
 
-        fila.appendChild(nombre);
-        fila.appendChild(select);
-        body.appendChild(fila);
-      }
+        wrap.appendChild(card);
+      });
 
-      //Sección: mantenimiento (acciones destructivas)
-      body.appendChild(crearSeparador());
-      body.appendChild(crearTituloSeccion("Mantenimiento"));
-      body.appendChild(renderMantenimiento());
+      return wrap;
     }
 
     function renderMantenimiento() {
       const wrap = document.createElement("div");
-      wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-top:4px";
-      const mkBtn = (label, color, onClick) => {
+      wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:6px";
+
+      const mkBtn = (icono, label, sub, danger, onClick) => {
         const b = document.createElement("button");
-        b.textContent = label;
         b.style.cssText =
-          `padding:5px 10px;background:#0f1620;color:${color};border:1px solid ${color};` +
-          "border-radius:3px;cursor:pointer;font-size:10.5px";
+          "display:flex;align-items:center;gap:10px;padding:8px 12px;" +
+          `background:#172029;color:${danger ? "#e74c3c" : "#cdd5e0"};` +
+          `border:1px solid ${danger ? "#5c2018" : "#2c3a4d"};` +
+          "border-radius:4px;cursor:pointer;font-size:12px;text-align:left;" +
+          "transition:background 0.15s,border-color 0.15s;width:100%";
+        b.addEventListener("mouseenter", () => {
+          b.style.background = "#1c2733";
+          b.style.borderColor = danger ? "#e74c3c" : "#3498db";
+        });
+        b.addEventListener("mouseleave", () => {
+          b.style.background = "#172029";
+          b.style.borderColor = danger ? "#5c2018" : "#2c3a4d";
+        });
+        b.innerHTML =
+          `<span style="font-size:16px;flex-shrink:0">${icono}</span>` +
+          `<div style="flex:1">` +
+          `<div style="font-weight:bold">${escapeHtml(label)}</div>` +
+          `<div style="color:#7a8aa0;font-size:10.5px;margin-top:1px">${escapeHtml(sub)}</div>` +
+          `</div>`;
         b.addEventListener("click", onClick);
         return b;
       };
-      wrap.appendChild(mkBtn("Limpiar historial", "#e74c3c", () => {
-        if (!confirm("¿Borrar todo el historial de claims y el último ciclo persistido?")) return;
+
+      wrap.appendChild(mkBtn("📥", "Exportar historial", "Descarga un JSON con todo el historial", false, exportarHistorial));
+      wrap.appendChild(mkBtn("🔄", "Reset cooldown del server", "Olvida cuándo se claimeó cada aldea — se re-sincroniza solo", false, () => {
+        if (!confirm("¿Resetear el map de lastClaimAt?\nEl próximo ciclo va a respetar los cooldowns que el server marque.")) return;
+        limpiarLastClaimAt();
+      }));
+      wrap.appendChild(mkBtn("🗑", "Limpiar historial", "Borra todos los ciclos y claims persistidos. No se puede deshacer.", true, () => {
+        if (!confirm("¿Borrar todo el historial de claims y los últimos ciclos?\nEsta acción NO se puede deshacer.")) return;
         limpiarHistorial();
         renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
       }));
-      wrap.appendChild(mkBtn("Exportar JSON", "#3498db", () => exportarHistorial()));
-      wrap.appendChild(mkBtn("Reset cooldown server", "#f39c12", () => {
-        if (!confirm("¿Resetear el map de lastClaimAt? El próximo ciclo va a probar todas las aldeas y dejar que el server marque las que están en cooldown.")) return;
-        limpiarLastClaimAt();
-      }));
+
       return wrap;
+    }
+
+    function renderFooterVersion() {
+      const f = document.createElement("div");
+      f.style.cssText =
+        "margin-top:18px;padding:10px 0;border-top:1px solid #2c3a4d;" +
+        "text-align:center;color:#5a6776;font-size:10.5px;letter-spacing:0.5px";
+      let version = "0.0.0";
+      try { version = chrome.runtime.getManifest().version; } catch (_) { /* no chrome.runtime */ }
+      f.innerHTML = `<strong style="color:#7a8aa0">JamtBotGrepolis</strong> · v${escapeHtml(version)}`;
+      return f;
     }
 
     function crearFilaToggleFinalizar() {
       const fila = document.createElement("div");
       fila.style.cssText =
-        "display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0";
+        "display:flex;justify-content:space-between;align-items:center;gap:10px;" +
+        "padding:10px 12px;background:#172029;border:1px solid #2c3a4d;" +
+        "border-radius:4px;margin-top:6px";
 
-      const label = document.createElement("span");
-      label.textContent = "Finalizar construcción gratis";
-      label.style.cssText = "flex:1";
+      const lblWrap = document.createElement("div");
+      lblWrap.style.cssText = "flex:1;min-width:0";
+      const lblTitulo = document.createElement("div");
+      lblTitulo.textContent = "Finalizar construcción gratis";
+      lblTitulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
+      const lblSub = document.createElement("div");
+      lblSub.textContent = "Activa el botón \"Gratis\" cuando faltan <5 min";
+      lblSub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
+      lblWrap.appendChild(lblTitulo);
+      lblWrap.appendChild(lblSub);
+      fila.appendChild(lblWrap);
 
-      const check = document.createElement("input");
-      check.type = "checkbox";
-      check.style.cssText = "width:16px;height:16px;cursor:pointer";
+      //Toggle switch custom (más profesional que un checkbox HTML)
+      const sw = document.createElement("button");
+      sw.style.cssText =
+        "position:relative;width:42px;height:22px;border:none;border-radius:11px;" +
+        "background:#2c3a4d;cursor:pointer;transition:background 0.2s;flex-shrink:0;" +
+        "padding:0;outline:none";
+      const knob = document.createElement("span");
+      knob.style.cssText =
+        "position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;" +
+        "background:#fff;transition:left 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.3)";
+      sw.appendChild(knob);
+      fila.appendChild(sw);
+
+      let estadoActual = false;
+      const setEstadoVisual = (on) => {
+        estadoActual = on;
+        sw.style.background = on ? "#27ae60" : "#2c3a4d";
+        knob.style.left = on ? "22px" : "2px";
+      };
 
       chrome.storage.local.get("jambotConfig", (obj) => {
         const cfg = obj && obj.jambotConfig;
@@ -714,21 +1111,23 @@
           cfg && typeof cfg.finalizarHabilitado === "boolean"
             ? cfg.finalizarHabilitado
             : data.finalizarGratis === true;
-        check.checked = enabled;
+        setEstadoVisual(enabled);
       });
 
-      check.addEventListener("change", () => {
+      sw.addEventListener("click", () => {
+        const nuevo = !estadoActual;
+        setEstadoVisual(nuevo);
         chrome.storage.local.get("jambotConfig", (obj) => {
           const cfgPrev = (obj && obj.jambotConfig) || {};
-          const cfgNuevo = { ...cfgPrev, finalizarHabilitado: check.checked };
-          chrome.storage.local.set({ jambotConfig: cfgNuevo }, () => {
-            core.log("panel", `finalizar construcción ${check.checked ? "ON" : "OFF"}`, "ok");
-          });
+          chrome.storage.local.set(
+            { jambotConfig: { ...cfgPrev, finalizarHabilitado: nuevo } },
+            () => {
+              core.log("panel", `finalizar construcción ${nuevo ? "ON" : "OFF"}`, "ok");
+            }
+          );
         });
       });
 
-      fila.appendChild(label);
-      fila.appendChild(check);
       return fila;
     }
 
@@ -816,23 +1215,42 @@
         return;
       }
 
-      //Header de estado de la feature
-      const estadoFila = document.createElement("div");
-      estadoFila.style.cssText =
-        "display:flex;justify-content:space-between;gap:10px;padding:6px 8px;background:#172029;border-radius:3px;margin-bottom:8px;font-size:11px";
-      const estadoColor = !ds.habilitada ? "#8a96a6" : (core.isPaused() ? "#27ae60" : "#3498db");
-      const estadoTxt = !ds.habilitada ? "Deshabilitada (activar en Settings)"
-        : core.isPaused() ? "Pausada (bot global pausado)"
+      //Header de estado de la feature — 2 cards lado a lado
+      const headerWrap = document.createElement("div");
+      headerWrap.style.cssText =
+        "display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px";
+
+      const estadoColor = !ds.habilitada ? "#7a8aa0" : (core.isPaused() ? "#27ae60" : "#3498db");
+      const estadoTxt = !ds.habilitada ? "Deshabilitada"
+        : core.isPaused() ? "Pausada"
         : "Activa";
+      const estadoSub = !ds.habilitada ? "Activar en Settings"
+        : core.isPaused() ? "Bot global pausado"
+        : "";
+
+      const card1 = document.createElement("div");
+      card1.style.cssText =
+        `padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid ${estadoColor}`;
+      card1.innerHTML =
+        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Estado</div>` +
+        `<div style="color:${estadoColor};font-weight:bold;font-size:14px;margin-top:2px">${estadoTxt}</div>` +
+        (estadoSub ? `<div style="color:#7a8aa0;font-size:10px;margin-top:1px">${estadoSub}</div>` : "");
+      headerWrap.appendChild(card1);
+
       let proximoTxt = "—";
       if (ds.proximoTickAt) {
         const seg = Math.max(0, Math.round((ds.proximoTickAt - Date.now()) / 1000));
         proximoTxt = core.formatDuracion(seg);
       }
-      estadoFila.innerHTML =
-        `<span><strong>Estado:</strong> <span style="color:${estadoColor}">${estadoTxt}</span></span>` +
-        `<span><strong>Próximo tick:</strong> ${proximoTxt}</span>`;
-      body.appendChild(estadoFila);
+      const card2 = document.createElement("div");
+      card2.style.cssText =
+        "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid #3498db";
+      card2.innerHTML =
+        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Próximo tick</div>` +
+        `<div style="color:#cdd5e0;font-weight:bold;font-size:14px;margin-top:2px">${proximoTxt}</div>`;
+      headerWrap.appendChild(card2);
+
+      body.appendChild(headerWrap);
 
       //Sección 1: último ciclo
       if (ds.ultimoCiclo) {
@@ -884,19 +1302,26 @@
 
     function renderResumenCicloConstr(u) {
       const wrap = document.createElement("div");
-      wrap.style.cssText = "font-family:monospace;font-size:11px;line-height:1.6";
-      const linea = (label, val, color) => {
+      wrap.style.cssText =
+        "display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:4px 0";
+      const stat = (label, val, color) => {
         const d = document.createElement("div");
-        d.innerHTML = `<span style="color:#8a96a6;display:inline-block;width:160px">${label}</span>` +
-          `<span style="color:${color || "#cdd5e0"}">${val}</span>`;
+        d.style.cssText =
+          "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid " +
+          (color || "#3498db");
+        d.innerHTML =
+          `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">${label}</div>` +
+          `<div style="color:${color || "#e6e9ee"};font-weight:bold;font-size:14px;margin-top:2px">${val}</div>`;
         return d;
       };
-      wrap.appendChild(linea("Órdenes en cola:", u.ordenesEnCola));
-      wrap.appendChild(linea("En ventana free:", u.ordenesEnVentana, u.ordenesEnVentana ? "#f39c12" : "#cdd5e0"));
-      wrap.appendChild(linea("Finalizadas:", u.finalizadas, u.finalizadas ? "#27ae60" : "#cdd5e0"));
-      wrap.appendChild(linea("Duración:", core.formatDuracion((u.duracion || 0) / 1000)));
+      wrap.appendChild(stat("Órdenes en cola", u.ordenesEnCola));
+      wrap.appendChild(stat("En ventana free", u.ordenesEnVentana, u.ordenesEnVentana ? "#f39c12" : null));
+      wrap.appendChild(stat("Finalizadas", u.finalizadas, u.finalizadas ? "#27ae60" : null));
+      wrap.appendChild(stat("Duración", core.formatDuracion((u.duracion || 0) / 1000)));
       if (u.captchaDurante) {
-        wrap.appendChild(linea("CAPTCHA:", "sí", "#e74c3c"));
+        const captchaBox = stat("CAPTCHA durante el ciclo", "Sí", "#e74c3c");
+        captchaBox.style.gridColumn = "1 / -1";
+        wrap.appendChild(captchaBox);
       }
       return wrap;
     }
@@ -906,28 +1331,47 @@
       if (!cola.length) {
         const v = document.createElement("div");
         v.textContent = "(no hay órdenes en cola)";
-        v.style.cssText = "opacity:0.6;font-style:italic;padding:4px 0";
+        v.style.cssText = "opacity:0.6;font-style:italic;padding:6px 0;font-size:11px";
         wrap.appendChild(v);
         return wrap;
       }
-      const tabla = document.createElement("div");
-      tabla.style.cssText = "font-family:monospace;font-size:10.5px";
       const ahora = Math.floor(Date.now() / 1000);
       for (const o of cola) {
         const restante = Math.max(0, o.finish_time - ahora);
         const enVentana = restante <= VENTANA_SEGUNDOS_DEFAULT;
-        const c = enVentana ? "#f39c12" : "#cdd5e0";
+        const color = enVentana ? "#f39c12" : "#7a8aa0";
+
         const fila = document.createElement("div");
         fila.style.cssText =
-          "display:flex;gap:8px;padding:3px 0;border-bottom:1px solid #1a232e";
-        fila.innerHTML =
-          `<span style="color:${c};min-width:14px">${enVentana ? "⏱" : "·"}</span>` +
-          `<span style="flex:1;color:#cdd5e0">${escapeHtml(o.town_nombre)}</span>` +
-          `<span style="flex:1;color:#8a96a6">${escapeHtml(o.building_type)}</span>` +
-          `<span style="color:${c};min-width:75px;text-align:right">${core.formatDuracion(restante)}</span>`;
-        tabla.appendChild(fila);
+          "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
+          "background:#172029;border-radius:3px;border-left:3px solid " + color;
+
+        const badge = document.createElement("span");
+        badge.style.cssText =
+          `display:inline-flex;align-items:center;justify-content:center;` +
+          `width:20px;height:20px;background:${color}22;color:${color};` +
+          `border-radius:3px;font-weight:bold;font-size:11px;flex-shrink:0`;
+        badge.textContent = enVentana ? "⏱" : "·";
+        fila.appendChild(badge);
+
+        const ciudad = document.createElement("span");
+        ciudad.textContent = o.town_nombre;
+        ciudad.style.cssText = "flex:1;color:#e6e9ee;font-size:11.5px;font-weight:bold";
+        fila.appendChild(ciudad);
+
+        const tipo = document.createElement("span");
+        tipo.textContent = o.building_type;
+        tipo.style.cssText = "flex:1;color:#7a8aa0;font-family:monospace;font-size:10.5px";
+        fila.appendChild(tipo);
+
+        const tiempo = document.createElement("span");
+        tiempo.textContent = core.formatDuracion(restante);
+        tiempo.style.cssText =
+          `color:${color};min-width:75px;text-align:right;font-weight:bold;font-size:11px`;
+        fila.appendChild(tiempo);
+
+        wrap.appendChild(fila);
       }
-      wrap.appendChild(tabla);
       return wrap;
     }
 
@@ -936,23 +1380,22 @@
       if (!finalizadas.length) {
         const v = document.createElement("div");
         v.textContent = "(todavía no se finalizó ninguna en esta sesión)";
-        v.style.cssText = "opacity:0.6;font-style:italic;padding:4px 0";
+        v.style.cssText = "opacity:0.6;font-style:italic;padding:6px 0;font-size:11px";
         wrap.appendChild(v);
         return wrap;
       }
-      const tabla = document.createElement("div");
-      tabla.style.cssText = "font-family:monospace;font-size:10.5px";
       for (const f of finalizadas) {
         const fila = document.createElement("div");
         fila.style.cssText =
-          "display:flex;gap:8px;padding:3px 0;border-bottom:1px solid #1a232e";
+          "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
+          "background:#172029;border-radius:3px;border-left:3px solid #27ae60";
         fila.innerHTML =
-          `<span style="color:#8a96a6;min-width:42px">${formatHoraCorta(f.ts)}</span>` +
-          `<span style="color:#27ae60;min-width:12px">✓</span>` +
-          `<span style="flex:1;color:#cdd5e0">${escapeHtml(f.town_nombre || f.town_id)}</span>` +
-          `<span style="flex:1;color:#8a96a6">${escapeHtml(f.building_type)}</span>` +
-          `<span style="color:#5a6776">id ${f.id}</span>`;
-        tabla.appendChild(fila);
+          `<span style="color:#27ae60;min-width:18px;text-align:center">✓</span>` +
+          `<span style="color:#7a8aa0;min-width:42px;font-family:monospace;font-size:10.5px">${formatHoraCorta(f.ts)}</span>` +
+          `<span style="flex:1;color:#e6e9ee;font-weight:bold;font-size:11.5px">${escapeHtml(f.town_nombre || f.town_id)}</span>` +
+          `<span style="flex:1;color:#7a8aa0;font-family:monospace;font-size:10.5px">${escapeHtml(f.building_type)}</span>` +
+          `<span style="color:#5a6776;font-size:10px">#${f.id}</span>`;
+        wrap.appendChild(fila);
       }
       return wrap;
     }
@@ -968,7 +1411,12 @@
     function crearTituloSeccion(texto) {
       const t = document.createElement("div");
       t.textContent = texto;
-      t.style.cssText = "font-weight:bold;margin:8px 0 6px;color:#cdd5e0";
+      //Estilo "label" tipo dashboard: chico, uppercase con tracking, color
+      //gris medio. Mucho más profesional que el "centrado bold" anterior.
+      t.style.cssText =
+        "font-size:10.5px;font-weight:bold;margin:14px 0 8px;color:#7a8aa0;" +
+        "text-transform:uppercase;letter-spacing:1.2px;" +
+        "border-bottom:1px solid #2c3a4d;padding-bottom:5px;text-align:left";
       return t;
     }
 
@@ -1050,17 +1498,42 @@
         .map(([id, c]) => ({ id, ...c }))
         .sort((a, b) => (a.nombre || "").localeCompare(b.nombre || "", undefined, { numeric: true }));
       for (const c of ciudadesArr) {
-        const fila = document.createElement("div");
         const completa = c.claims >= (c.esperado || 6);
-        const color = enCurso && c.claims === 0 ? "#8a96a6" : completa ? "#27ae60" : "#e74c3c";
-        const icon = enCurso && c.claims === 0 ? "·" : completa ? "✓" : "✗";
+        const enProgreso = enCurso && c.claims < (c.esperado || 6);
+        const sinClaims = enCurso && c.claims === 0;
+        const color = sinClaims ? "#7a8aa0" : enProgreso ? "#f39c12" : completa ? "#27ae60" : "#e74c3c";
+        const icon = sinClaims ? "·" : enProgreso ? "↻" : completa ? "✓" : "✗";
+
+        const fila = document.createElement("div");
         fila.style.cssText =
-          "display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-family:monospace;font-size:11px";
-        fila.innerHTML =
-          `<span style="color:${color};min-width:10px">${icon}</span>` +
-          `<span style="flex:1">${escapeHtml(c.nombre)}</span>` +
-          `<span style="color:#cdd5e0">${c.claims}/${c.esperado || 6}</span>` +
-          `<span style="color:#8a96a6;min-width:140px;text-align:right">+${c.wood}/+${c.stone}/+${c.iron}</span>`;
+          "display:flex;align-items:center;gap:8px;padding:5px 8px;margin:2px 0;" +
+          "background:#172029;border-radius:3px;border-left:3px solid " + color;
+
+        //Badge cuadrado coloreado con el ícono
+        const badge = document.createElement("span");
+        badge.style.cssText =
+          `display:inline-flex;align-items:center;justify-content:center;` +
+          `width:20px;height:20px;background:${color}22;color:${color};` +
+          `border-radius:3px;font-weight:bold;font-size:12px;flex-shrink:0`;
+        badge.textContent = icon;
+        fila.appendChild(badge);
+
+        const nombre = document.createElement("span");
+        nombre.textContent = c.nombre;
+        nombre.style.cssText = "flex:1;font-size:12px;color:#e6e9ee";
+        fila.appendChild(nombre);
+
+        const ratio = document.createElement("span");
+        ratio.textContent = `${c.claims}/${c.esperado || 6}`;
+        ratio.style.cssText = `color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right`;
+        fila.appendChild(ratio);
+
+        const recursos = document.createElement("span");
+        recursos.textContent = `+${c.wood} / +${c.stone} / +${c.iron}`;
+        recursos.style.cssText =
+          "color:#7a8aa0;font-family:monospace;font-size:10.5px;min-width:140px;text-align:right";
+        fila.appendChild(recursos);
+
         wrap.appendChild(fila);
       }
       if (!enCurso && ciclo.duracion != null) {
@@ -1069,9 +1542,11 @@
         const totIron = ciudadesArr.reduce((s, c) => s + (c.iron || 0), 0);
         const totales = document.createElement("div");
         totales.style.cssText =
-          "margin-top:6px;padding-top:6px;border-top:1px dashed #2c3a4d;font-family:monospace;font-size:11px;color:#cdd5e0";
+          "margin-top:8px;padding:6px 8px;background:#0f1620;border-radius:3px;" +
+          "font-size:11px;color:#cdd5e0;display:flex;justify-content:space-between";
         totales.innerHTML =
-          `<span style="color:#8a96a6">total ciclo:</span> +${totWood} mad / +${totStone} pie / +${totIron} pla`;
+          `<span style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.8px;font-size:10px;font-weight:bold">Total ciclo</span>` +
+          `<span style="font-family:monospace;color:#27ae60">+${totWood} mad · +${totStone} pie · +${totIron} pla</span>`;
         wrap.appendChild(totales);
       }
       return wrap;
@@ -1090,10 +1565,15 @@
         const okEnUltimoCiclo = ultimoCiclo && ultimoCiclo.ciudades && ultimoCiclo.ciudades[ciudad.codigoCiudad];
         const claims = okEnUltimoCiclo ? okEnUltimoCiclo.claims : 0;
         const esperado = okEnUltimoCiclo ? okEnUltimoCiclo.esperado : 6;
-        const color = !okEnUltimoCiclo ? "#8a96a6"
+        const color = !okEnUltimoCiclo ? "#7a8aa0"
           : claims >= esperado ? "#27ae60" : "#e74c3c";
-        const headerTxt = `${escapeHtml(ciudad.nombreCiudad || ciudad.codigoCiudad)} · ${aldeasOrden.length} aldeas` +
-          (okEnUltimoCiclo ? ` · último: ${claims}/${esperado}` : "");
+        const ratioBadge = okEnUltimoCiclo
+          ? ` <span style="color:${color};font-weight:bold;background:${color}22;padding:1px 6px;border-radius:3px;font-size:10.5px">${claims}/${esperado}</span>`
+          : "";
+        const headerTxt =
+          `<span style="color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad || ciudad.codigoCiudad)}</span>` +
+          ` <span style="color:#7a8aa0;font-size:10.5px">· ${aldeasOrden.length} aldeas</span>` +
+          ratioBadge;
         const expandidoDefault = uiColapso.ciudades[ciudad.codigoCiudad] === true ||
           (ultimoCiclo && claims < esperado && uiColapso.ciudades[ciudad.codigoCiudad] !== false);
         wrap.appendChild(seccionColapsable(
@@ -1107,6 +1587,20 @@
       return wrap;
     }
 
+    //Mapa central de presentación de status. Devuelve {label, color, icono}
+    //para cada uno de los 4 valores que retorna recolectarAldea (más null
+    //cuando no hay historial). Centralizar acá evita texto críptico tipo
+    //"saltada-cooldown" suelto en la UI.
+    function presentarStatus(status) {
+      switch (status) {
+        case "ok":               return { label: "OK",          color: "#27ae60", icono: "✓" };
+        case "reintentar":       return { label: "Pendiente",   color: "#f39c12", icono: "↻" };
+        case "descartar":        return { label: "Descartada",  color: "#e74c3c", icono: "✗" };
+        case "saltada-cooldown": return { label: "En cooldown", color: "#8a96a6", icono: "⏱" };
+        default:                 return { label: "—",           color: "#8a96a6", icono: "·" };
+      }
+    }
+
     function renderAldeasDeCiudad(aldeas) {
       const wrap = document.createElement("div");
       for (const aldea of aldeas) {
@@ -1114,18 +1608,17 @@
         const ultimaOk = [...histo].reverse().find((e) => e.status === "ok");
         const desde = ultimaOk ? formatRelativo(ultimaOk.ts) : "—";
         const ultimaCualquiera = histo[histo.length - 1];
-        const statusColor = !ultimaCualquiera ? "#8a96a6"
-          : ultimaCualquiera.status === "ok" ? "#27ae60"
-          : ultimaCualquiera.status === "saltada-cooldown" ? "#8a96a6"
-          : "#e74c3c";
-        const statusTxt = !ultimaCualquiera ? "—" : ultimaCualquiera.status;
-        const headerTxt = `${escapeHtml(aldea.name || `id ${aldea.id}`)}  ·  hace ${desde}  ·  ${statusTxt}`;
+        const p = presentarStatus(ultimaCualquiera && ultimaCualquiera.status);
+        const headerTxt =
+          `${escapeHtml(aldea.name || `id ${aldea.id}`)}` +
+          `  ·  <span style="color:#7a8aa0">hace</span> ${desde}` +
+          `  ·  <span style="color:${p.color}">${p.icono} ${p.label}</span>`;
         wrap.appendChild(seccionColapsable(
           headerTxt,
           uiColapso.aldeas[aldea.id] === true,
           (v) => uiColapso.aldeas[aldea.id] = v,
           () => renderHistorialAldea(aldea),
-          statusColor
+          p.color
         ));
       }
       return wrap;
@@ -1146,21 +1639,18 @@
       for (const e of histo) {
         const fila = document.createElement("div");
         fila.style.cssText =
-          "display:flex;gap:8px;padding:2px 0;border-bottom:1px solid #1a232e";
-        const c =
-          e.status === "ok" ? "#27ae60" :
-          e.status === "saltada-cooldown" ? "#8a96a6" :
-          e.status === "reintentar" ? "#f39c12" : "#e74c3c";
+          "display:flex;gap:8px;padding:3px 4px;border-bottom:1px solid #1a232e;align-items:center";
+        const p = presentarStatus(e.status);
         const cuerpo =
           e.status === "ok" && e.dW != null
             ? `${fmt(e.dW)}/${fmt(e.dS)}/${fmt(e.dI)}`
             : e.status === "saltada-cooldown"
-            ? `cooldown ${e.esperaSeg ? core.formatDuracion(e.esperaSeg) : ""}`.trim()
-            : e.errorMsg || e.status;
+            ? (e.esperaSeg ? `falta ${core.formatDuracion(e.esperaSeg)}` : "cooldown")
+            : e.errorMsg || p.label;
         fila.innerHTML =
-          `<span style="color:#8a96a6;min-width:42px">${formatHoraCorta(e.ts)}</span>` +
-          `<span style="color:${c};min-width:12px">${e.status === "ok" ? "✓" : e.status === "saltada-cooldown" ? "·" : "✗"}</span>` +
-          `<span style="flex:1;color:${c}">${escapeHtml(cuerpo)}</span>` +
+          `<span style="color:#7a8aa0;min-width:42px">${formatHoraCorta(e.ts)}</span>` +
+          `<span style="color:${p.color};min-width:14px;text-align:center">${p.icono}</span>` +
+          `<span style="flex:1;color:${p.color}">${escapeHtml(cuerpo)}</span>` +
           `<span style="color:#5a6776">#${e.ciclo || "?"}</span>`;
         tabla.appendChild(fila);
       }
@@ -1227,28 +1717,12 @@
       return `${h}h ${m}m`;
     }
 
-    function pintarEstadoBoton(estado) {
-      switch (estado) {
-        case "pausado":
-          boton.setLabel("▶");
-          boton.setStyle({ bg: "#27ae60", fg: "#fff" });
-          break;
-        case "corriendo":
-          boton.setLabel("⏸");
-          boton.setStyle({ bg: "#3498db", fg: "#fff" });
-          break;
-        case "captcha":
-          boton.setLabel("⚠");
-          boton.setStyle({ bg: "#c0392b", fg: "#fff" });
-          break;
-      }
-    }
 
     //Reflejar cambios de CAPTCHA en el botón. Cuando se resuelve, volver
     //al estado anterior según core.isPaused().
     core.onCaptcha((active) => {
-      if (active) pintarEstadoBoton("captcha");
-      else pintarEstadoBoton(core.isPaused() ? "pausado" : "corriendo");
+      actualizarEstadoCard();
+      void active;
     });
 
     //—— Bridge: pedir recursos actuales del Town cargado en MM ———————————
@@ -1313,7 +1787,7 @@
 
     async function recolectarRecursos() {
       if (core.isPaused()) return;
-      pintarEstadoBoton(core.isCaptchaActive() ? "captcha" : "corriendo");
+      actualizarEstadoCard();
 
       nCiclo += 1;
       const inicioCiclo = Date.now();
@@ -1429,7 +1903,7 @@
         );
       }
 
-      pintarEstadoBoton(core.isCaptchaActive() ? "captcha" : "corriendo");
+      actualizarEstadoCard();
       programarSiguienteTick(tiempoEspera);
     }
 
