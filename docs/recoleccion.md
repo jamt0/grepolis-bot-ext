@@ -47,21 +47,22 @@ json={
 4. Promueve `cicloActual` → push a `ciclos[]` (FIFO max 36) → persiste.
 5. Calcula `tiempoEspera` (ver §6) y programa el próximo tick.
 
-### `recolectarCiudades()` — orquesta ciudades
+### `recolectarCiudades()` — orquesta el ciclo entero (2 passes)
 1. Loguea separador violeta `═══ CICLO #N ═══`.
 2. Refresca el baseline de recursos por ciudad (consultando `MM` vía bridge) — sin esto el primer claim arrastra 5-10 min de producción.
 3. Ordena ciudades por `localeCompare(numeric)` → "001 Jam" < "002 Jam" < "010 Jam".
-4. Para cada ciudad: separador azul + `recolectarCiudad(ciudad, ..., pendientes)`.
-5. Después del loop principal: **retry diferido** sobre `pendientes` (max 3 intentos × 5s entre rondas).
-6. Imprime resumen por ciudad (verde si 6/6, rojo `core.logError` si menos).
-7. Retorna `{proximaLiberacionSeg}` para que `recolectarRecursos` ajuste el próximo tick.
-
-### `recolectarCiudad()` — orquesta aldeas
-1. `cooldownMs = minutos * 60 * 1000 + 5 * 1000` (margen +5s, ver §5).
-2. Mezcla aldeas con shuffle (anti-bot — el orden de aldeas dentro de una ciudad NO es predictible).
-3. Por cada aldea, **gating de cooldown** (ver §4).
-4. Si pasa el gating, llama `recolectarAldea()`.
-5. Trackea fallos en `pendientes` para retry diferido.
+4. **Pass 1 (síncrono)**: para cada ciudad, recorre sus 6 aldeas (orden alfabético determinista — ver §6.1) y aplica el **gating de cooldown** (ver §4). Las aldeas en cooldown vivo (cliente o server) registran su `status:"saltada-cooldown"` en historial sin pegarle al server. Las que pasan el gate se acumulan en `tareas[]`. Información de saltadas por ciudad se guarda en `ciudadInfo` para loguearla en Pass 2.
+5. **Pass 2 (fire-and-forget)**: itera `tareas[]`. Por cada tarea (excepto la última):
+   - Chequea `core.isCaptchaActive()` y `t.ciudad.recursosLlenos` → si alguno cierto, salta.
+   - Emite el banner azul de la ciudad si es la primera tarea de esa ciudad.
+   - **Dispara** `recolectarAldea()` SIN awaitarlo. El handler async procesa la respuesta cuando vuelve y actualiza `lastClaimAt`, ciclo stats, marca `recursosLlenos` si corresponde, encola en `pendientes` si fue `reintentar`.
+   - `await delayMs(jitter(0, 500))` — único bloqueo del loop (ver §6).
+   - La **última tarea SÍ se awaitea** para que `duracionCiclo = now() - inicioCiclo` refleje también la última response.
+6. `await Promise.allSettled(promesasFire)` — bloquea hasta que todas las responses en flight cierren. Necesario para que `pendientes` esté completo antes del retry.
+7. Si hubo CAPTCHA, mergea las pendientes al contexto del core (cartel mostrará cuántas aldeas quedaron en cola).
+8. **Retry diferido** sobre `pendientes` (max 3 intentos × 5s entre rondas, secuencial).
+9. Imprime resumen por ciudad (verde si 6/6, rojo `core.logError` si menos).
+10. Retorna `{proximaLiberacionSeg}` para que `recolectarRecursos` ajuste el próximo tick.
 
 ### `recolectarAldea()` — un claim concreto
 Retorna `{status: "ok" | "reintentar" | "descartar"}`:
@@ -102,23 +103,23 @@ Antes de pegarle al server por una aldea, el bot decide si esperar. Hay **dos fu
 - Indica **cuándo el server libera la aldea** para el próximo claim.
 - Útil cuando `lastClaimAtPorAldea` está vacío (e.g. primer ciclo después de instalar la extensión, o si el storage se borró). Sin esto el bot dispararía todas las aldeas y se comería un `success:false` por cada una.
 
-### Lógica combinada en `recolectarCiudad`
+### Lógica combinada en Pass 1 de `recolectarCiudades`
 
 ```js
-for (const aldea of shuffle(aldeas)) {
+for (const aldea of shuffle(ciudad.aldeas)) {
   const last = lastClaimAtPorAldea[aldea.id] || 0;
   const transcurrido = Date.now() - last;
 
   // Fuente B — solo si nunca claimeamos esta aldea en la sesión
   if (last === 0 && aldea.loot) {
-    if (aldea.loot * 1000 > Date.now()) { saltar; continue; }
+    if (aldea.loot * 1000 > Date.now()) { registrarSaltada; continue; }
   }
 
   // Fuente A
-  if (last > 0 && transcurrido < cooldownMs) { saltar; continue; }
+  if (last > 0 && transcurrido < cooldownMs) { registrarSaltada; continue; }
 
-  // Procede
-  await recolectarAldea(...);
+  // Procede — la aldea entra a tareas[] y se dispara en Pass 2
+  tareas.push({ ciudad, aldea, acumulador, opcion, idxCiudad });
 }
 ```
 
@@ -139,17 +140,39 @@ Con +5s pegamos **después** de que el server liberó. Costo: ~1.7% de yield en 
 
 ---
 
-## 6. Cadencia entre claims
+## 6. Cadencia y orden de los claims
+
+### 6.1. Jitter entre fires
 
 ```js
-await delayMs(jitter(2000, 2500));  // 2-2.5s entre claim y claim
+await delayMs(jitter(0, 500));  // entre fire y fire en Pass 2
 ```
 
-Más conservador que 1-1.5s anterior. Razones:
-- Reduce presión sobre el server (menos `success:false` por rate limit encubierto).
-- Reduce errores de hidratación del cliente del juego cuando llegan notifications muy seguidas.
-- Variabilidad ±25% mantiene la huella anti-bot.
-- Costo: ~17s extra de duración por ciclo (con 18 aldeas). Despreciable vs cooldown de 5/10 min.
+El jitter aplica entre **disparos** de claim, no entre claim y respuesta — porque Pass 2 es fire-and-forget (ver §3). Con `[0, 500ms]` y avg 250ms, el ciclo dispara 600 aldeas en ~150s.
+
+Razones del valor 0-500ms:
+- **Throughput**: con jitter avg 0.25s + response time async (~200-500ms en background), 100 ciudades = 600 aldeas se procesan en ~150s wall-clock — bien dentro del cooldown de 10min.
+- **Anti-bot**: jitter random (no fijo) mantiene la variabilidad. El piso de 0ms permite picos rápidos que un humano puede igualar (clicks consecutivos en aldeas vecinas).
+- **Varianza acumulada baja**: la diferencia entre la duración total de dos ciclos consecutivos (sumas de ~600 jitters cada una) tiene σ ≈ √600 · 0.144s · √2 ≈ 5s. La gracia de 30s en `esperaNormal` (§7) la cubre con margen >5σ.
+
+**Antes** este valor era `[2000, 2500]ms` — pensado para la era pre-fire-and-forget cuando cada aldea bloqueaba el loop por su response time. Con el refactor del Pass 2, ese conservadurismo dejaba 100 ciudades fuera del rango viable (el ciclo tardaba más que el cooldown).
+
+### 6.2. Orden determinista de aldeas dentro de cada ciudad
+
+Las aldeas dentro de cada ciudad se procesan en **orden alfabético-natural** (mismo criterio que las ciudades). **NO shuffle**.
+
+**Por qué importa**: la fórmula `baseMs - duracionCiclo + 30s` (ver §7) asume que cada aldea está en la **misma posición temporal** del ciclo en ambas vueltas. Si shuffleamos:
+
+| | Ciclo N | Ciclo N+1 | CD efectivo |
+|---|---|---|---|
+| Aldea X (con shuffle) | offset = 599 (última, t=150s) | offset = 0 (primera, t=0s) | `baseMs − duracionCiclo + 30s` = **480s** ✗ |
+| Aldea X (alfabético) | offset = pos_X (igual en N) | offset = pos_X (igual en N+1) | `baseMs + 30s ± varianza_chica` ≈ **630s** ✓ |
+
+Con shuffle, una aldea que pasa de la última posición a la primera del ciclo siguiente se queda **120s corta** del cooldown de 600s — el server la rechaza. Por eso el orden tiene que ser determinista.
+
+**Trade-off anti-bot**: secuencia de aldeas 100% predecible. Mitigación: el jitter random sigue rompiendo los patrones de microsegundos, y la firma "orden alfabético-natural por nombre" no es obviamente "claim aldea_1, claim aldea_2…" (depende de cómo nombró el server cada `farm_town`).
+
+Si en algún momento el server activa anti-bot por orden interno de aldeas, habría que pensar una solución que no rompa la fórmula — probablemente **shuffle determinista por seed** `(ciudadId, dayOfYear)` para que el orden sea idéntico entre dos ciclos consecutivos pero distinto entre días.
 
 ---
 
@@ -166,7 +189,9 @@ const baseMs = tiempoCicloMinutos() * 60 * 1000;  // 5 o 10 min según config
 // retomar el ciclo (ver §10).
 if (core.isCaptchaActive()) return;
 
-let esperaAjustada = baseMs + jitter(3-30s);  // medido desde el FIN del ciclo
+const GRACIA_MS = 30 * 1000;
+const PISO_ESPERA_MS = 5 * 1000;
+let esperaAjustada = Math.max(baseMs - duracionCiclo + GRACIA_MS, PISO_ESPERA_MS);
 
 // Adelantar si hay aldeas listas antes del intervalo normal
 if (stats.proximaLiberacionSeg < ∞) {
@@ -174,38 +199,61 @@ if (stats.proximaLiberacionSeg < ∞) {
   if (esperaServer < esperaAjustada) esperaAjustada = esperaServer;
 }
 
-tiempoEspera = Math.max(30 * 1000, esperaAjustada);   // piso 30s
+tiempoEspera = Math.max(PISO_ESPERA_MS, esperaAjustada);   // piso 5s
 ```
 
-### Por qué `baseMs + jitter` y no `baseMs - duracionCiclo + jitter`
+### Anclamos al INICIO del ciclo (descontando duracionCiclo)
 
-La versión anterior **descontaba** `duracionCiclo` de la espera, con la idea de que el siguiente ciclo arranque a `baseMs` del INICIO del actual (no del fin). Eso parecía evitar perder los ~30-45s del ciclo en cada vuelta. **Es un cálculo incorrecto** y producía el patrón "ciclo largo + ciclo corto adelantado" que se observaba en producción.
+Queremos que el ciclo siguiente arranque (en promedio) a `baseMs + 30s` desde el **inicio** del actual — así CADA aldea, sin importar su posición en el ciclo, tiene su CD completo + 30s de margen cuando se la vuelve a claimear en la misma posición del ciclo siguiente.
 
-**El error conceptual**: el server no mide el cooldown desde el inicio del ciclo del bot. Lo mide desde el momento exacto en que **cada aldea individualmente** fue procesada. Como el ciclo reparte 18 aldeas a lo largo de ~45s (jitter de 2-2.5s entre cada una), solo la **primera** aldea del ciclo previo llega al siguiente con 10min completos. Las demás llegan con CD parcial:
-
-| Aldea procesada en | CD acumulado al inicio del ciclo siguiente (cálculo viejo) |
+| Aldea procesada en | CD al ser re-claimeada en mismo offset del ciclo siguiente |
 |---|---|
-| `inicio + 0s` (primera) | `baseMs + jitter` ✓ libre |
-| `inicio + 22s` (mitad) | `baseMs - 22s + jitter` ✗ aún en CD |
-| `inicio + 45s` (última) | `baseMs - 45s + jitter` ✗ aún en CD |
+| `inicio + 0s` (primera) | `baseMs + 30s` ✓ libre con 30s de margen |
+| `inicio + N/2 · jitter` (mitad) | `baseMs + 30s` ✓ libre |
+| `inicio + N · jitter` (última) | `baseMs + 30s` ✓ libre |
 
-Resultado en producción: 3-4 aldeas saltadas por ciclo (las últimas del orden de procesamiento). El bot detectaba que las saltadas se liberaban en ~25s y disparaba el ciclo corto adelantado para recogerlas — un parche que rescataba el yield, pero generaba dos ciclos en lugar de uno y una segunda tanda de requests al server cada 10min.
+Todas con el mismo margen de 30s. Esto solo funciona porque el jitter es **chico** ([0, 500ms]): la varianza acumulada de la diferencia entre dos ciclos es σ ≈ 0.2·√N segundos.
 
-**Fix**: medir la espera desde el **fin** del ciclo, no del inicio. Así la última aldea procesada (la que tiene el cooldown más fresco) ya cumplió sus 10min cuando arranca el siguiente:
+| N aldeas (ciudades × 6) | σ varianza | 30s = cuántos σ |
+|---|---|---|
+| 18 (3 ciudades) | 0.85s | 35σ |
+| 300 (50 ciudades) | 3.5s | 8.6σ |
+| 600 (100 ciudades) | 4.9s | 6.1σ |
 
-| Aldea procesada en | CD acumulado al inicio del ciclo siguiente (cálculo nuevo) |
-|---|---|
-| `inicio + 0s` (primera) | `duracionCiclo + baseMs + jitter` ✓ libre con 45s+ de margen |
-| `inicio + 22s` (mitad) | `duracionCiclo - 22s + baseMs + jitter` ✓ libre |
-| `inicio + 45s` (última) | `baseMs + jitter` ✓ libre con jitter de margen |
+Probabilidad de rechazo del server (5σ) ≈ 1 en 3.5 millones.
 
-**Trade-off**: el loop completo pasa de 10:30 (par largo+corto) a 10:41 (un solo ciclo). Yield por aldea: ~5.62 claims/h vs 5.71 antes (−1.6%). A cambio:
-- 18/18 aldeas en cada ciclo, sin saltadas.
-- Sin requests rechazadas por el server (el viejo patrón generaba `success:false` en 3 aldeas de cada ciclo largo).
-- Sin warnings espurios de "1/6 aldeas en cooldown" en los logs.
-- La mitad de requests al server (1 ciclo por loop en lugar de 2).
+### Por qué la versión 1 rompía con jitter 2-2.5s
 
-**Adelantar** (clave después de un reload): si en este ciclo todas las aldeas estaban en cooldown y la próxima se libera en 4 min, no esperamos 10 min — adelantamos a 4m05s. Recuperamos yield perdido por el reload. Este mecanismo sigue activo aunque ya no se dispare en operación normal: solo aplica cuando el ciclo arranca con cooldowns desfasados (post-reload, post-CAPTCHA, primer arranque tras instalación).
+La fórmula `baseMs - duracionCiclo + jitter` que tuvimos primero **es la misma** que esta. La diferencia es el JITTER: con `[2000, 2500]ms` la varianza por gap era la misma (0.144s — depende del rango, no del offset), pero el **peor caso adversarial** para N=18 era −8.5s. El jitter mínimo de 3s no lo cubría → el server rechazaba 3-4 aldeas/ciclo y se generaba el patrón "ciclo largo + ciclo corto adelantado".
+
+Con `[0, 500ms]` el rango es el mismo, pero la gracia subió a 30s **fija** (no random). Eso cubre el peor caso para N hasta ~3000 aldeas con margen estadístico holgado.
+
+### Versión 2 (intermedia): `baseMs + jitter`
+
+Entre la v1 rota y la actual hubo una variante que NO descontaba duracionCiclo: `baseMs + jitter(3-30s)`. Era segura pero **desperdiciaba** `duracionCiclo + jitter` por ciclo — para 18 aldeas 30-50s, para 100 ciudades 600s+ (yield catastrófico). La v3 actual recupera ese yield manteniendo la seguridad gracias al jitter chico.
+
+### Piso de 5s
+
+Cuando `duracionCiclo > baseMs - 30s` (≥130 ciudades aprox), `baseMs - duracionCiclo + 30s` da negativo o muy chico. El piso de 5s da un respiro mínimo entre vueltas para que el server digiera el último claim y mantiene algo de variabilidad anti-bot.
+
+### Adelantar (post-reload / post-CAPTCHA)
+
+Si en este ciclo todas las aldeas estaban en cooldown y la próxima se libera en 4 min, no esperamos 10 min — adelantamos a 4m05s. Recuperamos yield perdido. Solo aplica cuando el ciclo arranca con cooldowns desfasados (post-reload, post-CAPTCHA, primer arranque tras instalación).
+
+### Yield por escala
+
+Con la fórmula nueva (cooldown 10min):
+
+| Ciudades | duracionCiclo | esperaNormal | Loop total | Yield/aldea | vs ideal 6.0/h |
+|---|---|---|---|---|---|
+| 3 | ~18s | ~612s | 10:30 | 5.71/h | −4.8% |
+| 20 | ~120s | ~510s | 10:30 | 5.71/h | −4.8% |
+| 50 | ~300s | ~330s | 10:30 | 5.71/h | −4.8% |
+| 100 | ~600s | 30s (gracia) | 10:30 | 5.71/h | −4.8% |
+| 130 | ~780s | 5s (piso) | 13:05 | 4.59/h | −23.5% |
+| 200 | ~1200s | 5s (piso) | 20:05 | 2.99/h | −50.2% |
+
+**Hasta 100 ciudades**, el yield se mantiene constante. A partir de ~130 ciudades el bot se vuelve bot-bound (el ciclo dura más que el cooldown) y el yield baja proporcionalmente — para escalar más allá habría que reducir el jitter o paralelizar requests.
 
 ---
 
@@ -248,7 +296,7 @@ try { response = await fetch(url, { signal: ctrl.signal, ... }); }
 finally { clearTimeout(abortId); }
 ```
 
-`AbortError` cae en el catch del caller (`recolectarCiudad`) → registrado como retry transitorio.
+`AbortError` cae en el `.catch` del fire-and-forget en Pass 2 → la aldea entra a `pendientes` para retry diferido.
 
 ### Watchdog del scheduler
 Si `programarSiguienteTick(ms)` arma un timeout de `ms`, también arma un timeout de respaldo de `ms × 2 + 60000`:
