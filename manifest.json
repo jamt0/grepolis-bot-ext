@@ -1,7 +1,7 @@
 {
     "name": "Grepolis JamBot",
     "description": "A grepolis bot",
-    "version": "3.3",
+    "version": "3.4",
     "manifest_version": 3,
     "permissions": ["storage", "activeTab", "contextMenus", "tabs", "scripting"],
     "host_permissions": ["*://*.grepolis.com/*"],

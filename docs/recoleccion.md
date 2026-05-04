@@ -51,10 +51,11 @@ json={
 1. Loguea separador violeta `═══ CICLO #N ═══`.
 2. Refresca el baseline de recursos por ciudad (consultando `MM` vía bridge) — sin esto el primer claim arrastra 5-10 min de producción.
 3. Ordena ciudades por `localeCompare(numeric)` → "001 Jam" < "002 Jam" < "010 Jam".
-4. **Pass 1 (síncrono)**: para cada ciudad, recorre sus 6 aldeas (orden alfabético determinista — ver §6.1) y aplica el **gating de cooldown** (ver §4). Las aldeas en cooldown vivo (cliente o server) registran su `status:"saltada-cooldown"` en historial sin pegarle al server. Las que pasan el gate se acumulan en `tareas[]`. Información de saltadas por ciudad se guarda en `ciudadInfo` para loguearla en Pass 2.
-5. **Pass 2 (fire-and-forget)**: itera `tareas[]`. Por cada tarea (excepto la última):
+4. **Pass 1 (síncrono)**: aplana las 6 aldeas de cada ciudad en una lista `tareas[]` (orden alfabético determinista por nombre, ver §6.2). NO hace gating de cooldown — eso pasa en Pass 2 al momento del fire (ver siguiente punto).
+5. **Pass 2 (gating al fire-time + fire-and-forget)**: itera `tareas[]`. Por cada tarea (excepto la última):
    - Chequea `core.isCaptchaActive()` y `t.ciudad.recursosLlenos` → si alguno cierto, salta.
-   - Emite el banner azul de la ciudad si es la primera tarea de esa ciudad.
+   - **Gating de cooldown** (ver §4): compara `Date.now()` (en el momento del fire, no al inicio del ciclo) contra `lastClaimAt`. Si está en cooldown, registra `status:"saltada-cooldown"` y `continue`. Es crítico que el gate corra acá: la última aldea se dispara ~`duracionCiclo` segundos después del inicio, gateándola al inicio le faltarían esos segundos del cooldown contra el server (bug que estuvo brevemente en producción y se fixeó en v3.4).
+   - Emite el banner azul de la ciudad si es la primera tarea suya que pasa el gate.
    - **Dispara** `recolectarAldea()` SIN awaitarlo. El handler async procesa la respuesta cuando vuelve y actualiza `lastClaimAt`, ciclo stats, marca `recursosLlenos` si corresponde, encola en `pendientes` si fue `reintentar`.
    - `await delayMs(jitter(0, 500))` — único bloqueo del loop (ver §6).
    - La **última tarea SÍ se awaitea** para que `duracionCiclo = now() - inicioCiclo` refleje también la última response.

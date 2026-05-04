@@ -2580,131 +2580,52 @@
         };
       }
 
-      //═══ Pass 1: cooldown gating + build flat task list ═══
+      //═══ Pass 1: build flat task list (sin gating) ═══
       //
-      //Sincronía pura: filtra aldeas en cooldown vivo (cliente o server) y
-      //arma `tareas[]` con (ciudad, aldea, acumulador, opcion). El gating no
-      //depende del server — usa lastClaimAtPorAldea local + aldea.loot del
-      //bootstrap. Las saltadas registran su `status:"saltada-cooldown"` en
-      //historial y suman al acumulador acá, sin pegarle al server.
+      //Pass 1 aplana las 6 aldeas de cada ciudad en una lista única `tareas`,
+      //ordenada por (ciudad alfabético, aldea alfabético). NO hace gating de
+      //cooldown — eso pasa en Pass 2 al momento del fire.
       //
-      //La info por ciudad (saltadas + tiempo a próxima libre) se guarda en
-      //ciudadInfo y se loguea en Pass 2 cuando se emite el banner de la
-      //ciudad — así el log queda visualmente agrupado por ciudad.
+      //Por qué el gating se mueve a Pass 2: si gateáramos acá, todas las
+      //aldeas se evaluarían contra `Date.now()` al INICIO del ciclo, pero la
+      //última aldea no se dispara hasta `t = duracionCiclo` segundos después.
+      //Para 50 ciudades (duracionCiclo ≈ 75s) la última aldea estaría 75s
+      //corta de cooldown al inicio de Pass 1, pero ya cumplido cuando Pass 2
+      //le toque. Gatear al inicio rompía la fórmula entera.
+      //
+      //Orden alfabético determinista (NO shuffle): ver el comentario detallado
+      //más abajo en Pass 2 sobre por qué la fórmula `baseMs - duracionCiclo +
+      //30s` requiere orden estable entre ciclos.
       const tareas = [];
-      const ciudadInfo = new Map();
 
       for (let idxCiudad = 0; idxCiudad < ciudadesOrdenadas.length; idxCiudad++) {
         const ciudad = ciudadesOrdenadas[idxCiudad];
         const cfg = getConfigCiudad(ciudad.codigoCiudad);
-        //Margen de +5s sobre el cooldown server real (5 o 10min). Cubre
-        //drift de reloj cliente/server, latencia de red y jitter del
-        //setTimeout. Costo: ~1.7% de yield en ciudades de 5min, ~0.8% en
-        //10min — despreciable.
-        const cooldownMs = cfg.minutos * 60 * 1000 + 5 * 1000;
         const acumulador = acumuladoCiclo[ciudad.codigoCiudad];
 
-        let saltadasPorCooldown = 0;
-        let restanteMinSeg = Infinity;
-
-        //Orden DETERMINISTA (alfabético por nombre de aldea) — NO shuffle.
-        //
-        //Por qué este cambio importa para la fórmula de esperaNormal:
-        //
-        //La fórmula `baseMs - duracionCiclo + 30s` asume que cada aldea está
-        //en la MISMA posición temporal del ciclo en ambas vueltas (N y N+1).
-        //Con eso, su CD entre claims es ≈ `baseMs + 30s ± varianza_jitter`
-        //(σ ≈ 0.2·√pos segundos — chica).
-        //
-        //Si en cambio shuffleamos las aldeas dentro de la ciudad, una aldea
-        //que estaba al FINAL del ciclo N (offset ≈ duracionCiclo) puede caer
-        //al INICIO del ciclo N+1 (offset ≈ 0). Su CD efectivo se reduce en
-        //`duracionCiclo` entera — para 100 ciudades eso es 150-600s. La
-        //gracia de 30s NO cubre eso. Resultado: server rechaza esa aldea.
-        //
-        //Trade-off: orden 100% predecible aldea-por-aldea. La huella anti-bot
-        //la siguen dando (a) el jitter random [0, 500ms] entre claims, (b)
-        //el orden alfabético-natural de ciudades (también determinista pero
-        //no obviamente "secuencial" como sería claim-id-1, claim-id-2…).
-        //
-        //Si en algún momento el server activa anti-bot por orden de aldeas
-        //dentro de una ciudad, tocará pensar en una solución que no rompa
-        //la fórmula (probablemente: shuffle pero MISMO shuffle entre ciclos —
-        //e.g. seed determinista por (ciudadId, dayOfYear)).
         const aldeasOrdenadas = ciudad.aldeas.slice().sort((x, y) => {
           const nx = x.name || `farm_${x.id}`;
           const ny = y.name || `farm_${y.id}`;
           return nx.localeCompare(ny, undefined, { numeric: true });
         });
         for (const aldea of aldeasOrdenadas) {
-          const last = lastClaimAtPorAldea[aldea.id] || 0;
-          const transcurrido = Date.now() - last;
-
-          //Sincronización con server al primer ciclo: si todavía no claimeamos
-          //esta aldea en esta sesión (last == 0), respetamos el campo
-          //`aldea.loot` que el server nos dio en obtenerCiudadesConAldeas.
-          //Es un timestamp Unix en segundos del próximo claim disponible.
-          //Sin esto, después de un reload el bot intenta todas las aldeas
-          //asumiendo cooldown=0 y el server las rechaza con success:false.
-          if (last === 0 && aldea.loot) {
-            const ahoraSec = Math.floor(Date.now() / 1000);
-            if (aldea.loot > ahoraSec) {
-              saltadasPorCooldown += 1;
-              acumulador.saltadasCooldown += 1;
-              const restante = aldea.loot - ahoraSec;
-              if (restante < restanteMinSeg) restanteMinSeg = restante;
-              registrarClaim({
-                aldeaId: aldea.id, ciudadId: ciudad.codigoCiudad,
-                ciudadNombre: ciudad.nombreCiudad || ciudad.codigoCiudad,
-                aldeaNombre: aldea.name || `farm_${aldea.id}`,
-                ciclo: nCiclo, status: "saltada-cooldown",
-                esperaSeg: restante,
-              });
-              continue;
-            }
-          }
-
-          if (last > 0 && transcurrido < cooldownMs) {
-            saltadasPorCooldown += 1;
-            acumulador.saltadasCooldown += 1;
-            const restante = Math.round((cooldownMs - transcurrido) / 1000);
-            if (restante < restanteMinSeg) restanteMinSeg = restante;
-            registrarClaim({
-              aldeaId: aldea.id, ciudadId: ciudad.codigoCiudad,
-              ciudadNombre: ciudad.nombreCiudad || ciudad.codigoCiudad,
-              aldeaNombre: aldea.name || `farm_${aldea.id}`,
-              ciclo: nCiclo, status: "saltada-cooldown",
-              esperaSeg: restante,
-            });
-            continue;
-          }
-
-          //Aldea pasa el gate → entra a la cola de fires del Pass 2.
-          tareas.push({ ciudad, aldea, acumulador, opcion: cfg.opcion, idxCiudad });
-        }
-
-        ciudadInfo.set(ciudad.codigoCiudad, {
-          nombre: ciudad.nombreCiudad || ciudad.codigoCiudad,
-          minutos: cfg.minutos,
-          saltadas: saltadasPorCooldown,
-          restanteSeg: restanteMinSeg,
-          totalAldeas: ciudad.aldeas.length,
-        });
-
-        //Propagar al global el mínimo entre ciudades — recolectarRecursos lo
-        //usa para adelantar el próximo tick si la próxima aldea se libera
-        //antes del intervalo normal.
-        if (restanteMinSeg < cicloState.proximaLiberacionSeg) {
-          cicloState.proximaLiberacionSeg = restanteMinSeg;
+          tareas.push({ ciudad, aldea, acumulador, opcion: cfg.opcion, cfg, idxCiudad });
         }
       }
 
-      //═══ Pass 2: fire-and-forget de los claims ═══
+      //═══ Pass 2: gating + fire-and-forget de los claims ═══
       //
-      //Cada iteración dispara un claim sin awaitarlo (excepto el último).
-      //La response llega asincrónica, dispara `manejarResultadoClaim` que
-      //actualiza estado (lastClaimAt, ciclo stats) y, si hubo error
-      //recuperable, encola en `pendientes` para retry diferido.
+      //Cada iteración:
+      //  1. Chequea CAPTCHA / pause / ciudad-llena → corta o saltea.
+      //  2. Hace gating de cooldown EN EL MOMENTO del fire (no al inicio del
+      //     ciclo). Esto es crítico: si gateáramos arriba al inicio, la última
+      //     aldea estaría `duracionCiclo` segundos corta de cooldown según el
+      //     reloj de Pass 1, pero ya cumplido cuando Pass 2 le toque (ver
+      //     comentario en Pass 1).
+      //  3. Si pasa el gate, dispara el claim sin awaitarlo (excepto el último).
+      //     La response llega asincrónica, dispara `manejarResultadoClaim` que
+      //     actualiza estado (lastClaimAt, ciclo stats) y, si hubo error
+      //     recuperable, encola en `pendientes` para retry diferido.
       //
       //Entre fires hay jitter [0, 500ms] — el único bloqueo del loop.
       //Con response time típico de 200-500ms, la primera response llega
@@ -2782,9 +2703,63 @@
         //sola cuando el jugador construya / haga upgrades.
         if (t.ciudad.recursosLlenos) continue;
 
-        //Banner per ciudad — emitido cuando llega su primera tarea. Una
-        //ciudad 6/6 cooldowned (sin tareas en Pass 2) no llega acá y por
-        //tanto no tiene banner; en su lugar Pass 1 ya registró las saltadas.
+        //═══ Gating de cooldown AL MOMENTO DEL FIRE ═══
+        //
+        //Crítico que esto sea acá y no en Pass 1: cada aldea se evalúa contra
+        //el `Date.now()` del momento en que le toca dispararse, no contra el
+        //inicio del ciclo. Para 50 ciudades la última aldea se dispara ~75s
+        //después del inicio del ciclo — gateándola al inicio le faltarían
+        //esos 75s de cooldown contra el server, pero al fire ya están
+        //cumplidos.
+        const last = lastClaimAtPorAldea[t.aldea.id] || 0;
+        const transcurrido = Date.now() - last;
+        //Margen de +5s sobre el cooldown server real. Cubre drift de reloj
+        //cliente/server, latencia de red y jitter del setTimeout.
+        const cooldownGateMs = t.cfg.minutos * 60 * 1000 + 5 * 1000;
+
+        //Sincronización con server al primer ciclo: si todavía no claimeamos
+        //esta aldea en esta sesión (last == 0), respetamos el campo
+        //`aldea.loot` que el server nos dio en obtenerCiudadesConAldeas.
+        //Sin esto, después de un reload el bot intenta todas las aldeas
+        //asumiendo cooldown=0 y el server las rechaza con success:false.
+        if (last === 0 && t.aldea.loot) {
+          const ahoraSec = Math.floor(Date.now() / 1000);
+          if (t.aldea.loot > ahoraSec) {
+            const restante = t.aldea.loot - ahoraSec;
+            t.acumulador.saltadasCooldown += 1;
+            registrarClaim({
+              aldeaId: t.aldea.id, ciudadId: t.ciudad.codigoCiudad,
+              ciudadNombre: t.ciudad.nombreCiudad || t.ciudad.codigoCiudad,
+              aldeaNombre: t.aldea.name || `farm_${t.aldea.id}`,
+              ciclo: nCiclo, status: "saltada-cooldown",
+              esperaSeg: restante,
+            });
+            if (restante < cicloState.proximaLiberacionSeg) {
+              cicloState.proximaLiberacionSeg = restante;
+            }
+            continue;
+          }
+        }
+
+        if (last > 0 && transcurrido < cooldownGateMs) {
+          const restante = Math.round((cooldownGateMs - transcurrido) / 1000);
+          t.acumulador.saltadasCooldown += 1;
+          registrarClaim({
+            aldeaId: t.aldea.id, ciudadId: t.ciudad.codigoCiudad,
+            ciudadNombre: t.ciudad.nombreCiudad || t.ciudad.codigoCiudad,
+            aldeaNombre: t.aldea.name || `farm_${t.aldea.id}`,
+            ciclo: nCiclo, status: "saltada-cooldown",
+            esperaSeg: restante,
+          });
+          if (restante < cicloState.proximaLiberacionSeg) {
+            cicloState.proximaLiberacionSeg = restante;
+          }
+          continue;
+        }
+
+        //Banner per ciudad — emitido en la primera aldea que pasa el gate.
+        //Una ciudad con todas sus aldeas en cooldown queda sin banner — la
+        //resumen final del ciclo igual reporta los counters.
         if (!ciudadesConBanner.has(t.ciudad.codigoCiudad)) {
           core.logCiclo(
             "recoleccion",
@@ -2792,15 +2767,6 @@
             "info"
           );
           ciudadesConBanner.add(t.ciudad.codigoCiudad);
-          //Log de saltadas por cooldown justo después del banner — visualmente
-          //agrupado con la ciudad que pertenece.
-          const info = ciudadInfo.get(t.ciudad.codigoCiudad);
-          if (info && info.saltadas > 0) {
-            core.log(
-              "recoleccion",
-              `${info.nombre}: ${info.saltadas}/${info.totalAldeas} aldeas en cooldown (${info.minutos}min) — próxima en ${core.formatDuracion(info.restanteSeg)}`
-            );
-          }
         }
 
         const isLast = (i === tareas.length - 1);
