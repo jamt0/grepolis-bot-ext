@@ -36,6 +36,198 @@
     return `${m}m ${String(r).padStart(2, "0")}s`;
   }
 
+  //—— Logging unificado ——————————————————————————————————————————————————
+  //
+  //Helpers para que todos los logs de la extensión tengan timestamp (fecha +
+  //hora), color por nivel/feature y separadores claros entre ciclos. Los
+  //warnings/errores se guardan en un buffer en memoria para poder recuperarlos
+  //después con `JamBot.errores()` desde la consola del navegador, aun si el
+  //log de DevTools fue clear-eado.
+  //
+  //Convención de colores:
+  //  info  azul   — eventos rutinarios
+  //  ok    verde  — algo terminó bien (claim exitoso, ciclo OK)
+  //  warn  ámbar  — algo no fatal pero merece atención
+  //  error rojo   — falla; siempre va a buffer
+  //  cycle violeta — header de ciclo nuevo
+
+  const ESTILOS = {
+    ts:    "color:#888;font-weight:normal",
+    scope: "color:#888",
+    info:  "color:#3498db;font-weight:bold",
+    ok:    "color:#27ae60;font-weight:bold",
+    warn:  "color:#f39c12;font-weight:bold",
+    error: "color:#fff;background:#c0392b;font-weight:bold;padding:2px 6px;border-radius:3px",
+    cycle: "color:#9b59b6;font-weight:bold;font-size:13px",
+  };
+
+  const erroresBuffer = [];
+  const MAX_ERRORES = 200;
+  //Persistencia del buffer en chrome.storage.local. Sobrevive a reload del
+  //tab y reinicio del navegador. Global (no namespaceado por mundo) — los
+  //errores son ruido transitorio y no vale la pena duplicar storage por
+  //mundo. Cap 200 entradas × ~500 B ≈ 100 KB, despreciable vs cuota 10 MB.
+  const STORAGE_KEY_ERRORES = "jambotErrores";
+  //Throttle de la escritura: muchos errores en burst (e.g. 1 por aldea
+  //fallida) se colapsan en 1 sola escritura cada 500ms. Sin esto cada
+  //logWarn dispararía un set() — innecesario para datos de diagnóstico.
+  let saveErroresPending = null;
+
+  function formatTimestamp() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function log(scope, mensaje, tipo) {
+    const estilo = ESTILOS[tipo] || ESTILOS.info;
+    console.log(
+      `%c[${formatTimestamp()}]%c [${scope}]%c ${mensaje}`,
+      ESTILOS.ts, ESTILOS.scope, estilo
+    );
+  }
+
+  function logWarn(scope, mensaje, ...extra) {
+    console.warn(
+      `%c[${formatTimestamp()}]%c [${scope}] %c⚠ ${mensaje}`,
+      ESTILOS.ts, ESTILOS.scope, ESTILOS.warn,
+      ...extra
+    );
+    guardarError("warn", scope, mensaje, extra);
+  }
+
+  function logError(scope, mensaje, ...extra) {
+    console.error(
+      `%c[${formatTimestamp()}]%c [${scope}] %c✖ ERROR: ${mensaje}`,
+      ESTILOS.ts, ESTILOS.scope, ESTILOS.error,
+      ...extra
+    );
+    guardarError("error", scope, mensaje, extra);
+  }
+
+  //Banner con separadores `═`. Por defecto violeta (cycle); se puede pasar
+  //otro tipo para distinguir niveles (e.g. "info" azul para subsecciones
+  //dentro de un ciclo, como el banner de cada ciudad).
+  function logCiclo(scope, titulo, tipo) {
+    const sep = "═".repeat(60);
+    const estilo = ESTILOS[tipo] || ESTILOS.cycle;
+    console.log(
+      `%c${sep}\n[${formatTimestamp()}] [${scope}] ${titulo}\n${sep}`,
+      estilo
+    );
+  }
+
+  function guardarError(nivel, scope, mensaje, extra) {
+    erroresBuffer.push({
+      ts: Date.now(),
+      iso: new Date().toISOString(),
+      nivel,
+      scope,
+      mensaje,
+      //Serializar lo que se pueda para que sobreviva a referencias mutables.
+      //Errores conservamos name/message/stack; objetos complejos van por
+      //JSON round-trip; el resto cae a String().
+      extra: extra && extra.length
+        ? extra.map((e) => {
+            if (e instanceof Error) return { name: e.name, message: e.message, stack: e.stack };
+            try { return JSON.parse(JSON.stringify(e)); } catch (_) { return String(e); }
+          })
+        : undefined,
+    });
+    if (erroresBuffer.length > MAX_ERRORES) erroresBuffer.shift();
+    persistirErroresBuffer();
+  }
+
+  function cargarErroresBuffer() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(STORAGE_KEY_ERRORES, (obj) => {
+          const arr = (obj && obj[STORAGE_KEY_ERRORES]) || [];
+          //Reemplazar contenido del buffer in-place para no romper
+          //referencias del array (las funciones getErrores/imprimirErrores
+          //hacen .slice() así que tampoco importa, pero por consistencia).
+          erroresBuffer.length = 0;
+          for (const e of arr) erroresBuffer.push(e);
+          resolve();
+        });
+      } catch (_) {
+        //chrome.storage no disponible (page-context) → arrancar vacío.
+        resolve();
+      }
+    });
+  }
+
+  function persistirErroresBuffer() {
+    if (saveErroresPending) clearTimeout(saveErroresPending);
+    saveErroresPending = setTimeout(() => {
+      saveErroresPending = null;
+      try {
+        chrome.storage.local.set({ [STORAGE_KEY_ERRORES]: erroresBuffer });
+      } catch (_) {
+        //Ya estamos en un código que loggea errores; no podemos llamar a
+        //logError acá sin riesgo de loop. Silencioso.
+      }
+    }, 500);
+  }
+
+  function getErrores(filtro) {
+    const f = filtro || {};
+    let r = erroresBuffer.slice();
+    if (f.scope) r = r.filter((e) => e.scope === f.scope);
+    if (f.nivel) r = r.filter((e) => e.nivel === f.nivel);
+    if (f.desde) r = r.filter((e) => e.ts >= f.desde);
+    return r;
+  }
+
+  function clearErrores() {
+    erroresBuffer.length = 0;
+    try { chrome.storage.local.remove(STORAGE_KEY_ERRORES); } catch (_) { /* no storage */ }
+    log("core", "buffer de errores limpiado", "ok");
+  }
+
+  //Imprime el buffer en consola con formato. Pensado para invocarse desde
+  //DevTools: `JamBot.errores()` o `JamBot.errores({ scope: "recoleccion" })`.
+  function imprimirErrores(filtro) {
+    const lista = getErrores(filtro);
+    if (!lista.length) {
+      console.log("%c[JamBot] sin errores registrados", ESTILOS.ok);
+      return;
+    }
+    console.group(`%c[JamBot] ${lista.length} entrada(s) en el buffer`, ESTILOS.cycle);
+    for (const e of lista) {
+      const fecha = new Date(e.ts).toLocaleString();
+      const estilo = e.nivel === "error" ? ESTILOS.error : ESTILOS.warn;
+      const fn = e.nivel === "error" ? console.error : console.warn;
+      if (e.extra && e.extra.length) {
+        fn(`%c[${fecha}] [${e.scope}] ${e.mensaje}`, estilo, ...e.extra);
+      } else {
+        fn(`%c[${fecha}] [${e.scope}] ${e.mensaje}`, estilo);
+      }
+    }
+    console.groupEnd();
+  }
+
+  //Captura errores no manejados y unhandled promise rejections. Filtra por
+  //URL del archivo: solo registra los que vienen de la propia extensión, así
+  //no nos contaminamos con errores del juego (game.min.js, jquery, etc).
+  //Las unhandledrejection no traen filename — las registramos todas igual,
+  //porque cualquier promise nuestra que rompa cae aquí y conviene verla.
+  function instalarCapturaErrores() {
+    let extPrefix = "";
+    try { extPrefix = chrome.runtime.getURL(""); } catch (_) { /* page-context */ }
+
+    window.addEventListener("error", (e) => {
+      if (!extPrefix || !e.filename || !e.filename.startsWith(extPrefix)) return;
+      logError("global", e.message || "error sin mensaje", e.error || e);
+    });
+
+    window.addEventListener("unhandledrejection", (e) => {
+      const reason = e.reason;
+      const msg = (reason && reason.message) || String(reason);
+      logError("global", `unhandledrejection: ${msg}`, reason);
+    });
+  }
+
   //—— Estado de CAPTCHA ——————————————————————————————————————————————————
 
   let captchaActive = false;
@@ -52,14 +244,14 @@
 
   function emitCaptchaChange(active) {
     for (const fn of captchaListeners) {
-      try { fn(active); } catch (e) { console.error("[JamBot/core] listener captcha:", e); }
+      try { fn(active); } catch (e) { logError("core", "listener captcha falló", e); }
     }
   }
 
   function onCaptchaDetectado() {
     if (captchaActive) return;
     captchaActive = true;
-    console.warn("[JamBot] CAPTCHA detectado — pausando bot");
+    logWarn("core", "CAPTCHA detectado — el ciclo seguirá con probes cada 30s");
     iniciarFlashTitulo();
     sonarAlerta();
     chrome.runtime.sendMessage({ type: "JamBot:badge", text: "!", color: "#c0392b" });
@@ -69,7 +261,7 @@
   function onCaptchaResuelto() {
     if (!captchaActive) return;
     captchaActive = false;
-    console.log("[JamBot] CAPTCHA resuelto — reanudando bot");
+    log("core", "CAPTCHA resuelto — operación normal", "ok");
     pararFlashTitulo();
     chrome.runtime.sendMessage({ type: "JamBot:badge", text: "" });
     emitCaptchaChange(false);
@@ -98,14 +290,20 @@
 
   function emitPlayPauseChange(p) {
     for (const fn of playPauseListeners) {
-      try { fn(p); } catch (e) { console.error("[JamBot/core] listener playPause:", e); }
+      try { fn(p); } catch (e) { logError("core", "listener playPause falló", e); }
     }
   }
 
   function setPaused(p) {
     if (pausado === p) return;
     pausado = p;
-    console.log("[JamBot/core] " + (p ? "PAUSADO" : "REANUDADO"));
+    log("core", p ? "PAUSADO" : "REANUDADO", p ? "warn" : "ok");
+    //Stack trace para auditar quién dispara el cambio. Si el bot "se pausa
+    //solo", el stack mostrará si vino de un click humano (HTMLButtonElement
+    //o similar) o de algo programático (e.g. handler del juego que tocó el
+    //botón superpuesto). Imprime con console.trace para que sea colapsable
+    //en DevTools y no satura el log normal.
+    console.trace(`[JamBot/core] setPaused(${p}) — origen del cambio`);
     emitPlayPauseChange(p);
   }
 
@@ -162,8 +360,13 @@
     if (cont) return cont;
     cont = document.createElement("div");
     cont.id = "jambot-buttons";
+    //z-index bajo (5) para que NUNCA quede encima de modales del juego —
+    //antes estaba en 1000 y los clicks dirigidos al chat/foro/mensajería
+    //a veces aterrizaban en el botón ▶/⏸ y pausaban el bot sin querer.
+    //Position bottom:90px → los botones quedan justo encima del pulpo
+    //(ícono de selector de unidades en la esquina inferior izquierda).
     cont.style.cssText =
-      "position:absolute;bottom:80px;left:10px;z-index:1000;" +
+      "position:absolute;bottom:90px;left:10px;z-index:5;" +
       "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
     document.body.appendChild(cont);
     return cont;
@@ -198,6 +401,12 @@
    * de cambio de bot_check y devuelve el ctx que cada feature recibirá.
    */
   async function init() {
+    instalarCapturaErrores();
+    //Restaurar el buffer de errores persistido. Sobrevive a reload — los
+    //warnings/errores recientes quedan visibles en JamBot.errores() y en el
+    //panel "Errores recientes" aunque hayas recargado la pestaña.
+    await cargarErroresBuffer();
+
     injectScript(chrome.runtime.getURL("/js/saveToken.js"), "body");
     injectScript(chrome.runtime.getURL("/js/gameBridge.js"), "body");
 
@@ -206,7 +415,7 @@
       const res = await fetch(chrome.runtime.getURL("/data.json"));
       dataConfig = await res.json();
     } catch (e) {
-      console.error("[JamBot/core] no pude cargar data.json:", e);
+      logError("core", "no pude cargar data.json", e);
       return null;
     }
 
@@ -218,7 +427,7 @@
       //existe `window.Game`. Salimos en silencio para no spamear consola.
       return null;
     }
-    console.log({ world_id, csrfToken, townId, player_id });
+    log("core", `bootstrap world=${world_id} town=${townId} player=${player_id}`, "ok");
 
     //Escuchar el bridge para detectar cambios de bot_check
     window.addEventListener("message", (e) => {
@@ -244,6 +453,10 @@
         onPlayPauseChange,
         setPaused,
         togglePlayPause,
+        log,
+        logWarn,
+        logError,
+        logCiclo,
       },
     };
   }
@@ -261,5 +474,20 @@
     onPlayPauseChange,
     setPaused,
     togglePlayPause,
+    log,
+    logWarn,
+    logError,
+    logCiclo,
+    getErrores,
+    clearErrores,
   };
+
+  //Atajo para que el usuario pueda invocar desde DevTools:
+  //  JamBot.errores()                       -> imprime todo el buffer
+  //  JamBot.errores({ scope:"recoleccion" })-> filtra por feature
+  //  JamBot.errores.lista()                 -> devuelve el array crudo
+  //  JamBot.errores.limpiar()               -> vacía el buffer
+  JamBot.errores = imprimirErrores;
+  JamBot.errores.lista = getErrores;
+  JamBot.errores.limpiar = clearErrores;
 })();

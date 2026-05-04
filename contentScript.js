@@ -10,6 +10,8 @@
 (async () => {
   const JamBot = window.JamBot;
   if (!JamBot || !JamBot.core || !JamBot.features) {
+    //Pre-init: no podemos usar JamBot.core.logError porque eso es
+    //precisamente lo que falta. console.error directo es la única opción.
     console.error(
       "[JamBot/bootstrap] window.JamBot incompleto — core.js o features/* no se cargaron antes que contentScript.js. Revisar orden en manifest.json."
     );
@@ -24,15 +26,15 @@
     //los botones del bot.
     return;
   }
-  console.log("[JamBot/bootstrap] iniciando…");
+  ctx.core.log("bootstrap", "iniciando…");
 
   for (const [nombre, feature] of Object.entries(JamBot.features)) {
     if (!feature || typeof feature.init !== "function") continue;
     try {
       await feature.init(ctx);
-      console.log(`[JamBot/bootstrap] feature '${nombre}' iniciada`);
+      ctx.core.log("bootstrap", `feature '${nombre}' iniciada`, "ok");
     } catch (e) {
-      console.error(`[JamBot/bootstrap] feature '${nombre}' falló:`, e);
+      ctx.core.logError("bootstrap", `feature '${nombre}' falló al inicializar`, e);
     }
   }
 })();

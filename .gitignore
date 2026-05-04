@@ -1,0 +1,8 @@
+# Logs locales para debugging del bot. No tienen valor versionable y suelen
+# crecer rápido (cada sesión genera cientos de KB).
+logs.txt
+*.log
+
+# Herramientas y artefactos del sistema operativo
+.DS_Store
+Thumbs.db
