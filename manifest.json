@@ -25,6 +25,7 @@
                 "core.js",
                 "features/recoleccion.js",
                 "features/finalizarConstruccion.js",
+                "features/ataques.js",
                 "contentScript.js"
             ],
             "run_at": "document_end"

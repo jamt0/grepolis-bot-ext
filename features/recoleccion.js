@@ -642,7 +642,7 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion"];
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
@@ -774,6 +774,7 @@
         if (tabActivo === "dashboard") renderTabDashboard(body);
         else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
         else if (tabActivo === "construccion") renderTabConstruccion(body);
+        else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
       //(que de todos modos nos retornamos antes en outsideClickHandler).
@@ -833,6 +834,7 @@
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
+      tabs.appendChild(crearBotonTab("ataques", "Ataques"));
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -881,7 +883,29 @@
       if (tabActivo === "dashboard") renderTabDashboard(body);
       else if (tabActivo === "settings") renderTabSettings(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
+      else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
       else renderTabRecoleccion(body);
+    }
+
+    //Delegamos el render de "Ataques" a la feature, que se mantiene
+    //self-contained en features/ataques.js. Si todavía no se inicializó,
+    //mostramos placeholder. Mismo patrón que podría aplicarse a otras
+    //features futuras.
+    function renderTabAtaquesDelegado(body) {
+      const api = JamBot.features.ataques && JamBot.features.ataques.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de ataques todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      //IMPORTANTE: NO limpiamos body acá. renderTab tiene su propio
+      //chequeo "skip si hay foco en input/select" que se rompía si
+      //borrábamos el contenido antes — el activeElement quedaba sin
+      //referencia y el input perdía foco/cursor cada segundo.
+      api.renderTab(body);
     }
 
     function actualizarHeaderPanel(panel) {

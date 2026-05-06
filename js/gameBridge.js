@@ -111,6 +111,38 @@
   });
 
   /**
+   * Permite al content script preguntar las unidades que pertenecen y están
+   * en una ciudad — es decir, el modelo Units con
+   * `home_town_id == current_town_id == townId`. Eso filtra: tropas en otra
+   * ciudad como apoyo (current_town_id != home), tropas en movimiento
+   * (current_town_id null), y tropas extranjeras estacionadas (home != town).
+   *
+   * Devuelve el atributo crudo (sword, slinger, archer, …) o null si el
+   * modelo no está cargado en MM (la ciudad no fue abierta en la sesión).
+   * El feature ataques usa esto para saber cuántas unidades del tipo
+   * elegido están disponibles antes de cada ataque.
+   */
+  window.addEventListener("JamBot:queryUnits", function (e) {
+    const townId = e && e.detail && e.detail.townId;
+    let units = null;
+    if (window.MM && typeof window.MM.getModels === "function") {
+      const all = window.MM.getModels().Units;
+      if (all) {
+        for (const id of Object.keys(all)) {
+          const u = all[id];
+          const a = u && u.attributes;
+          if (!a) continue;
+          if (a.home_town_id == townId && a.current_town_id == townId) {
+            units = Object.assign({}, a);
+            break;
+          }
+        }
+      }
+    }
+    window.postMessage({ type: "JamBot:unitsResult", townId, units }, "*");
+  });
+
+  /**
    * Vigila Game.bot_check. En estado normal vale null; cuando Grepolis exige
    * un challenge anti-bot pasa a un objeto con la info del CAPTCHA. Cualquier
    * cambio se notifica al content script vía postMessage para que pause el
