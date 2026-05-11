@@ -521,6 +521,37 @@
     }
   }
 
+  //Beep "suave" para advertencias no urgentes (ciudad llena, cupo diario
+  //alcanzado): dos blips descendentes 660Hz→440Hz, gain bajo (0.06). Avisa
+  //al usuario que algo dejó de farmear pero NO confundir con el tono del
+  //CAPTCHA (880Hz solido, agudo, asociado a "bot detenido, vení ya").
+  //
+  //NO trae throttle global: la gating es responsabilidad del caller — la
+  //feature de recolección usa un flag `advertenciaSonadaCiclo` por ciudad
+  //y por ciclo, así N ciudades distintas en el mismo ciclo cada una suena
+  //1 vez (y N aldeas de la misma ciudad no spamean).
+  function sonarAdvertencia() {
+    try {
+      const ctx = new AudioContext();
+      function blip(freq, atSec, durSec) {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.connect(g);
+        g.connect(ctx.destination);
+        o.type = "sine";
+        o.frequency.value = freq;
+        g.gain.setValueAtTime(0.06, ctx.currentTime + atSec);
+        o.start(ctx.currentTime + atSec);
+        o.stop(ctx.currentTime + atSec + durSec);
+      }
+      blip(660, 0, 0.12);
+      blip(440, 0.18, 0.15);
+      setTimeout(() => { try { ctx.close(); } catch (_) {} }, 600);
+    } catch (e) {
+      //sonido es nice-to-have
+    }
+  }
+
   //—— UI: contenedor de botones ——————————————————————————————————————————
 
   function asegurarContenedorBotones() {
@@ -640,6 +671,7 @@
         logWarn,
         logError,
         logCiclo,
+        sonarAdvertencia,
       },
     };
   }
@@ -669,6 +701,7 @@
     logCiclo,
     getErrores,
     clearErrores,
+    sonarAdvertencia,
   };
 
   //Atajo para que el usuario pueda invocar desde DevTools:
