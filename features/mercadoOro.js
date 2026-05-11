@@ -547,6 +547,7 @@
         return wrap;
       }
       const lista = document.createElement("div");
+      lista.id = "mercadoOroAlertasLista";
       lista.style.cssText =
         "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
         "max-height:240px;overflow-y:auto";
@@ -573,6 +574,11 @@
     }
 
     function renderTab(body) {
+      //Preservar scroll de la lista de alertas: renderTab se llama cada
+      //segundo y reconstruye body entero, así el usuario no podía scrollear.
+      const listaPrev = body.querySelector("#mercadoOroAlertasLista");
+      const scrollPrev = listaPrev ? listaPrev.scrollTop : 0;
+
       body.innerHTML = "";
       body.appendChild(renderHeader());
 
@@ -586,6 +592,11 @@
       body.appendChild(renderTablaEstado());
 
       body.appendChild(renderAlertas());
+
+      if (scrollPrev) {
+        const listaNew = body.querySelector("#mercadoOroAlertasLista");
+        if (listaNew) listaNew.scrollTop = scrollPrev;
+      }
     }
 
     //—— Arranque ———————————————————————————————————————————————————————
