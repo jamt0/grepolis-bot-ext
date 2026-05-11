@@ -1811,8 +1811,16 @@
       const lastClaim = lastClaimAtPorAldea[aldea.id];
       const lootMs = (aldea.loot || 0) * 1000;
       let next = 0;
-      if (lastClaim) next = Math.max(next, lastClaim + cooldownMs);
-      if (lootMs) next = Math.max(next, lootMs);
+      //Guardas con Number.isFinite: si el storage tiene un valor sucio
+      //(p.ej. NaN persistido por una sincronización post-CAPTCHA que se
+      //hizo con cooldownMs indefinido), Math.max propaga NaN y el render
+      //termina mostrando "en NaNm NaNs". Validar acá lo evita en raíz.
+      if (Number.isFinite(lastClaim) && lastClaim > 0 && Number.isFinite(cooldownMs)) {
+        next = Math.max(next, lastClaim + cooldownMs);
+      }
+      if (Number.isFinite(lootMs) && lootMs > 0) {
+        next = Math.max(next, lootMs);
+      }
       return next;
     }
 
