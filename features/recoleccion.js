@@ -652,14 +652,24 @@
     const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
+    //Subtab dentro del tab "Recolección". "ciudades" muestra el estado live
+    //por aldea (cooldown, próxima claim, dots históricos); "ciclos" muestra
+    //la vista clásica con el ciclo actual + último + anteriores. Default a
+    //"ciudades" porque es lo que la mayoría del tiempo querés mirar.
+    const STORAGE_KEY_SUBTAB_RECOLECCION = "jambotRecoleccionSubtab";
+    const SUBTABS_RECOLECCION_VALIDOS = ["ciudades", "ciclos"];
+    let subtabRecoleccion = window.localStorage.getItem(STORAGE_KEY_SUBTAB_RECOLECCION) || "ciudades";
+    if (!SUBTABS_RECOLECCION_VALIDOS.includes(subtabRecoleccion)) subtabRecoleccion = "ciudades";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
     //  ciclos:        { actual: bool, ultimo: bool }      true = expandido
     //  aldeas:        { [id]: bool }                      true = expandido (historial)
     //  cicloCiudades: { [n]: { [id]: bool } }             true = expandido (ciudad dentro de un ciclo)
+    //  ciudades:      { [id]: bool }                      true = expandido (subtab "ciudades")
     const uiColapso = {
       ciclos: { actual: true, ultimo: true },
       aldeas: {},
       cicloCiudades: {},
+      ciudades: {},
       errores: false,
     };
 
@@ -1599,19 +1609,69 @@
     }
 
     //—— Tab Recolección ——————————————————————————————————————————————————
+    //
+    //El tab tiene 2 subtabs:
+    //  "ciudades" — estado live por aldea (cooldown, próxima claim, dots
+    //               históricos). Lo que casi siempre querés ver.
+    //  "ciclos"   — vista clásica con el ciclo actual + último + anteriores.
+    //               Útil para auditar barridos individuales.
+    //
+    //renderTabRecoleccion es el wrapper: pinta CAPTCHA (si hay) + las
+    //sub-tabs + delega el cuerpo a renderSubtabPorCiudades / PorCiclos.
 
     function renderTabRecoleccion(body) {
       body.innerHTML = "";
 
-      //Cartel CAPTCHA — pinned en el tope cuando hay captcha activo (o en
-      //timeout). Es la pieza más importante del tab mientras el bot está
-      //esperando al humano: dice qué pasó, qué aldea/ciudad disparó el
-      //captcha, cuántas aldeas quedaron en cola y cuánto falta para el
-      //timeout. Botón "Ya resolví" gatilla la sincronización del server.
       if (core.isCaptchaActive && core.isCaptchaActive()) {
         body.appendChild(renderCartelCaptcha());
       }
 
+      body.appendChild(renderSubtabsRecoleccion());
+
+      if (subtabRecoleccion === "ciudades") renderSubtabPorCiudades(body);
+      else renderSubtabPorCiclos(body);
+    }
+
+    function renderSubtabsRecoleccion() {
+      const cont = document.createElement("div");
+      cont.style.cssText =
+        "display:flex;gap:0;margin:0 0 10px;border-bottom:1px solid #2c3a4d";
+      const mk = (id, label) => {
+        const activo = subtabRecoleccion === id;
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.style.cssText =
+          `padding:6px 14px;background:${activo ? "#1f2a36" : "transparent"};` +
+          `color:${activo ? "#3498db" : "#7a8aa0"};border:none;` +
+          `border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
+          "margin-bottom:-1px;cursor:pointer;font-weight:bold;font-size:11.5px;" +
+          "letter-spacing:0.3px;transition:all 0.15s";
+        if (!activo) {
+          b.addEventListener("mouseenter", () => {
+            b.style.background = "#1a232e";
+            b.style.color = "#cdd5e0";
+          });
+          b.addEventListener("mouseleave", () => {
+            b.style.background = "transparent";
+            b.style.color = "#7a8aa0";
+          });
+        }
+        b.addEventListener("click", () => {
+          subtabRecoleccion = id;
+          window.localStorage.setItem(STORAGE_KEY_SUBTAB_RECOLECCION, id);
+          //Re-render del cuerpo del tab Recolección para reflejar el cambio.
+          renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
+        });
+        return b;
+      };
+      cont.appendChild(mk("ciudades", "🏘  Por ciudad"));
+      cont.appendChild(mk("ciclos", "🔁  Por ciclo"));
+      return cont;
+    }
+
+    //—— Subtab "Por ciclo" — vista clásica del histórico de ciclos ——————
+
+    function renderSubtabPorCiclos(body) {
       //Sección 1: ciclo en curso (si lo hay) — colapsable, abierto por default
       if (cicloActual) {
         body.appendChild(seccionColapsable(
@@ -1711,6 +1771,238 @@
         () => renderErrores(errores),
         errores.length ? "#f39c12" : "#8a96a6"
       ));
+    }
+
+    //—— Subtab "Por ciudad" — estado live de cada aldea ————————————————————
+    //
+    //Vista eje-ciudad (no eje-tiempo). Lista todas las ciudades con un
+    //resumen del estado de sus 6 aldeas, expandible a una tabla con:
+    //  - última claim (status + hace cuánto)
+    //  - próxima claim (countdown vivo, "LISTO YA" o razón de advertencia)
+    //  - dots históricos de las últimas 10 entradas, coloreados por status
+    //
+    //Soluciona la confusión de la vista por ciclos cuando los cooldowns de
+    //aldea no encajan con el ritmo del ciclo global: acá no importa qué
+    //ciclo claimeó qué — solo el estado actual de cada aldea.
+
+    function esAdvertenciaPersistente(status) {
+      return status === "no-pertenece" || status === "limite-diario" || status === "recursos-llenos";
+    }
+
+    function labelAdvertencia(status) {
+      if (status === "no-pertenece") return "sin acceso";
+      if (status === "limite-diario") return "sin recursos";
+      if (status === "recursos-llenos") return "ciudad llena";
+      return status;
+    }
+
+    function renderSubtabPorCiudades(body) {
+      if (!ciudadesConAldeas.length) {
+        const v = document.createElement("div");
+        v.textContent = "Cargando ciudades…";
+        v.style.cssText = "opacity:0.7;font-style:italic;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+
+      const ahoraMs = Date.now();
+      const cooldownMsPorCiudad = {};
+
+      //Acumuladores globales para el header.
+      let total = 0, listas = 0, enCool = 0, conAdv = 0;
+      let proximoMs = Infinity;
+
+      for (const ciudad of ciudadesConAldeas) {
+        const cdMin = cooldownPorCiudad[ciudad.codigoCiudad];
+        const cooldownMs = (cdMin || 10) * 60 * 1000;
+        cooldownMsPorCiudad[ciudad.codigoCiudad] = cooldownMs;
+        for (const aldea of ciudad.aldeas || []) {
+          total++;
+          const histo = historialPorAldea[aldea.id] || [];
+          const ult = histo[histo.length - 1];
+          const lastClaim = lastClaimAtPorAldea[aldea.id];
+          if (ult && esAdvertenciaPersistente(ult.status)) {
+            conAdv++;
+          } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+            listas++;
+          } else {
+            enCool++;
+            if (lastClaim + cooldownMs < proximoMs) proximoMs = lastClaim + cooldownMs;
+          }
+        }
+      }
+
+      //Header global
+      const header = document.createElement("div");
+      header.style.cssText =
+        "padding:10px 12px;background:#172029;border:1px solid #2c3a4d;" +
+        "border-left:3px solid #3498db;border-radius:4px;margin-bottom:10px;" +
+        "font-size:11.5px";
+      let proximoTxt;
+      if (listas > 0) {
+        proximoTxt = ` · <span style="color:#27ae60">hay aldeas listas ya</span>`;
+      } else if (proximoMs !== Infinity) {
+        const seg = Math.max(0, Math.round((proximoMs - ahoraMs) / 1000));
+        proximoTxt = ` · próxima en <b>${core.formatDuracion(seg)}</b>`;
+      } else {
+        proximoTxt = "";
+      }
+      header.innerHTML =
+        `<div style="color:#e6e9ee">` +
+        `<b>${total}</b> aldeas en <b>${ciudadesConAldeas.length}</b> ciudades:&nbsp;&nbsp;` +
+        `<span style="color:#27ae60;font-weight:bold">${listas} listas</span> · ` +
+        `<span style="color:#8a96a6;font-weight:bold">${enCool} en cooldown</span> · ` +
+        `<span style="color:#f39c12;font-weight:bold">${conAdv} advertencia</span>` +
+        `<span style="color:#7a8aa0">${proximoTxt}</span>` +
+        `</div>`;
+      body.appendChild(header);
+
+      //Lista de ciudades, ordenadas alfanuméricamente.
+      const ordenadas = ciudadesConAldeas.slice().sort((a, b) =>
+        (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
+      );
+      for (const ciudad of ordenadas) {
+        body.appendChild(renderCardCiudadEstado(
+          ciudad, ahoraMs, cooldownMsPorCiudad[ciudad.codigoCiudad]
+        ));
+      }
+    }
+
+    function renderCardCiudadEstado(ciudad, ahoraMs, cooldownMs) {
+      const aldeas = ciudad.aldeas || [];
+      let listas = 0, enCool = 0, conAdv = 0;
+      let proximoMs = Infinity;
+      const advertencias = {};
+      for (const aldea of aldeas) {
+        const histo = historialPorAldea[aldea.id] || [];
+        const ult = histo[histo.length - 1];
+        const lastClaim = lastClaimAtPorAldea[aldea.id];
+        if (ult && esAdvertenciaPersistente(ult.status)) {
+          conAdv++;
+          advertencias[ult.status] = (advertencias[ult.status] || 0) + 1;
+        } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+          listas++;
+        } else {
+          enCool++;
+          if (lastClaim + cooldownMs < proximoMs) proximoMs = lastClaim + cooldownMs;
+        }
+      }
+
+      //Color dominante: verde si hay aldeas listas, naranja si todo es
+      //advertencia, gris si todo cooldown. La idea es que de un vistazo el
+      //usuario sepa qué ciudades requieren atención (naranja) vs cuáles
+      //están saludables (verde / gris pasivo).
+      let color;
+      if (listas > 0) color = "#27ae60";
+      else if (conAdv > 0 && enCool === 0) color = "#f39c12";
+      else color = "#8a96a6";
+
+      //Descripción del estado de la ciudad.
+      const partes = [];
+      if (listas) partes.push(`${listas} listas`);
+      if (enCool) {
+        if (proximoMs !== Infinity) {
+          const seg = Math.max(0, Math.round((proximoMs - ahoraMs) / 1000));
+          partes.push(`${enCool} cooldown (próx ${core.formatDuracion(seg)})`);
+        } else {
+          partes.push(`${enCool} en cooldown`);
+        }
+      }
+      for (const [k, n] of Object.entries(advertencias)) {
+        partes.push(`${n} ${labelAdvertencia(k)}`);
+      }
+      const desc = partes.join(" · ") || "sin actividad registrada";
+
+      const header =
+        `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
+        `  <div style="flex:1;min-width:0;text-align:left;line-height:1.25">` +
+        `    <div style="font-size:12px;color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad)}</div>` +
+        `    <div style="font-size:10.5px;color:#7a8aa0;margin-top:2px">${escapeHtml(desc)}</div>` +
+        `  </div>` +
+        `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:36px;text-align:right">${listas}/${aldeas.length}</span>` +
+        `</div>`;
+
+      return seccionColapsable(
+        header,
+        uiColapso.ciudades[ciudad.codigoCiudad] === true,
+        (v) => uiColapso.ciudades[ciudad.codigoCiudad] = v,
+        () => renderTablaAldeasEstado(ciudad, ahoraMs, cooldownMs),
+        color
+      );
+    }
+
+    function renderTablaAldeasEstado(ciudad, ahoraMs, cooldownMs) {
+      const aldeas = (ciudad.aldeas || []).slice().sort((a, b) =>
+        (a.name || "").localeCompare(b.name || "", undefined, { numeric: true })
+      );
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "background:#0f1620;border:1px solid #2c3a4d;border-radius:3px;overflow:hidden";
+
+      const headHTML = `
+        <tr style="background:#1a232e;color:#7a8aa0;font-size:10px;text-transform:uppercase;letter-spacing:0.5px">
+          <th style="padding:6px 8px;text-align:left">Aldea</th>
+          <th style="padding:6px 8px;text-align:left">Última claim</th>
+          <th style="padding:6px 8px;text-align:left">Próxima</th>
+          <th style="padding:6px 8px;text-align:left">Últimas 10</th>
+        </tr>
+      `;
+
+      let rows = "";
+      for (const aldea of aldeas) {
+        const histo = historialPorAldea[aldea.id] || [];
+        const ult = histo[histo.length - 1];
+        const lastClaim = lastClaimAtPorAldea[aldea.id];
+
+        //Última claim: status del último entry del historial + tiempo
+        //relativo. Si nunca hubo intento, mostramos guión.
+        let ultHTML = `<span style="color:#5a6776">—</span>`;
+        if (ult) {
+          const p = presentarStatus(ult.status);
+          ultHTML = `<span style="color:${p.color}">${p.icono} hace ${escapeHtml(formatRelativo(ult.ts))}</span>`;
+        }
+
+        //Próxima claim: si la última fue advertencia persistente, lo
+        //decimos en lugar del countdown (el bot no va a reintentar pronto
+        //porque el cupo/lleno/acceso persiste). Si nunca claimeó o el
+        //cooldown ya venció → "LISTO YA". Si no → countdown.
+        let proximaHTML;
+        if (ult && esAdvertenciaPersistente(ult.status)) {
+          proximaHTML = `<span style="color:#f39c12">⚠ ${labelAdvertencia(ult.status)}</span>`;
+        } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+          proximaHTML = `<span style="color:#27ae60;font-weight:bold">LISTO YA</span>`;
+        } else {
+          const seg = Math.max(0, Math.round((lastClaim + cooldownMs - ahoraMs) / 1000));
+          proximaHTML = `<span style="color:#8a96a6">en ${escapeHtml(core.formatDuracion(seg))}</span>`;
+        }
+
+        //Dots últimas 10 entradas. Si hay menos de 10, rellenamos con
+        //círculos vacíos en gris muy oscuro para que el ancho de la
+        //columna sea consistente entre filas.
+        const ultimos = histo.slice(-10);
+        let dots = "";
+        for (const e of ultimos) {
+          const p = presentarStatus(e.status);
+          const tooltip = `${escapeHtml(p.label)} · hace ${escapeHtml(formatRelativo(e.ts))}` +
+            (e.errorMsg ? ` · ${escapeHtml(String(e.errorMsg).slice(0, 80))}` : "");
+          dots += `<span style="color:${p.color};font-size:13px;line-height:1" title="${tooltip}">●</span>`;
+        }
+        for (let i = ultimos.length; i < 10; i++) {
+          dots += `<span style="color:#1f2a36;font-size:13px;line-height:1">○</span>`;
+        }
+
+        rows += `
+          <tr style="border-top:1px solid #2c3a4d;font-size:11.5px">
+            <td style="padding:6px 8px;color:#e6e9ee">${escapeHtml(aldea.name || "")}</td>
+            <td style="padding:6px 8px">${ultHTML}</td>
+            <td style="padding:6px 8px">${proximaHTML}</td>
+            <td style="padding:6px 8px;letter-spacing:3px;white-space:nowrap">${dots}</td>
+          </tr>
+        `;
+      }
+
+      wrap.innerHTML = `<table style="width:100%;border-collapse:collapse">${headHTML}${rows}</table>`;
+      return wrap;
     }
 
     //—— Tab Construcción ——————————————————————————————————————————————————
