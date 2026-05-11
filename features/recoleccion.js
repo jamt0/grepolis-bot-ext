@@ -1796,6 +1796,26 @@
       return status;
     }
 
+    //Próxima recolección disponible para una aldea, en ms epoch. Combina
+    //dos fuentes:
+    //  - lastClaimAtPorAldea[id] + cooldownCiudad: lo que sabe el BOT por
+    //    sus propias claims (persistente entre sesiones).
+    //  - aldea.loot (timestamp en segundos): lo que el SERVER reporta como
+    //    next-available al boot. Cubre claims manuales del usuario antes
+    //    de cargar la pestaña, o cooldowns vivos heredados.
+    //Tomamos el máximo entre ambos: si el bot claimeó después que el server
+    //reportó cooldown (porque el cooldown ya había vencido), gana el bot;
+    //si el server tenía cooldown vivo al boot y el bot todavía no claimeó,
+    //gana el server. Devuelve 0 si no hay info — la aldea figura como lista.
+    function getNextAvailableMs(aldea, cooldownMs) {
+      const lastClaim = lastClaimAtPorAldea[aldea.id];
+      const lootMs = (aldea.loot || 0) * 1000;
+      let next = 0;
+      if (lastClaim) next = Math.max(next, lastClaim + cooldownMs);
+      if (lootMs) next = Math.max(next, lootMs);
+      return next;
+    }
+
     function renderSubtabPorCiudades(body) {
       if (!ciudadesConAldeas.length) {
         const v = document.createElement("div");
@@ -1820,14 +1840,14 @@
           total++;
           const histo = historialPorAldea[aldea.id] || [];
           const ult = histo[histo.length - 1];
-          const lastClaim = lastClaimAtPorAldea[aldea.id];
+          const nextMs = getNextAvailableMs(aldea, cooldownMs);
           if (ult && esAdvertenciaPersistente(ult.status)) {
             conAdv++;
-          } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+          } else if (nextMs === 0 || nextMs <= ahoraMs) {
             listas++;
           } else {
             enCool++;
-            if (lastClaim + cooldownMs < proximoMs) proximoMs = lastClaim + cooldownMs;
+            if (nextMs < proximoMs) proximoMs = nextMs;
           }
         }
       }
@@ -1876,15 +1896,15 @@
       for (const aldea of aldeas) {
         const histo = historialPorAldea[aldea.id] || [];
         const ult = histo[histo.length - 1];
-        const lastClaim = lastClaimAtPorAldea[aldea.id];
+        const nextMs = getNextAvailableMs(aldea, cooldownMs);
         if (ult && esAdvertenciaPersistente(ult.status)) {
           conAdv++;
           advertencias[ult.status] = (advertencias[ult.status] || 0) + 1;
-        } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+        } else if (nextMs === 0 || nextMs <= ahoraMs) {
           listas++;
         } else {
           enCool++;
-          if (lastClaim + cooldownMs < proximoMs) proximoMs = lastClaim + cooldownMs;
+          if (nextMs < proximoMs) proximoMs = nextMs;
         }
       }
 
@@ -1953,27 +1973,47 @@
         const histo = historialPorAldea[aldea.id] || [];
         const ult = histo[histo.length - 1];
         const lastClaim = lastClaimAtPorAldea[aldea.id];
+        const nextMs = getNextAvailableMs(aldea, cooldownMs);
+        //Cooldown server-side al boot (aldea.loot en seg). Si está vivo y
+        //es la fuente que está dominando el cálculo de "próxima" (el bot
+        //no claimeó después), lo marcamos al usuario.
+        const lootMs = (aldea.loot || 0) * 1000;
+        const cooldownServer = lootMs > ahoraMs && (!lastClaim || lootMs >= lastClaim + cooldownMs);
 
-        //Última claim: status del último entry del historial + tiempo
-        //relativo. Si nunca hubo intento, mostramos guión.
+        //Última claim: prioridad al historial (lo más detallado). Si no
+        //hay historial pero el server dice que hay cooldown vivo (claim
+        //manual o pre-boot), inferimos cuándo fue aproximadamente:
+        //last = loot - cooldownCiudad (aproximación: el server no nos
+        //dice el last_looted_at por aldea, pero el cooldown típico de la
+        //ciudad alcanza para una estimación útil).
         let ultHTML = `<span style="color:#5a6776">—</span>`;
         if (ult) {
           const p = presentarStatus(ult.status);
           ultHTML = `<span style="color:${p.color}">${p.icono} hace ${escapeHtml(formatRelativo(ult.ts))}</span>`;
+        } else if (lootMs > ahoraMs) {
+          const estimado = lootMs - cooldownMs;
+          if (estimado > 0 && estimado <= ahoraMs) {
+            ultHTML = `<span style="color:#7a8aa0" title="estimado a partir del cooldown del server — el bot no claimeó esta aldea aún en esta sesión">~hace ${escapeHtml(formatRelativo(estimado))}</span>`;
+          } else {
+            ultHTML = `<span style="color:#7a8aa0" title="server reporta cooldown vivo pero no podemos estimar cuándo fue">cooldown server</span>`;
+          }
         }
 
         //Próxima claim: si la última fue advertencia persistente, lo
         //decimos en lugar del countdown (el bot no va a reintentar pronto
-        //porque el cupo/lleno/acceso persiste). Si nunca claimeó o el
-        //cooldown ya venció → "LISTO YA". Si no → countdown.
+        //porque el cupo/lleno/acceso persiste). Si no hay cooldown vivo
+        //por ninguna fuente → "LISTO YA". Si no → countdown.
         let proximaHTML;
         if (ult && esAdvertenciaPersistente(ult.status)) {
           proximaHTML = `<span style="color:#f39c12">⚠ ${labelAdvertencia(ult.status)}</span>`;
-        } else if (!lastClaim || (lastClaim + cooldownMs) <= ahoraMs) {
+        } else if (nextMs === 0 || nextMs <= ahoraMs) {
           proximaHTML = `<span style="color:#27ae60;font-weight:bold">LISTO YA</span>`;
         } else {
-          const seg = Math.max(0, Math.round((lastClaim + cooldownMs - ahoraMs) / 1000));
-          proximaHTML = `<span style="color:#8a96a6">en ${escapeHtml(core.formatDuracion(seg))}</span>`;
+          const seg = Math.max(0, Math.round((nextMs - ahoraMs) / 1000));
+          const sufijo = cooldownServer
+            ? ` <span style="color:#7a8aa0;font-size:9px" title="cooldown reportado por el server al cargar la pestaña — claim manual previo o cooldown heredado">(server)</span>`
+            : "";
+          proximaHTML = `<span style="color:#8a96a6">en ${escapeHtml(core.formatDuracion(seg))}</span>${sufijo}`;
         }
 
         //Dots últimas 10 entradas. Si hay menos de 10, rellenamos con
