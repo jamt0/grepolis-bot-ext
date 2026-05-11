@@ -26,6 +26,7 @@
                 "features/recoleccion.js",
                 "features/finalizarConstruccion.js",
                 "features/ataques.js",
+                "features/mercadoOro.js",
                 "contentScript.js"
             ],
             "run_at": "document_end"

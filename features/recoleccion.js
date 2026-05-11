@@ -21,6 +21,13 @@
 
     const ciudadesConAldeas = [];
     const recursosPrevPorCiudad = {};
+    //Cap del almacén por ciudad — se cachea del campo `storage` que viene
+    //en el payload Town de cada claim exitoso. Lo usamos para distinguir
+    //"almacén lleno" de "CAPTCHA real" cuando el server devuelve success:true
+    //pero sin notification 'Town' (caso lleno: nada cambió en el town →
+    //server no emite el evento; antes lo confundíamos con CAPTCHA y parábamos
+    //el ciclo entero).
+    const storageCapPorCiudad = {};
     //Última vez que cada ALDEA individual fue claimada con éxito. Clave =
     //farm_town_id (aldea.id). El cooldown server es por aldea, no por
     //ciudad: si un ciclo se corta a mitad por CAPTCHA, las aldeas que
@@ -642,7 +649,7 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques"];
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
@@ -775,6 +782,7 @@
         else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
         else if (tabActivo === "construccion") renderTabConstruccion(body);
         else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+        else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
       //(que de todos modos nos retornamos antes en outsideClickHandler).
@@ -835,6 +843,7 @@
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
       tabs.appendChild(crearBotonTab("ataques", "Ataques"));
+      tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -884,6 +893,7 @@
       else if (tabActivo === "settings") renderTabSettings(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
       else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+      else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
       else renderTabRecoleccion(body);
     }
 
@@ -905,6 +915,19 @@
       //chequeo "skip si hay foco en input/select" que se rompía si
       //borrábamos el contenido antes — el activeElement quedaba sin
       //referencia y el input perdía foco/cursor cada segundo.
+      api.renderTab(body);
+    }
+
+    function renderTabMercadoOroDelegado(body) {
+      const api = JamBot.features.mercadoOro && JamBot.features.mercadoOro.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de mercado de oro todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
       api.renderTab(body);
     }
 
@@ -1036,14 +1059,14 @@
         let cicloOk = true;
         for (const cd of Object.values(c.ciudades || {})) {
           aldeasOk += cd.claims || 0;
-          aldeasError += Math.max(0, (cd.esperado || 6) - (cd.claims || 0));
+          aldeasError += Math.max(0, (cd.esperado ?? 6) - (cd.claims || 0));
           aldeasSinRecursos += cd.limiteDiario || 0;
           aldeasNoObtenidas += cd.bloqueadas || 0;
           aldeasCiudadLlena += cd.recursosLlenos || 0;
           totWood += cd.wood || 0;
           totStone += cd.stone || 0;
           totIron += cd.iron || 0;
-          if ((cd.claims || 0) < (cd.esperado || 6)) cicloOk = false;
+          if ((cd.claims || 0) < (cd.esperado ?? 6)) cicloOk = false;
         }
         if (cicloOk) ciclosCompletos += 1;
       }
@@ -1610,7 +1633,7 @@
       const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       if (ultimoCiclo) {
         const total = (ultimoCiclo.totalAldeas != null) ? ultimoCiclo.totalAldeas
-          : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
+          : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado ?? 6), 0);
         const claims = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
         const sCool = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.saltadasCooldown || 0), 0);
         //Mismo criterio que renderListaCiclosAnteriores: cubierto cuando
@@ -1623,7 +1646,7 @@
         //completo — el corte sucedió por causas externas (reload, F5).
         const interrumpido = ultimoCiclo.interrumpido === true;
         const tieneAdvertencia = Object.values(ultimoCiclo.ciudades || {})
-          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0 || (x.bloqueadas || 0) > 0);
 
         let icono, color;
         if (interrumpido) {
@@ -1966,7 +1989,7 @@
       uiColapso.cicloPorN = uiColapso.cicloPorN || {};
       for (const c of anteriores) {
         const total = (c.totalAldeas != null) ? c.totalAldeas
-          : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
+          : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado ?? 6), 0);
         const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
         const sCool = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.saltadasCooldown || 0), 0);
         //Cubrimos cuando claims + cooldown legítimo ≥ total esperado
@@ -1975,7 +1998,7 @@
         const cubierto = (claims + sCool) >= total;
         const interrumpido = c.interrumpido === true;
         const tieneAdvertencia = Object.values(c.ciudades || {})
-          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0 || (x.bloqueadas || 0) > 0);
 
         let icono, color;
         if (interrumpido) {
@@ -2020,10 +2043,13 @@
         .sort((a, b) => (a.nombre || "").localeCompare(b.nombre || "", undefined, { numeric: true }));
       uiColapso.cicloCiudades[ciclo.n] = uiColapso.cicloCiudades[ciclo.n] || {};
       for (const c of ciudadesArr) {
-        const totalEsp = c.esperado || 6;
+        const totalEsp = c.esperado ?? 6;
         const claimsOk = c.claims || 0;
         const sCool = c.saltadasCooldown || 0;
-        const tieneAdvertencia = (c.limiteDiario || 0) > 0 || (c.recursosLlenos || 0) > 0;
+        const tieneAdvertencia =
+          (c.limiteDiario || 0) > 0 ||
+          (c.recursosLlenos || 0) > 0 ||
+          (c.bloqueadas || 0) > 0;
         //Estado "cubierto" = todas las aldeas farmeables están
         //contabilizadas (claim OK o saltadas por cooldown legítimo). El
         //esperado ya viene decrementado por bloqueadas, cupo diario y
@@ -2056,15 +2082,39 @@
           color = "#e74c3c"; icon = "✗";
         }
 
-        //Header HTML que replica la fila plana anterior: badge + nombre +
-        //ratio + recursos. seccionColapsable agrega su propio arrow.
+        //Desglose textual del estado de la ciudad: cuántas aldeas cayeron en
+        //cada categoría. Las "fallidas reales" son las que el esperado dice
+        //que debían claimearse pero no se contabilizaron como OK ni como
+        //cooldown — es decir, errores genuinos del server (rechazo sin causa
+        //identificable). Las advertencias (no-pertenece, cupo diario, ciudad
+        //llena) ya están sustraídas del esperado.
+        const fallidasReales = Math.max(
+          0,
+          (c.esperado ?? 6) - (c.claims || 0) - (c.saltadasCooldown || 0)
+        );
+        const partes = [];
+        if ((c.claims || 0) > 0) partes.push(`${c.claims} OK`);
+        if ((c.saltadasCooldown || 0) > 0) partes.push(`${c.saltadasCooldown} en cooldown`);
+        if ((c.limiteDiario || 0) > 0) partes.push(`${c.limiteDiario} sin recursos`);
+        if ((c.recursosLlenos || 0) > 0) partes.push(`${c.recursosLlenos} ciudad llena`);
+        if ((c.bloqueadas || 0) > 0) partes.push(`${c.bloqueadas} sin acceso`);
+        if (fallidasReales > 0) partes.push(`${fallidasReales} fallidas`);
+        const descripcion = partes.join(" · ");
+
+        //Header HTML: badge + bloque ciudad (nombre + descripción de estados)
+        //+ ratio + recursos. seccionColapsable agrega su propio arrow.
         const headerTxt =
           `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
           `  <span style="display:inline-flex;align-items:center;justify-content:center;` +
           `width:20px;height:20px;background:${color}22;color:${color};` +
           `border-radius:3px;font-weight:bold;font-size:12px;flex-shrink:0">${icon}</span>` +
-          `  <span style="flex:1;font-size:12px;color:#e6e9ee;text-align:left">${escapeHtml(c.nombre)}</span>` +
-          `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right">${c.claims}/${c.esperado || 6}</span>` +
+          `  <div style="flex:1;min-width:0;text-align:left;line-height:1.25">` +
+          `    <div style="font-size:12px;color:#e6e9ee">${escapeHtml(c.nombre)}</div>` +
+          (descripcion
+            ? `    <div style="font-size:10.5px;color:#7a8aa0;margin-top:2px">${escapeHtml(descripcion)}</div>`
+            : "") +
+          `  </div>` +
+          `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right">${c.claims}/${c.esperado ?? 6}</span>` +
           `  <span style="color:#7a8aa0;font-family:monospace;font-size:10.5px;min-width:140px;text-align:right">+${c.wood} / +${c.stone} / +${c.iron}</span>` +
           `</div>`;
 
@@ -2699,7 +2749,15 @@
 
       //Reset por ciclo: si en un ciclo previo se cacheó "recursos llenos",
       //volvemos a intentar — quizá el jugador construyó cosas y bajaron.
-      for (const c of ciudadesConAldeas) c.recursosLlenos = false;
+      //`advertenciaSonadaCiclo` resetea el gate del beep por advertencia
+      //(cupo diario / almacén lleno) — máximo 1 beep por ciudad por ciclo,
+      //sin importar cuántas aldeas de la misma ciudad caigan en la misma
+      //situación. Es lo que evita el spam cuando 6 aldeas de una misma
+      //ciudad reportan cupo diario o el almacén se llenó.
+      for (const c of ciudadesConAldeas) {
+        c.recursosLlenos = false;
+        c.advertenciaSonadaCiclo = false;
+      }
 
       //Refresca el baseline del diff con el estado actual del Town en MM.
       //Sin esto, el primer claim del ciclo arrastra los 5 minutos transcurridos
@@ -2905,7 +2963,7 @@
           if (cicloActual && cicloActual.ciudades[t.ciudad.codigoCiudad]) {
             const cc = cicloActual.ciudades[t.ciudad.codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3246,7 +3304,7 @@
         if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
           const cc = cicloActual.ciudades[codigoCiudad];
           const eraCompleta = cc.claims >= cc.esperado;
-          cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+          cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
           cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
           cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
           if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3407,7 +3465,7 @@
           if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
             const cc = cicloActual.ciudades[codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.bloqueadas = (cc.bloqueadas || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3437,6 +3495,13 @@
             "recoleccion",
             `aldea ${farmTownId} (${ciudadNombreSafe}): cupo diario alcanzado — ${errorMsg}`
           );
+          //Beep suave 1x por ciudad por ciclo. Si las 6 aldeas de la misma
+          //ciudad reportan cupo diario en el mismo ciclo, suena solo en la
+          //primera (las demás registran el status en silencio).
+          if (!ciudad.advertenciaSonadaCiclo) {
+            ciudad.advertenciaSonadaCiclo = true;
+            core.sonarAdvertencia();
+          }
           registrarClaim({
             aldeaId: farmTownId, ciudadId: codigoCiudad,
             ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
@@ -3450,7 +3515,7 @@
           if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
             const cc = cicloActual.ciudades[codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.limiteDiario = (cc.limiteDiario || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3496,6 +3561,58 @@
       );
 
       if (!townNotification) {
+        //Distinguir "ciudad con almacén lleno" de "CAPTCHA real". Cuando los
+        //3 recursos están al tope, el server procesa el claim pero NO emite
+        //notification 'Town' (no hubo cambio de estado). Antes esto se
+        //confundía con CAPTCHA y paraba el ciclo entero — ahora chequeamos
+        //el cap cacheado (poblado en claims previos del cycle/sesión) contra
+        //los recursos cacheados de la ciudad. Si los 3 están en cap, es
+        //ciudad llena: marcamos la ciudad para que las aldeas restantes se
+        //salten (mismo path que la detección "lleno" post-claim exitoso) y
+        //el ciclo sigue con el resto de ciudades. La próxima vuelta volverá
+        //a intentar — si el jugador gastó recursos o subió almacén, fluye.
+        const cap = storageCapPorCiudad[codigoCiudad];
+        const prev = recursosPrevPorCiudad[codigoCiudad];
+        const almacenLleno = cap > 0 && prev &&
+          prev.wood >= cap && prev.stone >= cap && prev.iron >= cap;
+
+        if (almacenLleno) {
+          core.logWarn(
+            "recoleccion",
+            `aldea ${farmTownId} (${ciudadNombreSafe}): sin Town notification + almacén al tope (${prev.wood}/${prev.stone}/${prev.iron} de ${cap}) — ciudad llena, no CAPTCHA`,
+            response.json.notifications
+          );
+          //Beep suave 1x por ciudad por ciclo (mismo flag que el resto de
+          //advertencias). Si varias aldeas en flight del mismo town
+          //responden todas con no-Town antes de que `recursosLlenos=true`
+          //frene las siguientes, igual suena 1 vez.
+          if (!ciudad.advertenciaSonadaCiclo) {
+            ciudad.advertenciaSonadaCiclo = true;
+            core.sonarAdvertencia();
+          }
+          const idxCiudad = ciudadesConAldeas.findIndex((c) => c.codigoCiudad == codigoCiudad);
+          if (idxCiudad >= 0) ciudadesConAldeas[idxCiudad].recursosLlenos = true;
+          registrarClaim({
+            aldeaId: farmTownId, ciudadId: codigoCiudad,
+            ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
+            ciclo: nCiclo, status: "recursos-llenos",
+            errorMsg: "almacén lleno (server omitió Town notification)",
+          });
+          if (acumulador) acumulador.recursosLlenos += 1;
+          if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+            const cc = cicloActual.ciudades[codigoCiudad];
+            const eraCompleta = cc.claims >= cc.esperado;
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
+            cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+            if (!eraCompleta && cc.claims >= cc.esperado) {
+              cicloActual.ciudadesCompletadas += 1;
+            }
+            actualizarIndicadorVivo();
+          }
+          return { status: "descartar" };
+        }
+
         core.logWarn(
           "recoleccion",
           `sin notificación 'Town' para aldea ${farmTownId} — probable CAPTCHA`,
@@ -3541,6 +3658,10 @@
 
       const town = JSON.parse(townNotification.param_str)["Town"];
       const { storage, last_wood, last_iron, last_stone, resources } = town;
+      //Cacheamos el cap del almacén para que la rama "no Town" pueda
+      //distinguir ciudad llena de CAPTCHA real (ver bloque !townNotification
+      //arriba).
+      if (storage) storageCapPorCiudad[codigoCiudad] = storage;
 
       const nombreCiudad = ciudadNombreSafe;
       const nombreAldea = aldeaNombreSafe;
@@ -3598,6 +3719,14 @@
             `${nombreCiudad}: recursosLlenos activado tras claim de ${nombreAldea} (id ${farmTownId})`,
             { storage, last_wood, last_iron, last_stone, resources }
           );
+          //Beep suave 1x por ciudad por ciclo. El `!llenoPrevio` ya gatea
+          //esta transición, pero usamos también `advertenciaSonadaCiclo`
+          //para no doblar si la misma ciudad ya sonó por cupo diario o por
+          //la rama no-Town en este ciclo.
+          if (!ciudadesConAldeas[idx].advertenciaSonadaCiclo) {
+            ciudadesConAldeas[idx].advertenciaSonadaCiclo = true;
+            core.sonarAdvertencia();
+          }
         }
       }
       registrarClaim({
