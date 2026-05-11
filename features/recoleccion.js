@@ -2749,14 +2749,8 @@
 
       //Reset por ciclo: si en un ciclo previo se cacheó "recursos llenos",
       //volvemos a intentar — quizá el jugador construyó cosas y bajaron.
-      //`advertenciaSonadaCiclo` resetea el gate del beep por advertencia
-      //(cupo diario / almacén lleno) — máximo 1 beep por ciudad por ciclo,
-      //sin importar cuántas aldeas de la misma ciudad caigan en la misma
-      //situación. Es lo que evita el spam cuando 6 aldeas de una misma
-      //ciudad reportan cupo diario o el almacén se llenó.
       for (const c of ciudadesConAldeas) {
         c.recursosLlenos = false;
-        c.advertenciaSonadaCiclo = false;
       }
 
       //Refresca el baseline del diff con el estado actual del Town en MM.
@@ -3495,13 +3489,6 @@
             "recoleccion",
             `aldea ${farmTownId} (${ciudadNombreSafe}): cupo diario alcanzado — ${errorMsg}`
           );
-          //Beep suave 1x por ciudad por ciclo. Si las 6 aldeas de la misma
-          //ciudad reportan cupo diario en el mismo ciclo, suena solo en la
-          //primera (las demás registran el status en silencio).
-          if (!ciudad.advertenciaSonadaCiclo) {
-            ciudad.advertenciaSonadaCiclo = true;
-            core.sonarAdvertencia();
-          }
           registrarClaim({
             aldeaId: farmTownId, ciudadId: codigoCiudad,
             ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
@@ -3582,14 +3569,6 @@
             `aldea ${farmTownId} (${ciudadNombreSafe}): sin Town notification + almacén al tope (${prev.wood}/${prev.stone}/${prev.iron} de ${cap}) — ciudad llena, no CAPTCHA`,
             response.json.notifications
           );
-          //Beep suave 1x por ciudad por ciclo (mismo flag que el resto de
-          //advertencias). Si varias aldeas en flight del mismo town
-          //responden todas con no-Town antes de que `recursosLlenos=true`
-          //frene las siguientes, igual suena 1 vez.
-          if (!ciudad.advertenciaSonadaCiclo) {
-            ciudad.advertenciaSonadaCiclo = true;
-            core.sonarAdvertencia();
-          }
           const idxCiudad = ciudadesConAldeas.findIndex((c) => c.codigoCiudad == codigoCiudad);
           if (idxCiudad >= 0) ciudadesConAldeas[idxCiudad].recursosLlenos = true;
           registrarClaim({
@@ -3719,14 +3698,6 @@
             `${nombreCiudad}: recursosLlenos activado tras claim de ${nombreAldea} (id ${farmTownId})`,
             { storage, last_wood, last_iron, last_stone, resources }
           );
-          //Beep suave 1x por ciudad por ciclo. El `!llenoPrevio` ya gatea
-          //esta transición, pero usamos también `advertenciaSonadaCiclo`
-          //para no doblar si la misma ciudad ya sonó por cupo diario o por
-          //la rama no-Town en este ciclo.
-          if (!ciudadesConAldeas[idx].advertenciaSonadaCiclo) {
-            ciudadesConAldeas[idx].advertenciaSonadaCiclo = true;
-            core.sonarAdvertencia();
-          }
         }
       }
       registrarClaim({
