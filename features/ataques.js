@@ -446,7 +446,15 @@
       const r = await enviarAtaque(townId, Number(cfg.targetTownId), counts);
       if (!r.ok) {
         registrarUltimo(townId, modo, { error: r.error || "fallo desconocido" });
-        if (!forzar && debeCorrer(townId, modo)) programarCiudad(townId, modo, 60_000);
+        if (!forzar && debeCorrer(townId, modo)) {
+          //Si el server dijo "sin tropas", esperamos el mismo intervalo que
+          //la rama del chequeo previo basado en cache — no es un fallo de
+          //red, es ciclo natural de disponibilidad.
+          const espera = r.noTropas
+            ? (modo === "rt" ? 5 * 60_000 : SPAM_RETRY_FALTA_TROPAS_MS)
+            : 60_000;
+          programarCiudad(townId, modo, espera);
+        }
         return;
       }
 
@@ -557,6 +565,19 @@
 
       const j = response && response.json;
       if (!j || !j.success) {
+        const errStr = j && j.error ? String(j.error) : "";
+        //Falta-de-tropas del server: el modelo Units en MM estaba stale —
+        //mostraba unidades que ya no estaban (movimiento en vuelo, refuerzo,
+        //etc.). NO es CAPTCHA; esperá el siguiente ciclo igual que la rama
+        //de chequeo previo basada en cache (líneas 423-428).
+        const esFaltaTropas = /habitantes|inhabitants|al menos/i.test(errStr);
+        if (esFaltaTropas) {
+          core.logWarn(
+            "ataques",
+            `town=${nombreCiudad(attackerTownId)} sin tropas según server (${errStr}) — reintento próximo ciclo`
+          );
+          return { ok: false, error: "sin tropas (server)", noTropas: true };
+        }
         core.logWarn("ataques", `respuesta sin success (town=${attackerTownId} → ${targetTownId})`, response);
         //Heurística captcha: si el response no trae notification "Units"
         //(que indica que el modelo se movió), lo más probable es que el
@@ -570,7 +591,7 @@
             ciudad: { id: attackerTownId, nombre: nombreCiudad(attackerTownId) },
           });
         }
-        return { ok: false, error: j && j.error ? String(j.error) : "sin success" };
+        return { ok: false, error: errStr || "sin success" };
       }
 
       //Refrescar Backbone con las notifications — Units (home count -=
