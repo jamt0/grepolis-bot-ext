@@ -28,7 +28,7 @@
   const JamBot = (window.JamBot = window.JamBot || {});
   JamBot.features = JamBot.features || {};
 
-  const POLL_INTERVAL_MS = 20 * 1000;
+  const POLL_INTERVAL_MS = 3 * 1000;
   const REDESCUBRIR_INTERVAL_MS = 30 * 60 * 1000;
   const UMBRAL = 100;
   const BEEP_INTERVAL_MS = 700;
