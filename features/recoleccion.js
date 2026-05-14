@@ -649,7 +649,7 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "mercadoOro"];
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "defensa", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
     //Subtab dentro del tab "Recolección". "ciudades" muestra el estado live
@@ -792,6 +792,7 @@
         else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
         else if (tabActivo === "construccion") renderTabConstruccion(body);
         else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+        else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
         else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
@@ -853,6 +854,7 @@
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
       tabs.appendChild(crearBotonTab("ataques", "Ataques"));
+      tabs.appendChild(crearBotonTab("defensa", "Defensa"));
       tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
       panel.appendChild(tabs);
 
@@ -903,6 +905,7 @@
       else if (tabActivo === "settings") renderTabSettings(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
       else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+      else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
       else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
       else renderTabRecoleccion(body);
     }
@@ -934,6 +937,19 @@
         body.innerHTML = "";
         const v = document.createElement("div");
         v.textContent = "La feature de mercado de oro todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabAtaquesEntrantesDelegado(body) {
+      const api = JamBot.features.ataquesEntrantes && JamBot.features.ataquesEntrantes.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de ataques entrantes todavía no está cargada.";
         v.style.cssText = "opacity:0.7;padding:8px 0";
         body.appendChild(v);
         return;
