@@ -156,6 +156,15 @@
             if (!Array.isArray(cfg.spamUnitTypes)) cfg.spamUnitTypes = [];
             if (!cfg.spamCounts || typeof cfg.spamCounts !== "object") cfg.spamCounts = {};
             if (typeof cfg.spamIntervalMin !== "number" || cfg.spamIntervalMin <= 0) cfg.spamIntervalMin = 4;
+            //Config del modo "Isla" (one-shot): última isla cargada + qué
+            //unidades/cantidades mandar por ciudad. La lista de ciudades NO
+            //se persiste — se vuelve a cargar cada vez. seleccionadas también
+            //es runtime (Set en islaRuntime).
+            if (!cfg.isla || typeof cfg.isla !== "object") {
+              cfg.isla = { islandId: "", unitTypes: [], counts: {} };
+            }
+            if (!Array.isArray(cfg.isla.unitTypes)) cfg.isla.unitTypes = [];
+            if (!cfg.isla.counts || typeof cfg.isla.counts !== "object") cfg.isla.counts = {};
             delete cfg.mode; //limpieza de un intento previo de implementación
           }
           //Migración estado runtime persistido:
@@ -655,6 +664,22 @@
       }
     }
 
+    //Merge parcial del sub-objeto isla. Necesario porque renderCardCiudad usa
+    //un fallback local cuando configPorCiudad[tid] no existe — mutar ese fallback
+    //no persiste nada. Esto garantiza que la entry exista y que la mutación
+    //llegue a chrome.storage. NO reagenda timers (isla es one-shot manual).
+    function setConfigIsla(townId, patch) {
+      const prev = data.ataques.configPorCiudad[townId] || {};
+      const prevIsla = (prev.isla && typeof prev.isla === "object")
+        ? prev.isla
+        : { islandId: "", unitTypes: [], counts: {} };
+      data.ataques.configPorCiudad[townId] = {
+        ...prev,
+        isla: { ...prevIsla, ...patch },
+      };
+      persistir();
+    }
+
     //Merge parcial de spamCounts — la UI actualiza una unidad a la vez,
     //necesitamos preservar el resto. Pasar value=null/0 para borrar la entrada.
     function setSpamCount(townId, unitKey, value) {
@@ -712,6 +737,104 @@
     }
     if (data.ataques.habilitada && !core.isCaptchaActive()) {
       setTimeout(() => bootArrancar(6), 4000);
+    }
+
+    //—— Estado runtime de UI (NO persiste entre reloads) ————————————————
+    //
+    //  cardExpandidas:    Set<townId> — cards expandidas. Default: todas
+    //                     colapsadas para visión panorámica.
+    //  tabActivoPorCiudad: Map<townId, "rt"|"sp"|"isla"> — tab activo dentro
+    //                     de la card. Default: "rt".
+    //  islaRuntimePorCiudad: Map<townId, {islandId, ciudades, seleccionadas,
+    //                     loading, error, atacando}> — buffer de las ciudades
+    //                     cargadas para el modo Isla. NO persiste porque el
+    //                     mundo cambia y queremos datos frescos cada sesión.
+    const cardExpandidas = new Set();
+    const tabActivoPorCiudad = new Map();
+    const islaRuntimePorCiudad = new Map();
+
+    function getTabActivo(tid) {
+      return tabActivoPorCiudad.get(tid) || "rt";
+    }
+    function setTabActivo(tid, tab) {
+      tabActivoPorCiudad.set(tid, tab);
+    }
+    function getIslaRuntime(tid) {
+      if (!islaRuntimePorCiudad.has(tid)) {
+        islaRuntimePorCiudad.set(tid, {
+          islandId: "", ciudades: null, seleccionadas: new Set(),
+          loading: false, error: null, atacando: false, progreso: null,
+        });
+      }
+      return islaRuntimePorCiudad.get(tid);
+    }
+
+    //—— Fetch: ciudades de una isla ————————————————————————————————————
+    //
+    //El cliente del juego abre "Información isla" con un GET a island_info.
+    //La response trae `town_list` (array de [id, name, player_id, player_name,
+    //points, ...] aprox). Como Grepolis ha cambiado el shape entre versiones,
+    //parseamos varios shapes posibles y reportamos en log si no encontramos
+    //nada — así el usuario puede pasarme el response real para ajustar.
+    async function obtenerCiudadesDeIsla(islandId, attackerTownId) {
+      const url =
+        `https://${world_id}.grepolis.com/game/island_info` +
+        `?town_id=${attackerTownId}&action=index&h=${csrfToken}` +
+        `&json=${encodeURIComponent(JSON.stringify({
+          island_id: Number(islandId), fetch_tmpl: 1,
+          town_id: Number(attackerTownId), nl_init: true,
+        }))}`;
+      const res = await fetch(url, {
+        method: "GET",
+        credentials: "include",
+        headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "text/plain, */*; q=0.01" },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      //Re-dispatch notifications para que MM/Backbone se mantenga sincro.
+      if (body && body.json && Array.isArray(body.json.notifications)) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: body.json.notifications },
+        }));
+      }
+      //Shapes conocidos posibles:
+      //  body.json.town_list = [[id, name, player_id, player_name, points, ...], ...]
+      //  body.json.json.town_list = same
+      //  body.json.towns = [{id, name, player_id, player_name}, ...]
+      const j = (body && body.json) || {};
+      const rawList =
+        (Array.isArray(j.town_list) && j.town_list) ||
+        (j.json && Array.isArray(j.json.town_list) && j.json.town_list) ||
+        (Array.isArray(j.towns) && j.towns) ||
+        null;
+      if (!rawList) {
+        core.logWarn(
+          "ataques",
+          `obtenerCiudadesDeIsla(${islandId}): no encontré town_list en el response — pasame el log a Claude para ajustar el parser`
+        );
+        return [];
+      }
+      const ciudades = rawList.map((it) => {
+        if (Array.isArray(it)) {
+          //Formato tupla del legacy server. Índices comunes:
+          //[id, name, player_id, player_name, points, ...]
+          return {
+            id: Number(it[0]),
+            name: String(it[1] || ""),
+            playerId: it[2] != null ? Number(it[2]) : null,
+            playerName: String(it[3] || ""),
+            points: it[4] != null ? Number(it[4]) : null,
+          };
+        }
+        return {
+          id: Number(it.id),
+          name: String(it.name || ""),
+          playerId: it.player_id != null ? Number(it.player_id) : null,
+          playerName: String(it.player_name || ""),
+          points: it.points != null ? Number(it.points) : null,
+        };
+      }).filter((c) => c.id > 0);
+      return ciudades;
     }
 
     //—— Render del tab Ataques ——————————————————————————————————————————
@@ -825,16 +948,22 @@
       return wrap;
     }
 
+    //Card de ciudad atacante. Header siempre visible (clickeable para
+    //expandir/colapsar) + body con tabs RT/SP/Isla. Default: colapsada,
+    //tab RT activo. El estado de expansión y tab vive en `cardExpandidas`
+    //y `tabActivoPorCiudad` (memoria, no persiste).
     function renderCardCiudad(ciudad) {
       const tid = ciudad.codigoCiudad;
       const cfg = data.ataques.configPorCiudad[tid] || {
         enabled: false, targetTownId: "", unitTypes: [],
         spamEnabled: false, spamUnitTypes: [], spamCounts: {}, spamIntervalMin: 4,
+        isla: { islandId: "", unitTypes: [], counts: {} },
       };
       if (!Array.isArray(cfg.unitTypes)) cfg.unitTypes = [];
       if (!Array.isArray(cfg.spamUnitTypes)) cfg.spamUnitTypes = [];
       if (!cfg.spamCounts || typeof cfg.spamCounts !== "object") cfg.spamCounts = {};
       if (typeof cfg.spamIntervalMin !== "number" || cfg.spamIntervalMin <= 0) cfg.spamIntervalMin = 4;
+      if (!cfg.isla || typeof cfg.isla !== "object") cfg.isla = { islandId: "", unitTypes: [], counts: {} };
 
       const algunModoOn = cfg.enabled || cfg.spamEnabled;
       const proximoSlots = data.ataques.proximoPorCiudad[tid] || {};
@@ -849,34 +978,93 @@
 
       const card = document.createElement("div");
       card.style.cssText =
-        "padding:10px 12px;background:#172029;border:1px solid #2c3a4d;" +
-        `border-left:3px solid ${colorAcento};border-radius:4px`;
+        "background:#172029;border:1px solid #2c3a4d;" +
+        `border-left:3px solid ${colorAcento};border-radius:4px;overflow:hidden`;
 
-      //Fila 1: nombre de la ciudad
-      const row1 = document.createElement("div");
-      row1.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:8px";
+      const expandida = cardExpandidas.has(tid);
+
+      //——— Header (siempre visible) ———————————————————————————————
+      //Click toggle expand/collapse. Muestra:
+      //   ▶/▼  Nombre  id   [RT] [SP] [⚔]   estado/countdown
+      const header = document.createElement("div");
+      header.style.cssText =
+        "display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer;" +
+        "user-select:none;background:#172029;transition:background 0.15s";
+      header.addEventListener("mouseenter", () => { header.style.background = "#1a2530"; });
+      header.addEventListener("mouseleave", () => { header.style.background = "#172029"; });
+
+      const arrow = document.createElement("span");
+      arrow.textContent = expandida ? "▼" : "▶";
+      arrow.style.cssText = "color:#7a8aa0;font-size:10px;width:10px;flex-shrink:0";
+      header.appendChild(arrow);
+
       const nombre = document.createElement("div");
-      nombre.style.cssText = "flex:1;min-width:0";
+      nombre.style.cssText = "flex:1;min-width:0;display:flex;align-items:baseline;gap:8px";
       nombre.innerHTML =
-        `<div style="font-weight:bold;color:#e6e9ee;font-size:13px">${escapeHtml(ciudad.nombreCiudad || "")}</div>` +
-        `<div style="color:#7a8aa0;font-size:10px;font-family:monospace">id ${tid}</div>`;
-      row1.appendChild(nombre);
-      card.appendChild(row1);
+        `<span style="font-weight:bold;color:#e6e9ee;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(ciudad.nombreCiudad || "")}</span>` +
+        `<span style="color:#7a8aa0;font-size:10px;font-family:monospace">id ${tid}</span>`;
+      header.appendChild(nombre);
 
-      //Fila 2: ID ciudad objetivo (compartido entre los dos modos)
+      //Badges de modos activos
+      const badges = document.createElement("div");
+      badges.style.cssText = "display:flex;gap:4px;flex-shrink:0";
+      if (cfg.enabled) badges.appendChild(crearBadge("RT", "#27ae60"));
+      if (cfg.spamEnabled) badges.appendChild(crearBadge("SPAM", "#9b59b6"));
+      header.appendChild(badges);
+
+      //Resumen estado compacto al lado derecho (solo cuando colapsada)
+      if (!expandida) {
+        const estado = document.createElement("span");
+        estado.style.cssText = "color:#7a8aa0;font-size:10.5px;font-family:monospace;flex-shrink:0";
+        const proxRT = proximoSlots.rt;
+        const proxSP = proximoSlots.sp;
+        const partes = [];
+        if (proxRT) {
+          const seg = Math.max(0, Math.round((proxRT - Date.now()) / 1000));
+          partes.push(`RT ${core.formatDuracion(seg)}`);
+        }
+        if (proxSP) {
+          const seg = Math.max(0, Math.round((proxSP - Date.now()) / 1000));
+          partes.push(`SP ${core.formatDuracion(seg)}`);
+        }
+        if (!partes.length && cfg.targetTownId) partes.push(`→ ${cfg.targetTownId}`);
+        estado.textContent = partes.join(" · ");
+        header.appendChild(estado);
+      }
+
+      header.addEventListener("click", () => {
+        if (expandida) cardExpandidas.delete(tid);
+        else cardExpandidas.add(tid);
+        rerenderTab();
+      });
+      card.appendChild(header);
+
+      if (!expandida) return card;
+
+      //——— Body (cuando expandida) ————————————————————————————————
+      const body = document.createElement("div");
+      body.style.cssText = "padding:0 12px 12px 12px;border-top:1px solid #2c3a4d";
+
+      //Target ID (compartido entre RT y SP — el tab Isla tiene su propio
+      //selector de ciudades, ignora este). Lo mostramos siempre arriba para
+      //que el usuario lo vea al cambiar de tab.
       const targetWrap = document.createElement("label");
-      targetWrap.style.cssText = "display:flex;flex-direction:column;gap:2px;margin-bottom:10px";
+      targetWrap.style.cssText = "display:flex;flex-direction:column;gap:3px;margin:10px 0";
       const tlbl = document.createElement("span");
-      tlbl.textContent = "ID ciudad objetivo (compartido)";
-      tlbl.style.cssText = "color:#7a8aa0;font-size:10px;letter-spacing:0.3px;text-transform:uppercase";
+      tlbl.innerHTML =
+        `<span style="color:#7a8aa0;font-size:10px;letter-spacing:0.3px;text-transform:uppercase">ID ciudad objetivo</span> ` +
+        `<span style="color:#5a6776;font-size:10px">(usado por Round-trip y Spam)</span>`;
       const tinp = document.createElement("input");
       tinp.type = "text";
       tinp.inputMode = "numeric";
       tinp.placeholder = "ej: 95";
       tinp.value = cfg.targetTownId == null ? "" : String(cfg.targetTownId);
       tinp.style.cssText =
-        "padding:6px 8px;background:#0f1620;color:#e6e9ee;" +
-        "border:1px solid #2c3a4d;border-radius:3px;font-size:12px;font-family:monospace";
+        "padding:7px 10px;background:#0f1620;color:#e6e9ee;" +
+        "border:1px solid #2c3a4d;border-radius:3px;font-size:12px;font-family:monospace;" +
+        "outline:none;transition:border-color 0.15s";
+      tinp.addEventListener("focus", () => { tinp.style.borderColor = "#3498db"; });
+      tinp.addEventListener("blur", () => { tinp.style.borderColor = "#2c3a4d"; });
       tinp.addEventListener("change", () => {
         const v = tinp.value.replace(/\D/g, "");
         tinp.value = v;
@@ -884,27 +1072,73 @@
       });
       targetWrap.appendChild(tlbl);
       targetWrap.appendChild(tinp);
-      card.appendChild(targetWrap);
+      body.appendChild(targetWrap);
 
-      //Sección Round-trip (modo original) y sección Spam (modo nuevo).
-      //Cada una con su propio toggle, chips, descripción y estado.
-      card.appendChild(renderSeccionRT(tid, cfg, ultSlots.rt, proximoSlots.rt));
-      card.appendChild(renderSeccionSP(tid, cfg, ultSlots.sp, proximoSlots.sp));
+      //Tab bar
+      const tabActivo = getTabActivo(tid);
+      const tabBar = document.createElement("div");
+      tabBar.style.cssText =
+        "display:flex;gap:2px;background:#0f1620;border:1px solid #2c3a4d;" +
+        "border-radius:4px;padding:3px;margin-bottom:10px";
+      const definirTab = (key, label, accentColor) => {
+        const activo = tabActivo === key;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        btn.style.cssText =
+          "flex:1;padding:6px 10px;border:0;border-radius:3px;cursor:pointer;" +
+          "font-size:11.5px;font-weight:bold;letter-spacing:0.3px;" +
+          `background:${activo ? accentColor : "transparent"};` +
+          `color:${activo ? "#fff" : "#7a8aa0"};` +
+          "transition:all 0.15s";
+        if (!activo) {
+          btn.addEventListener("mouseenter", () => { btn.style.color = "#cdd5e0"; });
+          btn.addEventListener("mouseleave", () => { btn.style.color = "#7a8aa0"; });
+        }
+        btn.addEventListener("click", () => {
+          setTabActivo(tid, key);
+          rerenderTab();
+        });
+        return btn;
+      };
+      tabBar.appendChild(definirTab("rt",   "ROUND-TRIP", "#27ae60"));
+      tabBar.appendChild(definirTab("sp",   "SPAM",       "#9b59b6"));
+      tabBar.appendChild(definirTab("isla", "ISLA",       "#e67e22"));
+      body.appendChild(tabBar);
 
+      //Contenido del tab activo
+      if (tabActivo === "rt") {
+        body.appendChild(renderSeccionRT(tid, cfg, ultSlots.rt, proximoSlots.rt));
+      } else if (tabActivo === "sp") {
+        body.appendChild(renderSeccionSP(tid, cfg, ultSlots.sp, proximoSlots.sp));
+      } else {
+        body.appendChild(renderTabIsla(tid, cfg));
+      }
+
+      card.appendChild(body);
       return card;
+    }
+
+    function crearBadge(label, color) {
+      const b = document.createElement("span");
+      b.textContent = label;
+      b.style.cssText =
+        `background:${color};color:#fff;font-size:9.5px;font-weight:bold;` +
+        "padding:2px 6px;border-radius:3px;letter-spacing:0.4px";
+      return b;
     }
 
     //—— Sección Round-trip ——
     function renderSeccionRT(tid, cfg, ult, proximoAt) {
       const sec = crearSeccionModo({
-        tituloLabel: "Atacar (round-trip)",
+        tituloLabel: "Activar round-trip",
         toggleColor: cfg.enabled ? "#27ae60" : "#7a8aa0",
         toggleEstado: !!cfg.enabled,
         toggleOnChange: (nuevo) => {
           setConfigCiudad(tid, { enabled: nuevo });
           rerenderTab();
         },
-        descripcion: "Manda TODO lo disponible y espera ida + vuelta.",
+        descripcion: "Manda TODO lo disponible y espera ida + vuelta antes de repetir.",
       });
 
       const seleccionados = (cfg.unitTypes || []).length;
@@ -968,7 +1202,7 @@
     //—— Sección Spam ——
     function renderSeccionSP(tid, cfg, ult, proximoAt) {
       const sec = crearSeccionModo({
-        tituloLabel: "Spam (cantidad fija cada N min)",
+        tituloLabel: "Activar spam",
         toggleColor: cfg.spamEnabled ? "#9b59b6" : "#7a8aa0",
         toggleEstado: !!cfg.spamEnabled,
         toggleColorON: "#9b59b6",
@@ -976,7 +1210,7 @@
           setConfigCiudad(tid, { spamEnabled: nuevo });
           rerenderTab();
         },
-        descripcion: "Manda EXACTAMENTE las cantidades configuradas cada N minutos. Si no hay suficientes en casa, espera y reintenta.",
+        descripcion: "Manda EXACTAMENTE las cantidades configuradas cada N minutos. Si faltan tropas, espera y reintenta.",
       });
 
       //Input intervalo (minutos)
@@ -1065,13 +1299,462 @@
       return sec;
     }
 
+    //—— Tab Isla (ataque one-shot a todas las ciudades de una isla) ——
+    //
+    //Flujo:
+    //  1. Usuario ingresa ID isla y aprieta "Cargar".
+    //  2. obtenerCiudadesDeIsla fetch al server. Filtramos ciudades del
+    //     propio jugador (no nos atacamos solos).
+    //  3. Render checklist con todas las ciudades cargadas, todas marcadas
+    //     por default. Usuario deselecciona las que no quiera atacar.
+    //  4. Selector de unidades (chips) + cantidad por unidad. Las cantidades
+    //     son POR ciudad atacada (no totales).
+    //  5. Botón "Atacar N ciudades" → confirm → loop con jitter, mostrando
+    //     progreso. NO espera ida+vuelta (es one-shot).
+    //
+    //La config (islandId, unitTypes, counts) se persiste por ciudad atacante
+    //para que la próxima vez el usuario no tenga que volver a tipear todo.
+    //La lista de ciudades cargadas y las seleccionadas NO se persisten — son
+    //runtime (islaRuntimePorCiudad).
+    function renderTabIsla(tid, cfg) {
+      const rt = getIslaRuntime(tid);
+      const isla = cfg.isla || (cfg.isla = { islandId: "", unitTypes: [], counts: {} });
+
+      //Default: la isla a la que pertenece la propia ciudad atacante.
+      //Si no hay islandId persistido, lo prellenamos para que el usuario
+      //solo tenga que apretar "Cargar ciudades".
+      if (!isla.islandId) {
+        const propia = (data.ciudadesConAldeas || []).find((c) => c.codigoCiudad == tid);
+        if (propia && propia.islandId) {
+          isla.islandId = String(propia.islandId);
+          setConfigIsla(tid, { islandId: isla.islandId });
+        }
+      }
+
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "padding:10px 12px;background:#0f1620;border:1px solid #2c3a4d;border-radius:4px";
+
+      //Descripción + advertencia "one-shot"
+      const desc = document.createElement("div");
+      desc.style.cssText =
+        "color:#bdc3c7;font-size:11px;line-height:1.45;margin-bottom:10px;" +
+        "padding:7px 9px;background:#172029;border-left:3px solid #e67e22;border-radius:3px";
+      desc.innerHTML =
+        `<b style="color:#e67e22">Ataque one-shot</b> — manda una ola de tropas a TODAS las ciudades ` +
+        `marcadas de la isla. <b>No</b> se repite ni espera ida+vuelta. ` +
+        `Las cantidades son <b>por ciudad atacada</b>.`;
+      wrap.appendChild(desc);
+
+      //Fila: input ID isla + botón Cargar
+      const filaIsla = document.createElement("div");
+      filaIsla.style.cssText = "display:flex;gap:8px;align-items:flex-end;margin-bottom:10px";
+      const labIsla = document.createElement("label");
+      labIsla.style.cssText = "flex:1;display:flex;flex-direction:column;gap:3px";
+      const lblTxt = document.createElement("span");
+      lblTxt.textContent = "ID isla";
+      lblTxt.style.cssText = "color:#7a8aa0;font-size:10px;letter-spacing:0.3px;text-transform:uppercase";
+      const inpIsla = document.createElement("input");
+      inpIsla.type = "text";
+      inpIsla.inputMode = "numeric";
+      inpIsla.placeholder = "ej: 58157";
+      inpIsla.value = isla.islandId || "";
+      inpIsla.style.cssText =
+        "padding:7px 10px;background:#0f1620;color:#e6e9ee;" +
+        "border:1px solid #2c3a4d;border-radius:3px;font-size:12px;font-family:monospace;" +
+        "outline:none;transition:border-color 0.15s";
+      inpIsla.addEventListener("focus", () => { inpIsla.style.borderColor = "#e67e22"; });
+      inpIsla.addEventListener("blur", () => { inpIsla.style.borderColor = "#2c3a4d"; });
+      inpIsla.addEventListener("change", () => {
+        const v = inpIsla.value.replace(/\D/g, "");
+        inpIsla.value = v;
+        isla.islandId = v;
+        setConfigIsla(tid, { islandId: v });
+      });
+      labIsla.appendChild(lblTxt);
+      labIsla.appendChild(inpIsla);
+      filaIsla.appendChild(labIsla);
+
+      const btnCargar = document.createElement("button");
+      btnCargar.type = "button";
+      btnCargar.textContent = rt.loading ? "Cargando…" : "Cargar ciudades";
+      btnCargar.disabled = rt.loading || rt.atacando;
+      btnCargar.style.cssText =
+        "padding:7px 14px;background:#3498db;color:#fff;border:0;border-radius:3px;" +
+        "cursor:pointer;font-size:11.5px;font-weight:bold;letter-spacing:0.3px;" +
+        "flex-shrink:0;" + (rt.loading || rt.atacando ? "opacity:0.5;cursor:wait" : "");
+      btnCargar.addEventListener("click", async () => {
+        const v = inpIsla.value.replace(/\D/g, "");
+        if (!v) { inpIsla.focus(); return; }
+        isla.islandId = v;
+        setConfigIsla(tid, { islandId: v });
+        rt.islandId = v;
+        rt.loading = true;
+        rt.error = null;
+        rt.ciudades = null;
+        rt.seleccionadas = new Set();
+        rerenderTab();
+        try {
+          const ciudades = await obtenerCiudadesDeIsla(v, tid);
+          //Filtrar las propias: nuestras ciudades viven en data.ciudadesConAldeas.
+          const propias = new Set((data.ciudadesConAldeas || []).map((c) => Number(c.codigoCiudad)));
+          rt.ciudades = ciudades.filter((c) => !propias.has(c.id));
+          //Default: todas seleccionadas (el usuario destilda las que no quiera).
+          rt.seleccionadas = new Set(rt.ciudades.map((c) => c.id));
+          if (!rt.ciudades.length) {
+            rt.error = "No se encontraron ciudades atacables en esta isla (¿isla vacía o todas son tuyas?)";
+          }
+        } catch (e) {
+          rt.error = `No pude cargar la isla: ${e && e.message ? e.message : e}`;
+          core.logError("ataques", "obtenerCiudadesDeIsla falló", e);
+        }
+        rt.loading = false;
+        rerenderTab();
+      });
+      filaIsla.appendChild(btnCargar);
+      wrap.appendChild(filaIsla);
+
+      //Listado de ciudades cargadas (checklist)
+      if (rt.error) {
+        const errBox = document.createElement("div");
+        errBox.textContent = rt.error;
+        errBox.style.cssText =
+          "color:#e74c3c;font-size:11px;padding:8px 10px;background:#1a0e0e;" +
+          "border:1px solid #5a2424;border-radius:3px;margin-bottom:10px";
+        wrap.appendChild(errBox);
+      } else if (rt.loading) {
+        const loadBox = document.createElement("div");
+        loadBox.textContent = "Cargando ciudades de la isla…";
+        loadBox.style.cssText =
+          "color:#7a8aa0;font-size:11px;font-style:italic;padding:8px 10px;text-align:center";
+        wrap.appendChild(loadBox);
+      } else if (rt.ciudades == null) {
+        const emptyBox = document.createElement("div");
+        emptyBox.innerHTML =
+          `<span style="color:#7a8aa0">↑ Ingresá un ID de isla y apretá "Cargar ciudades" para empezar.</span>`;
+        emptyBox.style.cssText =
+          "font-size:11px;padding:14px 10px;text-align:center;background:#172029;" +
+          "border:1px dashed #2c3a4d;border-radius:3px;margin-bottom:10px";
+        wrap.appendChild(emptyBox);
+      } else {
+        wrap.appendChild(renderChecklistCiudades(tid, rt));
+      }
+
+      //Selector unificado de unidades + cantidades.
+      //
+      //Antes había dos pasos (chip "seleccionar" + grid "cantidad" gated por
+      //selección). El usuario reportó que no veía cómo seleccionar ni dónde
+      //escribir la cantidad, así que ahora una sola tabla con TODAS las
+      //unidades muestra el input siempre. Selección implícita: count > 0 =
+      //unidad incluida. Las que tienen tropas van primero; las ya configuradas
+      //(count > 0) también suben, así no se "pierden" si la ciudad se queda
+      //sin tropas momentáneamente.
+      const cache = data.ataques.unitsCache[tid] || {};
+      const numAsignadas = TIPOS_UNIDAD.filter((t) => Number(isla.counts[t.key]) > 0).length;
+
+      const ulbl = document.createElement("div");
+      ulbl.style.cssText = "color:#7a8aa0;font-size:10px;text-transform:uppercase;letter-spacing:0.3px;margin:14px 0 4px";
+      ulbl.textContent = `Unidades a enviar por ciudad atacada (${numAsignadas} tipo${numAsignadas === 1 ? "" : "s"} asignado${numAsignadas === 1 ? "" : "s"})`;
+      wrap.appendChild(ulbl);
+
+      const uhint = document.createElement("div");
+      uhint.style.cssText = "color:#7a8aa0;font-size:10.5px;font-style:italic;margin-bottom:6px";
+      uhint.textContent = "Escribí cuántas mandar de cada tipo. Dejá vacío o 0 para no incluir esa unidad.";
+      wrap.appendChild(uhint);
+
+      //Orden: con tropas disponibles primero, después las que ya tienen
+      //cantidad asignada (aunque no haya stock en este momento), después el
+      //resto. Dentro de cada grupo mantenemos el orden de TIPOS_UNIDAD.
+      const ordenadas = TIPOS_UNIDAD.slice().sort((a, b) => {
+        const aTropas = Number(cache[a.key] || 0) > 0 ? 0 : 1;
+        const bTropas = Number(cache[b.key] || 0) > 0 ? 0 : 1;
+        if (aTropas !== bTropas) return aTropas - bTropas;
+        const aAsig = Number(isla.counts[a.key] || 0) > 0 ? 0 : 1;
+        const bAsig = Number(isla.counts[b.key] || 0) > 0 ? 0 : 1;
+        if (aAsig !== bAsig) return aAsig - bAsig;
+        return 0;
+      });
+
+      const unitGrid = document.createElement("div");
+      unitGrid.style.cssText = "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px";
+      for (const t of ordenadas) {
+        const disp = Number(cache[t.key] || 0);
+        const cur = Number(isla.counts[t.key] || 0);
+        const incluida = cur > 0;
+        const tieneTropas = disp > 0;
+
+        const row = document.createElement("label");
+        row.style.cssText =
+          "display:flex;align-items:center;gap:6px;padding:5px 7px;border-radius:3px;cursor:text;" +
+          `background:${incluida ? "#1a2e1f" : "#172029"};` +
+          `border:1px solid ${incluida ? "#27ae60" : "#2c3a4d"};` +
+          (tieneTropas || incluida ? "" : "opacity:0.55");
+
+        const nameSpan = document.createElement("span");
+        nameSpan.style.cssText =
+          "flex:1;min-width:0;display:flex;align-items:baseline;gap:5px;" +
+          "overflow:hidden;white-space:nowrap";
+        nameSpan.innerHTML =
+          `<span style="color:${incluida ? "#27ae60" : (tieneTropas ? "#cdd5e0" : "#7a8aa0")};` +
+          `font-size:11px;font-weight:${incluida ? "bold" : "normal"};` +
+          `overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.label)}</span>` +
+          (disp > 0
+            ? `<span style="color:#7a8aa0;font-family:monospace;font-size:10px">${disp}</span>`
+            : `<span style="color:#5a6776;font-size:10px">—</span>`);
+
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.inputMode = "numeric";
+        inp.placeholder = "0";
+        inp.value = cur > 0 ? String(cur) : "";
+        inp.style.cssText =
+          "width:64px;padding:4px 7px;background:#0f1620;color:#e6e9ee;" +
+          `border:1px solid ${incluida ? "#27ae60" : "#2c3a4d"};` +
+          "border-radius:3px;font-size:11.5px;font-family:monospace;text-align:right;outline:none";
+        inp.addEventListener("focus", () => { inp.style.borderColor = "#e67e22"; });
+        inp.addEventListener("blur", () => {
+          const raw = inp.value.replace(/\D/g, "");
+          inp.value = raw;
+          const n = raw ? Math.floor(Number(raw)) : 0;
+          //Construimos counts y unitTypes nuevos a partir del estado actual
+          //persistido (no del local fallback) para evitar pisar cambios y
+          //para crear la entry en configPorCiudad si todavía no existe.
+          const prev = data.ataques.configPorCiudad[tid] || {};
+          const prevIsla = (prev.isla && typeof prev.isla === "object")
+            ? prev.isla
+            : { islandId: isla.islandId || "", unitTypes: [], counts: {} };
+          const nuevosCounts = { ...(prevIsla.counts || {}) };
+          const nuevosTypes = Array.isArray(prevIsla.unitTypes) ? prevIsla.unitTypes.slice() : [];
+          if (n > 0) {
+            nuevosCounts[t.key] = n;
+            if (!nuevosTypes.includes(t.key)) nuevosTypes.push(t.key);
+          } else {
+            delete nuevosCounts[t.key];
+            const idx = nuevosTypes.indexOf(t.key);
+            if (idx >= 0) nuevosTypes.splice(idx, 1);
+          }
+          setConfigIsla(tid, { counts: nuevosCounts, unitTypes: nuevosTypes });
+          rerenderTab();
+        });
+
+        row.appendChild(nameSpan);
+        row.appendChild(inp);
+        unitGrid.appendChild(row);
+      }
+      wrap.appendChild(unitGrid);
+
+      //Botón "Atacar"
+      //La selección es implícita: una unidad está incluida si su count > 0.
+      //Recalculamos desde counts (no desde unitTypes) para tolerar arrays
+      //desincronizados de versiones viejas.
+      const unitTypesActivas = TIPOS_UNIDAD
+        .map((t) => t.key)
+        .filter((k) => Number(isla.counts[k]) > 0);
+      const seleccionadas = rt.ciudades ? rt.seleccionadas.size : 0;
+      const tieneUnidadesValidas = unitTypesActivas.length > 0;
+      const habilitado = seleccionadas > 0 && tieneUnidadesValidas && !rt.atacando && !rt.loading;
+
+      const btnAtacar = document.createElement("button");
+      btnAtacar.type = "button";
+      btnAtacar.textContent = rt.atacando
+        ? (rt.progreso ? `Atacando ${rt.progreso.actual}/${rt.progreso.total}…` : "Atacando…")
+        : `⚔  Atacar ${seleccionadas} ciudad(es)`;
+      btnAtacar.disabled = !habilitado;
+      btnAtacar.style.cssText =
+        "width:100%;margin-top:14px;padding:10px;border:0;border-radius:4px;cursor:pointer;" +
+        "font-size:12.5px;font-weight:bold;letter-spacing:0.5px;text-transform:uppercase;" +
+        (habilitado
+          ? "background:#e67e22;color:#fff"
+          : "background:#2c3a4d;color:#5a6776;cursor:not-allowed");
+      btnAtacar.addEventListener("click", () => {
+        if (!habilitado) return;
+        const cantStr = unitTypesActivas
+          .map((ut) => `${isla.counts[ut]} ${labelUnidad(ut)}`)
+          .join(" + ");
+        const totalUnidades = unitTypesActivas.reduce((s, ut) => s + Number(isla.counts[ut] || 0), 0);
+        const grandTotal = totalUnidades * seleccionadas;
+        const ok = confirm(
+          `Atacar ${seleccionadas} ciudad(es) desde ${nombreCiudad(tid)}.\n\n` +
+          `Por ciudad: ${cantStr}\n` +
+          `Total a enviar: ${grandTotal} unidades en ${seleccionadas} olas.\n\n` +
+          `Esto NO se puede deshacer. ¿Confirmar?`
+        );
+        if (!ok) return;
+        ejecutarAtaqueIsla(tid).catch((e) => core.logError("ataques", "ataque isla falló", e));
+      });
+      wrap.appendChild(btnAtacar);
+
+      //Hint si falta config
+      if (!habilitado && !rt.atacando) {
+        const hint = document.createElement("div");
+        hint.style.cssText = "color:#7a8aa0;font-size:10.5px;font-style:italic;text-align:center;margin-top:6px";
+        if (rt.ciudades == null) hint.textContent = "Cargá una isla primero.";
+        else if (seleccionadas === 0) hint.textContent = "Marcá al menos una ciudad para atacar.";
+        else if (!tieneUnidadesValidas) hint.textContent = "Configurá al menos una unidad con cantidad > 0.";
+        wrap.appendChild(hint);
+      }
+
+      return wrap;
+    }
+
+    function renderChecklistCiudades(tid, rt) {
+      const cont = document.createElement("div");
+      cont.style.cssText =
+        "background:#172029;border:1px solid #2c3a4d;border-radius:3px;overflow:hidden";
+
+      //Header con contador + acciones masivas
+      const head = document.createElement("div");
+      head.style.cssText =
+        "display:flex;align-items:center;gap:8px;padding:7px 10px;" +
+        "background:#1a232e;border-bottom:1px solid #2c3a4d";
+      const cnt = document.createElement("span");
+      cnt.style.cssText = "flex:1;color:#cdd5e0;font-size:11px;font-weight:bold";
+      cnt.textContent = `${rt.seleccionadas.size} / ${rt.ciudades.length} ciudades seleccionadas`;
+      head.appendChild(cnt);
+
+      const btnTodas = document.createElement("button");
+      btnTodas.type = "button";
+      btnTodas.textContent = "Todas";
+      btnTodas.style.cssText =
+        "background:#2c3a4d;color:#cdd5e0;border:0;padding:3px 9px;border-radius:3px;" +
+        "cursor:pointer;font-size:10.5px;font-weight:bold";
+      btnTodas.addEventListener("click", () => {
+        rt.seleccionadas = new Set(rt.ciudades.map((c) => c.id));
+        rerenderTab();
+      });
+      head.appendChild(btnTodas);
+
+      const btnNinguna = document.createElement("button");
+      btnNinguna.type = "button";
+      btnNinguna.textContent = "Ninguna";
+      btnNinguna.style.cssText =
+        "background:#2c3a4d;color:#cdd5e0;border:0;padding:3px 9px;border-radius:3px;" +
+        "cursor:pointer;font-size:10.5px;font-weight:bold";
+      btnNinguna.addEventListener("click", () => {
+        rt.seleccionadas = new Set();
+        rerenderTab();
+      });
+      head.appendChild(btnNinguna);
+
+      cont.appendChild(head);
+
+      //Lista sin scroll interno: dejamos que el .pcj-body del panel scrollee.
+      //Nested scrolls dentro de un panel ya scrolleable hacen que la rueda
+      //"se trabe" entre contenedores en Chrome — el usuario reportó que no
+      //podía scrollear acá adentro.
+      const lista = document.createElement("div");
+      for (const c of rt.ciudades) {
+        const checked = rt.seleccionadas.has(c.id);
+        const row = document.createElement("label");
+        row.style.cssText =
+          "display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;" +
+          "border-top:1px solid #2c3a4d;font-size:11.5px;" +
+          (checked ? "background:#172029" : "background:#101820;opacity:0.65");
+        const chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.checked = checked;
+        chk.style.cssText = "accent-color:#e67e22;flex-shrink:0;cursor:pointer";
+        chk.addEventListener("change", () => {
+          if (chk.checked) rt.seleccionadas.add(c.id);
+          else rt.seleccionadas.delete(c.id);
+          //Re-render solo para actualizar contador y botón (lite reflow).
+          rerenderTab();
+        });
+        row.appendChild(chk);
+
+        const info = document.createElement("div");
+        info.style.cssText = "flex:1;min-width:0;display:flex;align-items:baseline;gap:6px";
+        info.innerHTML =
+          `<span style="color:#e6e9ee;font-weight:bold;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.name)}</span>` +
+          `<span style="color:#7a8aa0;font-family:monospace;font-size:10px">#${c.id}</span>` +
+          (c.points != null ? `<span style="color:#7a8aa0;font-size:10px">${c.points}p</span>` : "") +
+          (c.playerName ? `<span style="color:#5a6776;font-size:10.5px;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.playerName)}</span>` : "");
+        row.appendChild(info);
+
+        lista.appendChild(row);
+      }
+      cont.appendChild(lista);
+      return cont;
+    }
+
+    //Loop one-shot que dispara enviarAtaque para cada ciudad seleccionada.
+    //Respeta CAPTCHA (aborta) y agrega jitter entre cada disparo (1.5-3.5s)
+    //para no levantar sospecha. El estado de progreso se refleja en rt.atacando
+    //+ rt.progreso para que el panel muestre "Atacando X/N…".
+    async function ejecutarAtaqueIsla(tid) {
+      const rt = getIslaRuntime(tid);
+      const cfg = data.ataques.configPorCiudad[tid];
+      if (!cfg || !cfg.isla) return;
+      const objetivos = rt.ciudades.filter((c) => rt.seleccionadas.has(c.id));
+      if (!objetivos.length) return;
+
+      //Fuente de verdad: counts. Iteramos sus keys (en lugar de unitTypes)
+      //para tolerar drift entre los dos arreglos en configs viejas.
+      const counts = {};
+      const islaCounts = cfg.isla.counts || {};
+      for (const ut of Object.keys(islaCounts)) {
+        const n = Number(islaCounts[ut] || 0);
+        if (n > 0) counts[ut] = n;
+      }
+      if (!Object.keys(counts).length) return;
+
+      rt.atacando = true;
+      rt.progreso = { actual: 0, total: objetivos.length, ok: 0, fail: 0 };
+      rerenderTab();
+
+      core.log("ataques", `🏝️ ataque a isla ${cfg.isla.islandId} — ${objetivos.length} ciudades · ${formatCountsCorto(counts)} por ciudad`, "info");
+
+      for (const obj of objetivos) {
+        if (core.isCaptchaActive()) {
+          core.logWarn("ataques", `ataque a isla abortado en ${rt.progreso.actual}/${rt.progreso.total} por CAPTCHA`);
+          break;
+        }
+        const r = await enviarAtaque(tid, obj.id, counts);
+        rt.progreso.actual += 1;
+        if (r.ok) {
+          rt.progreso.ok += 1;
+          registrarHistorial({
+            ts: Date.now(),
+            town_id: tid,
+            target_town_id: obj.id,
+            modo: "isla",
+            counts,
+            total: Object.values(counts).reduce((s, n) => s + n, 0),
+            oneWaySeg: r.arrivalAt - r.startedAt,
+          });
+          core.log("ataques", `  ✓ → ${obj.name} (#${obj.id})`, "ok");
+        } else {
+          rt.progreso.fail += 1;
+          core.logWarn("ataques", `  ✗ → ${obj.name} (#${obj.id}): ${r.error || "fallo"}`);
+          //Si server dijo "sin tropas", no sigue — sigan los demás ataques no
+          //tendrían tropas tampoco.
+          if (r.noTropas) {
+            core.logWarn("ataques", "ataque a isla: sin tropas, aborto restantes");
+            break;
+          }
+        }
+        rerenderTab();
+        //Jitter entre ataques: suficiente para parecer humano pero rápido
+        //para terminar la ola.
+        await new Promise((res) => setTimeout(res, jitter(1500, 3500)));
+      }
+
+      core.log(
+        "ataques",
+        `🏝️ ataque a isla terminado · OK ${rt.progreso.ok} · falló ${rt.progreso.fail}`,
+        rt.progreso.fail ? "warn" : "ok"
+      );
+      rt.atacando = false;
+      rerenderTab();
+    }
+
     //Esqueleto común de cada sección de modo: contenedor con borde + header
     //(label + toggle) + descripción. Los hijos específicos del modo se
     //agregan luego con appendChild.
     function crearSeccionModo({ tituloLabel, toggleColor, toggleColorON, toggleEstado, toggleOnChange, descripcion }) {
       const sec = document.createElement("div");
       sec.style.cssText =
-        "margin-top:10px;padding:8px 10px;background:#0f1620;border:1px solid #2c3a4d;border-radius:4px";
+        "padding:10px 12px;background:#0f1620;border:1px solid #2c3a4d;border-radius:4px";
 
       const head = document.createElement("div");
       head.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:4px";

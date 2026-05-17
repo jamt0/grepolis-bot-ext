@@ -278,7 +278,18 @@
         },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.json();
+      const body = await res.json();
+      //Re-dispatch las notifications a MM/Backbone para que la UI del juego
+      //se actualice sola. Sin esto el server nos las entrega a NOSOTROS y se
+      //marca como delivered en la sesión → el juego nunca actualiza cola de
+      //construcción, recursos, tropas, etc. Crítico con polls frecuentes.
+      const notifs = body && body.json && body.json.notifications;
+      if (Array.isArray(notifs) && notifs.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifs },
+        }));
+      }
+      return body;
     }
 
     //—— Ciclo ————————————————————————————————————————————————————————

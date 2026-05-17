@@ -554,21 +554,30 @@
 
   //—— UI: contenedor de botones ——————————————————————————————————————————
 
+  //CSS del contenedor centralizado. Lo aplicamos SIEMPRE — tanto al crear
+  //el contenedor como al reutilizar uno existente — porque al recargar la
+  //extensión sin recargar la página, el contenedor del run anterior queda
+  //en el DOM con los estilos viejos, y el nuevo content script lo reusaría
+  //sin actualizar la posición. Setear cssText cada vez fuerza el update.
+  //z-index bajo (5) para que NUNCA quede encima de modales del juego —
+  //antes estaba en 1000 y los clicks dirigidos al chat/foro/mensajería
+  //a veces aterrizaban en el botón ▶/⏸ y pausaban el bot sin querer.
+  //Position bottom:120px;left:80px → la card queda justo arriba de la cola
+  //de construcción del juego (~95px de alto) con un pequeño margen. Antes
+  //estaba en bottom:45px y las alertas quedaban tapadas por esa barra.
+  const ESTILO_CONT_BOTONES =
+    "position:absolute;bottom:120px;left:80px;z-index:5;" +
+    "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
+
   function asegurarContenedorBotones() {
     let cont = document.getElementById("jambot-buttons");
-    if (cont) return cont;
+    if (cont) {
+      cont.style.cssText = ESTILO_CONT_BOTONES;
+      return cont;
+    }
     cont = document.createElement("div");
     cont.id = "jambot-buttons";
-    //z-index bajo (5) para que NUNCA quede encima de modales del juego —
-    //antes estaba en 1000 y los clicks dirigidos al chat/foro/mensajería
-    //a veces aterrizaban en el botón ▶/⏸ y pausaban el bot sin querer.
-    //Position bottom:45px;left:80px → la card queda alineada con el pulpo
-    //(esquina inferior izquierda), justo a la derecha del pulpo y el ícono
-    //de mute, sin taparlos. El bottom de 45px deja libre la barra "Resumen"
-    //que el juego puede mostrar pegada al borde inferior.
-    cont.style.cssText =
-      "position:absolute;bottom:45px;left:80px;z-index:5;" +
-      "display:flex;flex-direction:column;gap:6px;align-items:flex-start";
+    cont.style.cssText = ESTILO_CONT_BOTONES;
     document.body.appendChild(cont);
     return cont;
   }

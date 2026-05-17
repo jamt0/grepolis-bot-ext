@@ -1,7 +1,7 @@
 {
     "name": "Grepolis JamBot",
     "description": "A grepolis bot",
-    "version": "3.6",
+    "version": "3.7",
     "manifest_version": 3,
     "permissions": ["storage", "activeTab", "contextMenus", "tabs", "scripting"],
     "host_permissions": ["*://*.grepolis.com/*"],
@@ -28,6 +28,7 @@
                 "features/ataques.js",
                 "features/ataquesEntrantes.js",
                 "features/mercadoOro.js",
+                "features/comercio.js",
                 "contentScript.js"
             ],
             "run_at": "document_end"

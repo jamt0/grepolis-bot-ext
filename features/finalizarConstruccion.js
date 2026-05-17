@@ -2,7 +2,11 @@
  * cuando entran en la ventana de <5 minutos restantes (mecánica nativa del
  * juego: el botón "Gratis" en la cola).
  *
- * Para activarla, poner `"finalizarGratis": true` en data.json.
+ * Ciclo INDEPENDIENTE del resto de features. No depende del play/pause
+ * global ni de `data.ciudadesConAldeas` (que poblá recoleccion). Tiene su
+ * propio toggle Iniciar/Detener en la tab "Construcción" del panel, y
+ * obtiene la lista de ciudades vía un refetch HTTP propio (cacheado 30
+ * min). Persiste su flag en chrome.storage con su key propia.
  *
  * Endpoint usado (capturado del botón Gratis del juego):
  *   POST .../frontend_bridge?town_id=<TOWN>&action=execute&h=<token>
@@ -14,11 +18,6 @@
  *   }
  *   response.success ⇒ "La construcción se ha completado correctamente."
  *   notifications[]: BuildingOrder × N (cola actualizada) + BuildingBuildData
- *
- * Limitación: la cola se lee de MM (modelos cargados en cliente). Si el
- * jugador no abrió una ciudad en la sesión, sus órdenes no aparecen — habría
- * que agregar un refetch HTTP por ciudad. Por ahora trabajamos sobre lo que
- * el cliente tiene en memoria.
  */
 (function () {
   const JamBot = (window.JamBot = window.JamBot || {});
@@ -29,7 +28,7 @@
    */
   async function init(ctx) {
     const { data, game, core } = ctx;
-    const { csrfToken, world_id } = game;
+    const { csrfToken, world_id, townId } = game;
 
     //Margen de seguridad: el juego permite "free finish" si quedan <5min
     //(300s). Disparamos a los 290s para evitar race conditions con el reloj
@@ -41,9 +40,40 @@
     let proximoTickId = null;
     let corriendo = false;
     let proximoTickAt = null;
-    //La feature se habilita/deshabilita desde el toggle del panel ⚙. El
-    //valor inicial viene de chrome.storage (si el usuario ya lo configuró
-    //alguna vez) o cae al default de data.json (`finalizarGratis: true`).
+
+    //Persistencia del flag de habilitada. Key propia (no compartida con
+    //jambotConfig) para que el módulo sea autónomo. Migra del shape viejo
+    //(`jambotConfig.finalizarHabilitado`) la primera vez que se lee, así
+    //los usuarios existentes mantienen su preferencia.
+    //Declarado ACÁ (antes del await) porque cargarHabilitada lo referencia
+    //internamente — moverlo más abajo cae en TDZ y rompe el init.
+    const STORAGE_KEY_HABILITADA = `jambotFinalizarHabilitada_${world_id}`;
+
+    function cargarHabilitada() {
+      return new Promise((resolve) => {
+        chrome.storage.local.get(
+          [STORAGE_KEY_HABILITADA, "jambotConfig"],
+          (obj) => {
+            const propio = obj && obj[STORAGE_KEY_HABILITADA];
+            if (typeof propio === "boolean") { resolve(propio); return; }
+            //Migración del shape viejo (jambotConfig.finalizarHabilitado).
+            //Lo leemos una sola vez y lo guardamos bajo la nueva key — la
+            //fuente del flag pasa a ser propia de este módulo.
+            const cfg = obj && obj.jambotConfig;
+            const viejo = cfg && typeof cfg.finalizarHabilitado === "boolean"
+              ? cfg.finalizarHabilitado
+              : data.finalizarGratis === true;
+            try { chrome.storage.local.set({ [STORAGE_KEY_HABILITADA]: viejo }); } catch (_) {}
+            resolve(viejo);
+          }
+        );
+      });
+    }
+
+    //La feature se habilita/deshabilita desde el botón Iniciar/Detener
+    //de la tab "Construcción". El valor inicial viene de chrome.storage
+    //(si el usuario ya lo configuró alguna vez) o cae al default de
+    //data.json (`finalizarGratis: true`).
     let habilitada = await cargarHabilitada();
 
     //—— Estado expuesto al panel (data.construccion) —————————————————————
@@ -103,32 +133,23 @@
     }
 
     function nombreCiudad(town_id) {
+      //Preferimos el nombre propio (poblado por nuestro refetch de Towns);
+      //fallback a la lista de recoleccion por si todavía no corrimos
+      //refetch propio.
+      const propio = nombrePorCiudad.get(Number(town_id));
+      if (propio) return propio;
       const c = (data.ciudadesConAldeas || []).find((x) => x.codigoCiudad == town_id);
       return c ? (c.nombreCiudad || String(town_id)) : String(town_id);
     }
 
-    function cargarHabilitada() {
-      return new Promise((resolve) => {
-        chrome.storage.local.get("jambotConfig", (obj) => {
-          const cfg = obj && obj.jambotConfig;
-          if (cfg && typeof cfg.finalizarHabilitado === "boolean") {
-            resolve(cfg.finalizarHabilitado);
-          } else {
-            resolve(data.finalizarGratis === true);
-          }
-        });
-      });
-    }
-
-    //Reaccionar al play/pause global y al toggle del panel. La feature
-    //corre solo cuando ambas condiciones se dan: habilitada Y bot no
-    //pausado. Cualquier cambio dispara reconciliar().
+    //Reconciliar el scheduler con el estado actual del flag. NO mira el
+    //play/pause global: este módulo corre independiente. Si está habilitado,
+    //hay timer / ciclo activo. Si no, todo se cancela.
     function reconciliar() {
       data.construccion.habilitada = habilitada;
-      const debeCorrer = habilitada && !core.isPaused();
-      if (debeCorrer && !proximoTickId && !corriendo) {
+      if (habilitada && !proximoTickId && !corriendo) {
         ejecutarCiclo();
-      } else if (!debeCorrer && proximoTickId) {
+      } else if (!habilitada && proximoTickId) {
         clearTimeout(proximoTickId);
         proximoTickId = null;
         proximoTickAt = null;
@@ -136,26 +157,24 @@
       }
     }
 
-    core.onPlayPauseChange(() => reconciliar());
-
-    chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== "local" || !changes.jambotConfig) return;
-      const nuevo = changes.jambotConfig.newValue;
-      const flag = nuevo && typeof nuevo.finalizarHabilitado === "boolean"
-        ? nuevo.finalizarHabilitado
-        : data.finalizarGratis === true;
-      if (flag === habilitada) return;
-      habilitada = flag;
+    //API expuesta al panel para que la tab "Construcción" pueda alternar el
+    //estado desde su botón Iniciar/Detener. Cambia el flag, lo persiste y
+    //arranca o frena el ciclo.
+    function setHabilitada(nuevo) {
+      const v = !!nuevo;
+      if (v === habilitada) return;
+      habilitada = v;
+      try { chrome.storage.local.set({ [STORAGE_KEY_HABILITADA]: habilitada }); } catch (_) {}
       core.log(
         "finalizar",
-        `feature ${habilitada ? "habilitada" : "deshabilitada"} desde el panel`,
+        habilitada ? "INICIADO desde el panel" : "DETENIDO desde el panel",
         habilitada ? "ok" : "info"
       );
       reconciliar();
-    });
+    }
 
     if (!habilitada) {
-      core.log("finalizar", "feature deshabilitada — no arrancará hasta que se active en el panel ⚙");
+      core.log("finalizar", "feature deshabilitada — apretá Iniciar en la tab Construcción para arrancar");
     }
 
     //—— Scheduler ———————————————————————————————————————————————————————
@@ -183,7 +202,7 @@
      */
     async function ejecutarCiclo() {
       if (corriendo) return; //evitar reentradas
-      if (!habilitada || core.isPaused()) return;
+      if (!habilitada) return;
       corriendo = true;
       const inicioCiclo = Date.now();
       try {
@@ -233,10 +252,10 @@
             core.logWarn("finalizar", "CAPTCHA activo — abortando ciclo");
             break;
           }
-          //Si el usuario pausó o deshabilitó la feature mid-tanda, parar
+          //Si el usuario deshabilitó la feature mid-tanda, parar
           //inmediatamente sin procesar la siguiente orden.
-          if (core.isPaused() || !habilitada) {
-            core.log("finalizar", "pausa/deshabilitación detectada mid-ciclo — corto");
+          if (!habilitada) {
+            core.log("finalizar", "deshabilitación detectada mid-ciclo — corto");
             break;
           }
           const ok = await finalizarGratis(orden);
@@ -267,8 +286,8 @@
         };
         persistirConstruccion();
 
-        //Respetar pausa/deshabilitación que pudo ocurrir durante el ciclo.
-        if (habilitada && !core.isPaused()) {
+        //Si se deshabilitó mid-ciclo, no reagendamos. Igual respeta CAPTCHA.
+        if (habilitada) {
           programarSiguienteTick(msEspera);
         }
       } finally {
@@ -310,13 +329,68 @@
 
     const NOMBRE_COLECCION = "BuildingOrders";
 
-    function obtenerListaCiudades() {
-      //recoleccion poblá data.ciudadesConAldeas en su init. Como el bootstrap
-      //ejecuta recoleccion.init antes que el nuestro, debería estar lista.
+    //Cache de la lista de ciudades propias. Refetch HTTP propio cada
+    //LISTA_TTL — no dependemos de que recoleccion haya corrido. Si por la
+    //razón que sea recoleccion ya cargó `data.ciudadesConAldeas` la usamos
+    //como dato inicial barato, pero el refresco lo manejamos nosotros.
+    const LISTA_TTL_MS = 30 * 60 * 1000;
+    let listaCiudadesCache = [];
+    let listaCiudadesTs = 0;
+    //Mapa townId → nombre, para que `nombreCiudad()` siga funcionando sin
+    //depender de recoleccion. Si recoleccion también la tiene, las dos
+    //fuentes coexisten — `nombreCiudad()` consulta primero la propia.
+    const nombrePorCiudad = new Map();
+
+    async function obtenerListaCiudades() {
+      const ahora = Date.now();
+      if (listaCiudadesCache.length && ahora - listaCiudadesTs < LISTA_TTL_MS) {
+        return listaCiudadesCache;
+      }
+      //Refetch propio de la colección Towns. Igual patrón que mercadoOro:
+      //un GET por mundo, dispatchea las notifs (Town, BuildingOrders, etc.)
+      //para que la UI del juego se mantenga al día.
+      try {
+        const json = `{"collections":{"Towns":[]},"town_id":${townId},"nl_init":false}`;
+        const url = `https://${world_id}.grepolis.com/game/frontend_bridge?town_id=${townId}&action=refetch&h=${csrfToken}&json=${encodeURIComponent(json)}`;
+        const res = await fetch(url, {
+          method: "GET",
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            accept: "text/plain, */*; q=0.01",
+          },
+        });
+        const parsed = await res.json();
+        const notifs = parsed && parsed.json && parsed.json.notifications;
+        if (Array.isArray(notifs) && notifs.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifs },
+          }));
+        }
+        const items =
+          (parsed && parsed.json && parsed.json.collections &&
+           parsed.json.collections.Towns && parsed.json.collections.Towns.data) || [];
+        const lista = [];
+        for (const it of items) {
+          const c = it.d || it;
+          if (c && c.id) {
+            lista.push(c.id);
+            if (c.name) nombrePorCiudad.set(Number(c.id), String(c.name));
+          }
+        }
+        if (lista.length) {
+          listaCiudadesCache = lista;
+          listaCiudadesTs = ahora;
+          return lista;
+        }
+      } catch (e) {
+        core.logWarn("finalizar", `refetch lista de ciudades falló: ${e.message}`);
+      }
+      //Fallback: si el refetch falló y recoleccion ya tiene la lista, usarla
+      //para no quedar bloqueados. Se reintentará en el próximo ciclo.
       if (Array.isArray(data.ciudadesConAldeas) && data.ciudadesConAldeas.length) {
         return data.ciudadesConAldeas.map((c) => c.codigoCiudad);
       }
-      return [];
+      return listaCiudadesCache; //puede ser []
     }
 
     async function fetchColaCiudad(cityId) {
@@ -331,6 +405,22 @@
         },
       });
       const parsed = await res.json();
+
+      //Re-dispatch las notifications a Backbone. CRÍTICO: este refetch corre
+      //por cada ciudad cada ciclo, y la respuesta incluye notifs de Town,
+      //BuildingOrders, UnitOrders, Units, etc. Si las consumimos sin reenviar,
+      //el juego no se entera de:
+      //  - edificios que terminaron (cola congelada en la UI)
+      //  - free completion (5 min) o compra con oro (cola sigue mostrando)
+      //  - unidades que se terminaron de reclutar en el cuartel
+      //El server las marca como entregadas a la sesión: si no las pasamos al
+      //MM, esa info se pierde hasta que el jugador cambie de ciudad.
+      const notifs = parsed && parsed.json && parsed.json.notifications;
+      if (Array.isArray(notifs) && notifs.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifs },
+        }));
+      }
 
       const items =
         (parsed &&
@@ -360,11 +450,11 @@
     }
 
     async function obtenerColasConstruccion() {
-      const ciudades = obtenerListaCiudades();
+      const ciudades = await obtenerListaCiudades();
       if (!ciudades.length) {
         core.logWarn(
           "finalizar",
-          "no hay ciudades en data.ciudadesConAldeas — recoleccion todavía no las cargó?"
+          "no obtuve ninguna ciudad del refetch — reintento próximo ciclo"
         );
         return [];
       }
@@ -485,6 +575,18 @@
       registrarFinalizada(orden, String(response.json.success || ""), town_nombre);
       return true;
     }
+
+    //—— API expuesta al panel ————————————————————————————————————————————
+    //La tab "Construcción" llama estas funciones para encender/apagar el
+    //ciclo desde su propio botón. No usa el play/pause global.
+    JamBot.features.finalizarConstruccion.api = {
+      setHabilitada,
+      isHabilitada: () => habilitada,
+    };
+
+    //Arranque automático si el flag persistido estaba en true. Igual que el
+    //resto de features autónomas (mercadoOro, ataquesEntrantes).
+    reconciliar();
   }
 
   JamBot.features.finalizarConstruccion = { init };

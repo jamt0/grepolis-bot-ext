@@ -652,6 +652,54 @@
     const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "defensa", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
+
+    //Scroll persistente por tab. `scrollPorTab[tabId] = scrollTop` permite
+    //que al abrir el panel se restituya el último punto en el que estaba
+    //scrolleado el tab activo, y que al cambiar de tab y volver se conserve
+    //el scroll de cada uno. Persistido con debounce de 300ms.
+    const STORAGE_KEY_SCROLLS = "jambotTabScrolls";
+    let scrollPorTab = {};
+    try {
+      scrollPorTab = JSON.parse(window.localStorage.getItem(STORAGE_KEY_SCROLLS) || "{}") || {};
+    } catch (_) { scrollPorTab = {}; }
+    let saveScrollTimer = null;
+    function persistirScrolls() {
+      if (saveScrollTimer) return;
+      saveScrollTimer = setTimeout(() => {
+        saveScrollTimer = null;
+        try { window.localStorage.setItem(STORAGE_KEY_SCROLLS, JSON.stringify(scrollPorTab)); } catch (_) {}
+      }, 300);
+    }
+    //Mientras renderizamos el body, ignorar todos los scroll events: el
+    //`body.innerHTML = ""` de los renders resetea scrollTop a 0 y dispara
+    //un scroll event espurio que sin este flag sobrescribiría el último
+    //valor real del usuario con 0.
+    let renderingBody = false;
+    function snapshotScroll(body) {
+      if (!body || renderingBody) return;
+      scrollPorTab[tabActivo] = body.scrollTop;
+      persistirScrolls();
+    }
+    function restaurarScroll(body) {
+      if (!body) return;
+      const target = scrollPorTab[tabActivo] || 0;
+      body.scrollTop = target;
+    }
+    //Wrapper para ejecutar un render del body preservando el scroll del tab
+    //activo: marca renderingBody alrededor del render, hace el render, y
+    //restaura el scrollTop en el siguiente frame (cuando el layout del
+    //nuevo HTML ya está aplicado y scrollTop no se clampea).
+    function renderConScroll(body, render) {
+      if (!body) { render(); return; }
+      renderingBody = true;
+      render();
+      requestAnimationFrame(() => {
+        restaurarScroll(body);
+        //Soltar el flag tras una microtask para que el scroll event del
+        //`body.scrollTop = target` también caiga dentro de la ventana.
+        setTimeout(() => { renderingBody = false; }, 0);
+      });
+    }
     //Subtab dentro del tab "Recolección". "ciudades" muestra el estado live
     //por aldea (cooldown, próxima claim, dots históricos); "ciclos" muestra
     //la vista clásica con el ciclo actual + último + anteriores. Default a
@@ -781,19 +829,21 @@
       panel.style.display = "flex";
       renderPanelConfig(panel);
       intervalActualizarPanel = setInterval(() => {
-        actualizarHeaderPanel(panel);
         //Re-render del body solo en tabs dinámicos: Recolección muestra
         //tiempos relativos / progreso en vivo, Construcción muestra
         //countdown de cada orden — ambos cambian cada segundo. Settings
         //es estático y no necesita repintar.
         const body = panel.querySelector(".pcj-body");
         if (!body) return;
-        if (tabActivo === "dashboard") renderTabDashboard(body);
-        else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
-        else if (tabActivo === "construccion") renderTabConstruccion(body);
-        else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
-        else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
-        else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
+        renderConScroll(body, () => {
+          if (tabActivo === "dashboard") renderTabDashboard(body);
+          else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
+          else if (tabActivo === "construccion") renderTabConstruccion(body);
+          else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+          else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
+          else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
+          else if (tabActivo === "comercio") renderTabComercioDelegado(body);
+        });
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
       //(que de todos modos nos retornamos antes en outsideClickHandler).
@@ -835,20 +885,20 @@
 
       panel.appendChild(titulo);
 
-      //Header de control: pill de estado + countdown + botón play/pause.
-      //FIJO en todos los tabs (antes vivía solo en el Dashboard).
-      const header = document.createElement("div");
-      header.id = "panelHeaderEstado";
-      header.style.cssText =
-        "padding:10px 12px;border-bottom:1px solid #2c3a4d;background:#1a232e";
-      panel.appendChild(header);
-      actualizarHeaderPanel(panel);
+      //El header global con play/pause ya no existe. El botón pertenece a
+      //un solo módulo (Recolección) — vive como banner en la tab Recolección
+      //(renderBannerRecoleccion). Los otros módulos tienen su propio
+      //control en su tab (Construcción / Ataques) o no necesitan
+      //(Defensa / Oro, que monitorean siempre).
 
-      //Tabs
+      //Tabs — horizontalmente scrollables. Antes usaban flex:1 y se
+      //comprimían cuando había muchos módulos; ahora cada tab toma su ancho
+      //natural y la barra hace overflow-x:auto si no caben todos.
       const tabs = document.createElement("div");
       tabs.className = "pcj-tabs";
       tabs.style.cssText =
-        "display:flex;border-bottom:1px solid #2c3a4d;background:#172029";
+        "display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;" +
+        "border-bottom:1px solid #2c3a4d;background:#172029";
       tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
@@ -856,6 +906,7 @@
       tabs.appendChild(crearBotonTab("ataques", "Ataques"));
       tabs.appendChild(crearBotonTab("defensa", "Defensa"));
       tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
+      tabs.appendChild(crearBotonTab("comercio", "Comercio"));
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -867,16 +918,20 @@
       body.className = "pcj-body";
       body.style.cssText =
         "padding:10px 12px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden";
+      body.addEventListener("scroll", () => snapshotScroll(body), { passive: true });
       panel.appendChild(body);
-      renderTabActivo(body);
+      renderConScroll(body, () => renderTabActivo(body));
     }
 
     function crearBotonTab(id, label) {
       const b = document.createElement("button");
       b.textContent = label;
       const activo = tabActivo === id;
+      //flex-shrink:0 + white-space:nowrap → cada tab toma su ancho natural
+      //y no se comprime; la barra .pcj-tabs hace overflow-x:auto.
       b.style.cssText =
-        `flex:1;padding:10px 12px;background:${activo ? "#1f2a36" : "transparent"};` +
+        `flex:0 0 auto;padding:10px 16px;white-space:nowrap;` +
+        `background:${activo ? "#1f2a36" : "transparent"};` +
         `color:${activo ? "#3498db" : "#7a8aa0"};border:none;` +
         `border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
         "cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:0.3px;" +
@@ -892,6 +947,14 @@
         });
       }
       b.addEventListener("click", () => {
+        //Guardar el scroll del tab actual ANTES de cambiar tabActivo —
+        //sino el snapshotScroll del scroll-event subsiguiente apuntaría
+        //al tab nuevo y nos perderíamos el último punto del viejo.
+        const bodyActual = document.querySelector("#panelConfigJam .pcj-body");
+        if (bodyActual) {
+          scrollPorTab[tabActivo] = bodyActual.scrollTop;
+          persistirScrolls();
+        }
         tabActivo = id;
         window.localStorage.setItem(STORAGE_KEY_TAB, id);
         renderPanelConfig(document.getElementById("panelConfigJam"));
@@ -907,6 +970,7 @@
       else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
       else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
       else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
+      else if (tabActivo === "comercio") renderTabComercioDelegado(body);
       else renderTabRecoleccion(body);
     }
 
@@ -957,16 +1021,31 @@
       api.renderTab(body);
     }
 
-    function actualizarHeaderPanel(panel) {
-      const header = panel.querySelector("#panelHeaderEstado");
-      if (!header) return;
+    function renderTabComercioDelegado(body) {
+      const api = JamBot.features.comercio && JamBot.features.comercio.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de comercio todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
 
+    //Banner Iniciar/Pausar del módulo Recolección. Vive en la tab
+    //Recolección (no en un header global): el play/pause controla SOLO la
+    //recolección de aldeas, no afecta a los otros módulos (cada uno tiene
+    //su propio control). Replica visualmente lo que era el header global,
+    //pero scopeado a este módulo.
+    function renderBannerRecoleccion() {
       const captcha = core.isCaptchaActive();
       const captchaState = core.getCaptchaState ? core.getCaptchaState() : (captcha ? "pending" : "none");
       const pausado = core.isPaused();
       //En "pending" mostramos pill rojo "CAPTCHA" y deshabilitamos el botón
-      //(el usuario tiene que resolver vía el cartel del tab Recolección).
-      //En "timeout" mostramos pill gris "TIMEOUT" pero el botón Iniciar SE
+      //(el usuario tiene que resolver vía el cartel grande debajo del
+      //banner). En "timeout" pill gris "TIMEOUT" pero el botón Iniciar SE
       //HABILITA — apretarlo limpia el captcha y arranca un ciclo nuevo.
       const colorPill =
         captchaState === "pending" ? "#e74c3c" :
@@ -992,12 +1071,14 @@
         proximoColor = "#cdd5e0";
       }
 
-      header.innerHTML = "";
       const wrap = document.createElement("div");
-      wrap.style.cssText = "display:flex;align-items:center;gap:10px";
+      wrap.style.cssText =
+        "display:flex;align-items:center;gap:10px;padding:10px 12px;" +
+        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
+        `border-left:3px solid ${colorPill};margin-bottom:10px`;
 
       const izq = document.createElement("div");
-      izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0";
       izq.innerHTML =
         statusPill(label, colorPill) +
         `<span style="color:${proximoColor};font-size:11.5px">${proximoTexto}</span>`;
@@ -1018,7 +1099,7 @@
         btn.disabled = true;
         btn.style.opacity = "0.5";
         btn.style.cursor = "not-allowed";
-        btn.title = "Resolvé el CAPTCHA primero (botón en el tab Recolección)";
+        btn.title = "Resolvé el CAPTCHA primero (cartel debajo)";
       }
       btn.addEventListener("click", () => {
         if (bloqueadoPorCaptcha) return;
@@ -1029,14 +1110,16 @@
           core.onCaptchaResuelto();
         }
         core.togglePlayPause();
-        //Repaint inmediato del header — sin esto el botón se quedaba con
-        //el label viejo hasta el siguiente tick del setInterval (1s),
-        //como si el click no hubiera tomado.
-        actualizarHeaderPanel(panel);
+        //Repaint inmediato del body — sin esto el banner queda con el label
+        //viejo hasta el siguiente tick del setInterval (1s), como si el
+        //click no hubiera tomado.
+        const panel = document.getElementById("panelConfigJam");
+        const body = panel && panel.querySelector(".pcj-body");
+        if (body) renderTabRecoleccion(body);
       });
       wrap.appendChild(btn);
 
-      header.appendChild(wrap);
+      return wrap;
     }
 
     //—— Tab Dashboard ——————————————————————————————————————————————————
@@ -1052,9 +1135,10 @@
 
     function renderTabDashboard(body) {
       body.innerHTML = "";
-      //La barra de estado + botón play/pause vive en el header global del
-      //panel (visible en TODOS los tabs), no acá. Antes estaba duplicada
-      //en este Dashboard — quedaba inconsistente al saltar a otros tabs.
+      //El botón Iniciar/Pausar de Recolección vive en su propia tab
+      //(renderBannerRecoleccion), no acá. Cada módulo (Recolección,
+      //Construcción, Ataques) tiene su propio control en su tab, y los
+      //monitores (Defensa, Oro) no necesitan. Dashboard es solo métricas.
 
       //Métricas de Recolección
       body.appendChild(crearTituloSeccion("Recolección"));
@@ -1251,9 +1335,9 @@
     //—— Tab Settings (configuración) ——————————————————————————————————————
 
     function renderTabSettings(body) {
-      //Sección: features globales
-      body.appendChild(crearTituloSeccion("Funciones"));
-      body.appendChild(crearFilaToggleFinalizar());
+      //El toggle de "Finalizar construcción gratis" ya no vive acá — cada
+      //módulo es independiente y tiene su propio control en su tab. El de
+      //finalizar está en la tab "Construcción" como banner Iniciar/Detener.
 
       //Sección: tiempo por ciudad
       body.appendChild(crearTituloSeccion("Tiempo de recolección por ciudad"));
@@ -1637,6 +1721,11 @@
 
     function renderTabRecoleccion(body) {
       body.innerHTML = "";
+
+      //Banner Iniciar/Pausar — exclusivo del módulo recolección. Está
+      //ARRIBA del cartel de CAPTCHA para que el usuario vea de un vistazo
+      //el estado y el botón sin scrollear.
+      body.appendChild(renderBannerRecoleccion());
 
       if (core.isCaptchaActive && core.isCaptchaActive()) {
         body.appendChild(renderCartelCaptcha());
@@ -2082,28 +2171,50 @@
         return;
       }
 
-      //Header de estado de la feature — 2 cards lado a lado
-      const headerWrap = document.createElement("div");
-      headerWrap.style.cssText =
-        "display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px";
+      //Banner Iniciar/Detener propio del módulo — independiente del
+      //play/pause global del bot. Cambia el flag persistido vía la API
+      //expuesta por finalizarConstruccion.js.
+      const api =
+        JamBot.features.finalizarConstruccion &&
+        JamBot.features.finalizarConstruccion.api;
+      const habilitada = api ? !!api.isHabilitada() : !!ds.habilitada;
+      const estadoColor = habilitada ? "#27ae60" : "#7a8aa0";
+      const estadoTxt = habilitada ? "Activa" : "Detenida";
 
-      const estadoColor = !ds.habilitada ? "#7a8aa0" : (core.isPaused() ? "#27ae60" : "#3498db");
-      const estadoTxt = !ds.habilitada ? "Deshabilitada"
-        : core.isPaused() ? "Pausada"
-        : "Activa";
-      const estadoSub = !ds.habilitada ? "Activar en Settings"
-        : core.isPaused() ? "Bot global pausado"
-        : "";
+      const banner = document.createElement("div");
+      banner.style.cssText =
+        `display:flex;align-items:center;gap:10px;padding:10px 12px;` +
+        `background:#172029;border:1px solid #2c3a4d;border-radius:4px;` +
+        `border-left:3px solid ${estadoColor};margin-bottom:10px`;
+      const izq = document.createElement("div");
+      izq.style.cssText = "flex:1;min-width:0";
+      const titulo = document.createElement("div");
+      titulo.textContent = `Finalizar construcción gratis · ${estadoTxt}`;
+      titulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
+      const sub = document.createElement("div");
+      sub.textContent = habilitada
+        ? "Activa el botón \"Gratis\" cuando faltan <5 min en cualquier ciudad"
+        : "Apretá Iniciar para que el módulo arranque su propio ciclo";
+      sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
+      izq.appendChild(titulo);
+      izq.appendChild(sub);
+      banner.appendChild(izq);
 
-      const card1 = document.createElement("div");
-      card1.style.cssText =
-        `padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid ${estadoColor}`;
-      card1.innerHTML =
-        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Estado</div>` +
-        `<div style="color:${estadoColor};font-weight:bold;font-size:14px;margin-top:2px">${estadoTxt}</div>` +
-        (estadoSub ? `<div style="color:#7a8aa0;font-size:10px;margin-top:1px">${estadoSub}</div>` : "");
-      headerWrap.appendChild(card1);
+      const btn = document.createElement("button");
+      btn.textContent = habilitada ? "⏸  Detener" : "▶  Iniciar";
+      btn.style.cssText =
+        `padding:6px 14px;background:${habilitada ? "#7a8aa0" : "#27ae60"};` +
+        `color:#fff;border:none;border-radius:4px;cursor:pointer;` +
+        `font-weight:bold;font-size:12px;letter-spacing:0.3px;flex-shrink:0`;
+      btn.addEventListener("click", () => {
+        if (!api) return;
+        api.setHabilitada(!api.isHabilitada());
+        renderTabConstruccion(body);
+      });
+      banner.appendChild(btn);
+      body.appendChild(banner);
 
+      //Próximo tick — info secundaria
       let proximoTxt = "—";
       if (ds.proximoTickAt) {
         const seg = Math.max(0, Math.round((ds.proximoTickAt - Date.now()) / 1000));
@@ -2111,13 +2222,11 @@
       }
       const card2 = document.createElement("div");
       card2.style.cssText =
-        "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid #3498db";
+        "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid #3498db;margin-bottom:10px";
       card2.innerHTML =
         `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Próximo tick</div>` +
         `<div style="color:#cdd5e0;font-weight:bold;font-size:14px;margin-top:2px">${proximoTxt}</div>`;
-      headerWrap.appendChild(card2);
-
-      body.appendChild(headerWrap);
+      body.appendChild(card2);
 
       //Sección 1: último ciclo
       if (ds.ultimoCiclo) {
@@ -2704,7 +2813,6 @@
         actualizarEstadoCard();
         const panel = document.getElementById("panelConfigJam");
         if (panel && panel.style.display !== "none") {
-          actualizarHeaderPanel(panel);
           if (tabActivo === "recoleccion") {
             const body = panel.querySelector(".pcj-body");
             if (body) renderTabRecoleccion(body);
@@ -2749,6 +2857,15 @@
           { method: "GET", headers: { "X-Requested-With": "XMLHttpRequest", accept: "text/plain, */*; q=0.01" } }
         );
         res = await res.json();
+        //Re-dispatch notifs a Backbone para que el juego refresque su UI con
+        //los cambios que el server hizo durante el CAPTCHA (cooldowns,
+        //recursos, cola, etc.). Sin esto la UI puede quedar stale.
+        const notifs = res && res.json && res.json.notifications;
+        if (Array.isArray(notifs) && notifs.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifs },
+          }));
+        }
         return (res && res.json && res.json.json && res.json.json.farm_town_list) || null;
       } catch (e) {
         core.logError("recoleccion", `refrescarAldeasCiudad falló (ciudad=${codigoCiudad})`, e);
@@ -4094,6 +4211,14 @@
         },
       });
       res = await res.json();
+      //Re-dispatch notifs (Town, BuildingOrders, Units, etc.) para que la
+      //UI del juego no quede stale tras este refetch del mapa de relaciones.
+      const notifs = res && res.json && res.json.notifications;
+      if (Array.isArray(notifs) && notifs.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifs },
+        }));
+      }
 
       const items =
         (res.json &&
@@ -4126,6 +4251,15 @@
         }
       );
       ciudadesJugador = await ciudadesJugador.json();
+      //Re-dispatch notifs antes de consumir el payload — el bootstrap dispara
+      //este refetch al arrancar la página, y el server suele incluir el
+      //estado actual de Town/BuildingOrders que el juego necesita ver.
+      const notifsCJ = ciudadesJugador && ciudadesJugador.json && ciudadesJugador.json.notifications;
+      if (Array.isArray(notifsCJ) && notifsCJ.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifsCJ },
+        }));
+      }
       ciudadesJugador = ciudadesJugador.json.collections.Towns.data;
 
       //Para reportar cuántas aldeas vienen ya con cooldown server vivo desde
@@ -4149,6 +4283,15 @@
           }
         );
         aldeasCiudad = await aldeasCiudad.json();
+        //Re-dispatch notifs por ciudad. Bootstrap recorre N ciudades — cada
+        //island_info devuelve notifs que el juego necesita para mantener su
+        //UI sincronizada (recursos, cola, tropas).
+        const notifsAC = aldeasCiudad && aldeasCiudad.json && aldeasCiudad.json.notifications;
+        if (Array.isArray(notifsAC) && notifsAC.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifsAC },
+          }));
+        }
         aldeasCiudad = aldeasCiudad.json.json.farm_town_list;
 
         //Cada aldea trae `loot` (timestamp Unix en segundos): el momento en
