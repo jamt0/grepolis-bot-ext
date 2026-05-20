@@ -102,6 +102,14 @@ Si no aparecen:
 - Abrí DevTools (`F12`) → tab **Console** y buscá errores con prefijo `[JamBot/...]`.
 - El error más común: `"window.JamBot incompleto"`. Significa que el orden de carga del manifest es incorrecto — verificá que no hayas modificado `manifest.json`.
 
+### 3.5. Primera vez: ingresar la contraseña
+
+Al hacer click por primera vez en la card **Jam**, el bot te pide una contraseña para desbloquear el panel.
+
+- **Contraseña**: `JamMiPapá`
+
+Ingresala y apretá **Desbloquear**. El panel queda habilitado para esa pestaña — si recargás la pestaña, te la vuelve a pedir (no se persiste, vive solo en memoria de la sesión).
+
 ---
 
 ## 4. Cómo usarlo
