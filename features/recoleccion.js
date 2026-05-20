@@ -21,6 +21,13 @@
 
     const ciudadesConAldeas = [];
     const recursosPrevPorCiudad = {};
+    //Cap del almacén por ciudad — se cachea del campo `storage` que viene
+    //en el payload Town de cada claim exitoso. Lo usamos para distinguir
+    //"almacén lleno" de "CAPTCHA real" cuando el server devuelve success:true
+    //pero sin notification 'Town' (caso lleno: nada cambió en el town →
+    //server no emite el evento; antes lo confundíamos con CAPTCHA y parábamos
+    //el ciclo entero).
+    const storageCapPorCiudad = {};
     //Última vez que cada ALDEA individual fue claimada con éxito. Clave =
     //farm_town_id (aldea.id). El cooldown server es por aldea, no por
     //ciudad: si un ciclo se corta a mitad por CAPTCHA, las aldeas que
@@ -433,6 +440,45 @@
     //clickear sin querer. Esta card es solo un "abridor".
 
     const panelConfig = crearPanelConfig();
+
+    //Trigger one-shot del modal RECURSOS: la pwd se pide al PRIMER click
+    //en la card Jam de cada carga. Si el usuario cancela, no se le vuelve
+    //a preguntar (queda con los 3 tabs libres). Al F5 el flag se resetea
+    //y vuelve a pedir.
+    let recursosPwdYaSolicitada = false;
+
+    //Cuando una pwd se ingresa OK en runtime (RECURSOS desde la card,
+    //PREMIUM desde Settings), re-renderear el panel para que aparezcan
+    //los tabs nuevos. Si está cerrado, no hace falta — al abrirse se
+    //construye con el estado actual.
+    const reRenderSiAbierto = () => {
+      const panel = document.getElementById("panelConfigJam");
+      if (panel && panel.style.display !== "none") renderPanelConfig(panel);
+    };
+    core.onRecursosUnlock(reRenderSiAbierto);
+    core.onPremiumUnlock(reRenderSiAbierto);
+    //Repintar el slime cuando se desbloquea PREMIUM (rosa → morado).
+    core.onPremiumUnlock(() => pintarSlime());
+
+    //Paleta del slime de la card "Jam". Morado cuando hay PREMIUM, rosa
+    //cuando no — para que el usuario vea de un vistazo si tiene los
+    //features avanzados activos.
+    function coloresSlime() {
+      return core.isPremiumUnlocked()
+        ? { fill: "#9b59b6", stroke: "#7d3c98" }  // morado premium
+        : { fill: "#e91e63", stroke: "#ad1457" }; // rosa sin premium
+    }
+
+    //Repinta el body del slime in-situ sin remontar la card. Se llama
+    //cuando se dispara onPremiumUnlock.
+    function pintarSlime() {
+      const body = document.querySelector("#jambot-card .jambot-slime-body");
+      if (!body) return;
+      const { fill, stroke } = coloresSlime();
+      body.setAttribute("fill", fill);
+      body.setAttribute("stroke", stroke);
+    }
+
     crearCardJam();
 
     function crearCardJam() {
@@ -459,22 +505,24 @@
         "font-family:'Segoe UI',sans-serif;font-size:13px;font-weight:bold;" +
         "letter-spacing:0.3px;box-shadow:0 2px 6px rgba(0,0,0,0.3);" +
         "transition:background 0.15s,border-color 0.15s";
-      //SVG slime: blob verde con dos ojitos. No hay emoji estándar de
-      //slime; un SVG inline queda más limpio que cualquier emoji forzado.
+      //SVG slime: blob con dos ojitos. Color depende del estado PREMIUM —
+      //morado si está desbloqueado, rosa si no. La clase en el path
+      //principal nos permite repintar in-situ cuando se dispara el unlock
+      //sin tener que remontar la card.
+      const { fill, stroke } = coloresSlime();
       card.innerHTML =
         `<svg width="22" height="22" viewBox="0 0 24 24" style="flex-shrink:0">
            <ellipse cx="12" cy="19" rx="10" ry="3" fill="rgba(0,0,0,0.25)"/>
-           <path d="M3 17 Q3 7 12 5 Q21 7 21 17 Q21 20 12 20 Q3 20 3 17 Z"
-                 fill="#27ae60" stroke="#1e8449" stroke-width="0.8"/>
+           <path class="jambot-slime-body"
+                 d="M3 17 Q3 7 12 5 Q21 7 21 17 Q21 20 12 20 Q3 20 3 17 Z"
+                 fill="${fill}" stroke="${stroke}" stroke-width="0.8"/>
            <path d="M5 12 Q12 4 19 12 Q12 9 5 12 Z" fill="rgba(255,255,255,0.18)"/>
            <circle cx="9" cy="13" r="1.6" fill="#fff"/>
            <circle cx="15" cy="13" r="1.6" fill="#fff"/>
            <circle cx="9.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
            <circle cx="15.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
          </svg>
-         <span>Jam</span>
-         <span id="jambot-card-estado" style="margin-left:4px;font-size:14px"></span>
-         <span id="jambot-card-countdown" style="margin-left:6px;font-size:11px;font-family:monospace;color:#7a8aa0;font-weight:normal"></span>`;
+         <span>Jam</span>`;
       card.addEventListener("mouseenter", () => {
         card.style.background = "#26344a";
         card.style.borderColor = "#3498db";
@@ -483,7 +531,16 @@
         card.style.background = "#1f2a36";
         card.style.borderColor = "#2c3a4d";
       });
-      card.addEventListener("click", () => {
+      card.addEventListener("click", async () => {
+        //Primer click de la sesión y RECURSOS sin desbloquear → modal.
+        //Esperamos que el usuario confirme o cancele antes de abrir el
+        //panel; si confirma, el evento onRecursosUnlock va a re-renderear
+        //sobre el panel ya abierto, así no hay race.
+        if (!core.isRecursosUnlocked() && !recursosPwdYaSolicitada) {
+          recursosPwdYaSolicitada = true;
+          await core.pedirContraseñaRecursos();
+        }
+
         //Click en la card normalmente lleva a Dashboard. EXCEPCIÓN: cuando
         //hay CAPTCHA pendiente, lleva a Recolección — ahí está el cartel
         //con el botón "Ya resolví", que es lo único que el usuario quiere
@@ -507,79 +564,9 @@
       return card;
     }
 
-    function actualizarEstadoCard() {
-      const card = document.getElementById("jambot-card");
-      const span = document.getElementById("jambot-card-estado");
-      const captchaActivo = core.isCaptchaActive();
-      const captchaState = core.getCaptchaState ? core.getCaptchaState() : "none";
-      const ctx = core.getCaptchaContext ? core.getCaptchaContext() : null;
-      const resueltoEnJuego = core.isCaptchaResueltoEnJuego && core.isCaptchaResueltoEnJuego();
-
-      if (span) {
-        if (captchaActivo) {
-          span.textContent = captchaState === "timeout" ? "⏱" : "⚠";
-          span.style.color = captchaState === "timeout" ? "#7a8aa0" : "#e74c3c";
-        } else if (core.isPaused()) {
-          span.textContent = "▶";
-          span.style.color = "#27ae60";
-        } else {
-          //Corriendo: sin icono. El countdown / spinner indican actividad.
-          //Antes mostrábamos ⏸ pero confunde — leer "pausa" cuando en
-          //realidad está corriendo.
-          span.textContent = "";
-        }
-      }
-
-      //Cuando hay CAPTCHA, además del ⚠ pintamos el borde rojo (o verde
-      //si el bridge ya detectó que el captcha del juego se limpió y solo
-      //falta el click "Ya resolví"). En timeout queda gris.
-      if (card) {
-        if (captchaActivo) {
-          card.style.borderColor =
-            captchaState === "timeout" ? "#7a8aa0" :
-            resueltoEnJuego ? "#27ae60" : "#e74c3c";
-          //Tooltip con el contexto.
-          if (ctx && ctx.ciudad && ctx.aldea) {
-            card.title = `CAPTCHA · ${ctx.ciudad.nombre} → ${ctx.aldea.nombre} (click para resolver)`;
-          } else {
-            card.title = "CAPTCHA pendiente — click para resolver";
-          }
-        } else {
-          //Restaurar el borde default (lo manejan los hover handlers).
-          card.style.borderColor = "#2c3a4d";
-          card.title = "";
-        }
-      }
-
-      //Indicador secundario (countdown / spinner / texto CAPTCHA).
-      const cd = document.getElementById("jambot-card-countdown");
-      if (cd) {
-        if (captchaActivo && ctx && ctx.aldea) {
-          //Mostrar la aldea que falló — el usuario lee el pulpo y ya sabe
-          //cuál tiene que recolectar manual sin abrir el panel.
-          cd.innerHTML = `<span style="color:#f39c12">${escapeHtml(ctx.aldea.nombre)}</span>`;
-        } else if (cicloActual) {
-          cd.innerHTML = `<span class="jambot-spinner"></span>`;
-        } else if (proximoTickAt && !core.isPaused()) {
-          const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
-          cd.textContent = core.formatDuracion(seg);
-        } else {
-          cd.innerHTML = "";
-        }
-      }
-    }
-    actualizarEstadoCard();
-    //Tick de 1s SOLO para refrescar el countdown al próximo ciclo.
-    //El spinner es CSS puro y los demás estados se actualizan por evento
-    //(onPlayPauseChange/onCaptcha) o por llamadas explícitas, así que el
-    //interval en sí mismo no es necesario para esos casos. Igual lo
-    //dejamos siempre activo: actualizarEstadoCard es barato (lee globals
-    //y toca 2-3 nodos) y simplifica el ciclo de vida — no hay que
-    //arrancar/parar el interval según el estado.
-    setInterval(actualizarEstadoCard, 1000);
-
-    //Reaccionar al play/pause global: cancelar tick al pausar, arrancar al
-    //despausar. El estado se sincroniza con `core.isPaused()`.
+    //Reaccionar al play/pause global: cancelar tick al pausar, arrancar
+    //al despausar. La card ya no muestra estado/countdown, así que acá
+    //solo manejamos los timers del ciclo.
     core.onPlayPauseChange((p) => {
       if (p) {
         if (proximoTickId) clearTimeout(proximoTickId);
@@ -587,9 +574,7 @@
         proximoTickId = null;
         proximoTickAt = null;
         watchdogId = null;
-        actualizarEstadoCard();
       } else {
-        actualizarEstadoCard();
         recolectarRecursos();
       }
     });
@@ -642,17 +627,75 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion"];
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "defensa", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
+
+    //Scroll persistente por tab. `scrollPorTab[tabId] = scrollTop` permite
+    //que al abrir el panel se restituya el último punto en el que estaba
+    //scrolleado el tab activo, y que al cambiar de tab y volver se conserve
+    //el scroll de cada uno. Persistido con debounce de 300ms.
+    const STORAGE_KEY_SCROLLS = "jambotTabScrolls";
+    let scrollPorTab = {};
+    try {
+      scrollPorTab = JSON.parse(window.localStorage.getItem(STORAGE_KEY_SCROLLS) || "{}") || {};
+    } catch (_) { scrollPorTab = {}; }
+    let saveScrollTimer = null;
+    function persistirScrolls() {
+      if (saveScrollTimer) return;
+      saveScrollTimer = setTimeout(() => {
+        saveScrollTimer = null;
+        try { window.localStorage.setItem(STORAGE_KEY_SCROLLS, JSON.stringify(scrollPorTab)); } catch (_) {}
+      }, 300);
+    }
+    //Mientras renderizamos el body, ignorar todos los scroll events: el
+    //`body.innerHTML = ""` de los renders resetea scrollTop a 0 y dispara
+    //un scroll event espurio que sin este flag sobrescribiría el último
+    //valor real del usuario con 0.
+    let renderingBody = false;
+    function snapshotScroll(body) {
+      if (!body || renderingBody) return;
+      scrollPorTab[tabActivo] = body.scrollTop;
+      persistirScrolls();
+    }
+    function restaurarScroll(body) {
+      if (!body) return;
+      const target = scrollPorTab[tabActivo] || 0;
+      body.scrollTop = target;
+    }
+    //Wrapper para ejecutar un render del body preservando el scroll del tab
+    //activo: marca renderingBody alrededor del render, hace el render, y
+    //restaura el scrollTop en el siguiente frame (cuando el layout del
+    //nuevo HTML ya está aplicado y scrollTop no se clampea).
+    function renderConScroll(body, render) {
+      if (!body) { render(); return; }
+      renderingBody = true;
+      render();
+      requestAnimationFrame(() => {
+        restaurarScroll(body);
+        //Soltar el flag tras una microtask para que el scroll event del
+        //`body.scrollTop = target` también caiga dentro de la ventana.
+        setTimeout(() => { renderingBody = false; }, 0);
+      });
+    }
+    //Subtab dentro del tab "Recolección". "ciudades" muestra el estado live
+    //por aldea (cooldown, próxima claim, dots históricos); "ciclos" muestra
+    //la vista clásica con el ciclo actual + último + anteriores. Default a
+    //"ciudades" porque es lo que la mayoría del tiempo querés mirar.
+    const STORAGE_KEY_SUBTAB_RECOLECCION = "jambotRecoleccionSubtab";
+    const SUBTABS_RECOLECCION_VALIDOS = ["ciudades", "ciclos"];
+    let subtabRecoleccion = window.localStorage.getItem(STORAGE_KEY_SUBTAB_RECOLECCION) || "ciudades";
+    if (!SUBTABS_RECOLECCION_VALIDOS.includes(subtabRecoleccion)) subtabRecoleccion = "ciudades";
     //Estado de colapso del UI — vive en memoria nomás, no persiste.
     //  ciclos:        { actual: bool, ultimo: bool }      true = expandido
     //  aldeas:        { [id]: bool }                      true = expandido (historial)
     //  cicloCiudades: { [n]: { [id]: bool } }             true = expandido (ciudad dentro de un ciclo)
+    //  ciudades:      { [id]: bool }                      true = expandido (subtab "ciudades")
     const uiColapso = {
       ciclos: { actual: true, ultimo: true },
       aldeas: {},
       cicloCiudades: {},
+      ciudades: {},
       errores: false,
     };
 
@@ -668,19 +711,6 @@
           .pcj-row { transition: background 0.12s; }
           .pcj-row:hover { background: rgba(255,255,255,0.04) !important; }
           #panelConfigJam button:focus { outline: 2px solid #3498db44; outline-offset: 1px; }
-
-          /* Spinner para la card "Jam" cuando hay un ciclo en curso.
-             CSS-only (no depende de re-renders en JS). */
-          @keyframes jb-spin { to { transform: rotate(360deg); } }
-          .jambot-spinner {
-            display: inline-block;
-            width: 11px; height: 11px;
-            border: 2px solid rgba(255,255,255,0.15);
-            border-top-color: #f39c12;
-            border-radius: 50%;
-            animation: jb-spin 0.8s linear infinite;
-            vertical-align: -1px;
-          }
 
           /* Scrollbar custom alineado con el dark theme del panel.
              Solo aplica al body con scroll y a cualquier descendiente que
@@ -764,16 +794,22 @@
       panel.style.display = "flex";
       renderPanelConfig(panel);
       intervalActualizarPanel = setInterval(() => {
-        actualizarHeaderPanel(panel);
         //Re-render del body solo en tabs dinámicos: Recolección muestra
         //tiempos relativos / progreso en vivo, Construcción muestra
         //countdown de cada orden — ambos cambian cada segundo. Settings
         //es estático y no necesita repintar.
         const body = panel.querySelector(".pcj-body");
         if (!body) return;
-        if (tabActivo === "dashboard") renderTabDashboard(body);
-        else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
-        else if (tabActivo === "construccion") renderTabConstruccion(body);
+        renderConScroll(body, () => {
+          if (tabActivo === "dashboard") renderTabDashboard(body);
+          else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
+          else if (tabActivo === "construccion") renderTabConstruccion(body);
+          else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+          else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
+          else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
+          else if (tabActivo === "comercio") renderTabComercioDelegado(body);
+          else if (tabActivo === "hechizos") renderTabHechizosDelegado(body);
+        });
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
       //(que de todos modos nos retornamos antes en outsideClickHandler).
@@ -815,24 +851,44 @@
 
       panel.appendChild(titulo);
 
-      //Header de control: pill de estado + countdown + botón play/pause.
-      //FIJO en todos los tabs (antes vivía solo en el Dashboard).
-      const header = document.createElement("div");
-      header.id = "panelHeaderEstado";
-      header.style.cssText =
-        "padding:10px 12px;border-bottom:1px solid #2c3a4d;background:#1a232e";
-      panel.appendChild(header);
-      actualizarHeaderPanel(panel);
+      //El header global con play/pause ya no existe. El botón pertenece a
+      //un solo módulo (Recolección) — vive como banner en la tab Recolección
+      //(renderBannerRecoleccion). Los otros módulos tienen su propio
+      //control en su tab (Construcción / Ataques) o no necesitan
+      //(Defensa / Oro, que monitorean siempre).
 
-      //Tabs
+      //Tabs — horizontalmente scrollables. Antes usaban flex:1 y se
+      //comprimían cuando había muchos módulos; ahora cada tab toma su ancho
+      //natural y la barra hace overflow-x:auto si no caben todos.
       const tabs = document.createElement("div");
       tabs.className = "pcj-tabs";
       tabs.style.cssText =
-        "display:flex;border-bottom:1px solid #2c3a4d;background:#172029";
+        "display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;" +
+        "border-bottom:1px solid #2c3a4d;background:#172029";
+      //Tabs libres — siempre visibles.
       tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
-      tabs.appendChild(crearBotonTab("construccion", "Construcción"));
+      //Tabs protegidos — todos detrás de PREMIUM. Sin la pwd premium el
+      //usuario solo ve Dashboard / Settings / Recolección. Cuando se
+      //desbloquea, aparecen las 6 pestañas avanzadas de un saque.
+      const premiumUnlocked = core.isPremiumUnlocked && core.isPremiumUnlocked();
+      if (premiumUnlocked) {
+        tabs.appendChild(crearBotonTab("construccion", "Construcción"));
+        tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
+        tabs.appendChild(crearBotonTab("comercio", "Comercio"));
+        tabs.appendChild(crearBotonTab("ataques", "Ataques"));
+        tabs.appendChild(crearBotonTab("defensa", "Defensa"));
+        tabs.appendChild(crearBotonTab("hechizos", "Hechizos"));
+      }
+      //Si el usuario tenía persistido un tab protegido y ahora está
+      //locked (F5 o primer load), lo enviamos a Recolección — sino el
+      //body queda vacío.
+      const TABS_PROTEGIDOS = ["construccion", "mercadoOro", "comercio", "ataques", "defensa", "hechizos"];
+      if (TABS_PROTEGIDOS.includes(tabActivo) && !premiumUnlocked) {
+        tabActivo = "recoleccion";
+        try { window.localStorage.setItem(STORAGE_KEY_TAB, "recoleccion"); } catch (_) {}
+      }
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -844,16 +900,20 @@
       body.className = "pcj-body";
       body.style.cssText =
         "padding:10px 12px;flex:1;min-height:0;overflow-y:auto;overflow-x:hidden";
+      body.addEventListener("scroll", () => snapshotScroll(body), { passive: true });
       panel.appendChild(body);
-      renderTabActivo(body);
+      renderConScroll(body, () => renderTabActivo(body));
     }
 
     function crearBotonTab(id, label) {
       const b = document.createElement("button");
       b.textContent = label;
       const activo = tabActivo === id;
+      //flex-shrink:0 + white-space:nowrap → cada tab toma su ancho natural
+      //y no se comprime; la barra .pcj-tabs hace overflow-x:auto.
       b.style.cssText =
-        `flex:1;padding:10px 12px;background:${activo ? "#1f2a36" : "transparent"};` +
+        `flex:0 0 auto;padding:10px 16px;white-space:nowrap;` +
+        `background:${activo ? "#1f2a36" : "transparent"};` +
         `color:${activo ? "#3498db" : "#7a8aa0"};border:none;` +
         `border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
         "cursor:pointer;font-weight:bold;font-size:12px;letter-spacing:0.3px;" +
@@ -869,6 +929,14 @@
         });
       }
       b.addEventListener("click", () => {
+        //Guardar el scroll del tab actual ANTES de cambiar tabActivo —
+        //sino el snapshotScroll del scroll-event subsiguiente apuntaría
+        //al tab nuevo y nos perderíamos el último punto del viejo.
+        const bodyActual = document.querySelector("#panelConfigJam .pcj-body");
+        if (bodyActual) {
+          scrollPorTab[tabActivo] = bodyActual.scrollTop;
+          persistirScrolls();
+        }
         tabActivo = id;
         window.localStorage.setItem(STORAGE_KEY_TAB, id);
         renderPanelConfig(document.getElementById("panelConfigJam"));
@@ -881,19 +949,99 @@
       if (tabActivo === "dashboard") renderTabDashboard(body);
       else if (tabActivo === "settings") renderTabSettings(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
+      else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
+      else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
+      else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
+      else if (tabActivo === "comercio") renderTabComercioDelegado(body);
+      else if (tabActivo === "hechizos") renderTabHechizosDelegado(body);
       else renderTabRecoleccion(body);
     }
 
-    function actualizarHeaderPanel(panel) {
-      const header = panel.querySelector("#panelHeaderEstado");
-      if (!header) return;
+    //Delegamos el render de "Ataques" a la feature, que se mantiene
+    //self-contained en features/ataques.js. Si todavía no se inicializó,
+    //mostramos placeholder. Mismo patrón que podría aplicarse a otras
+    //features futuras.
+    function renderTabAtaquesDelegado(body) {
+      const api = JamBot.features.ataques && JamBot.features.ataques.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de ataques todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      //IMPORTANTE: NO limpiamos body acá. renderTab tiene su propio
+      //chequeo "skip si hay foco en input/select" que se rompía si
+      //borrábamos el contenido antes — el activeElement quedaba sin
+      //referencia y el input perdía foco/cursor cada segundo.
+      api.renderTab(body);
+    }
 
+    function renderTabMercadoOroDelegado(body) {
+      const api = JamBot.features.mercadoOro && JamBot.features.mercadoOro.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de mercado de oro todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabAtaquesEntrantesDelegado(body) {
+      const api = JamBot.features.ataquesEntrantes && JamBot.features.ataquesEntrantes.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de ataques entrantes todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabComercioDelegado(body) {
+      const api = JamBot.features.comercio && JamBot.features.comercio.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de comercio todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabHechizosDelegado(body) {
+      const api = JamBot.features.hechizos && JamBot.features.hechizos.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de hechizos todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    //Banner Iniciar/Pausar del módulo Recolección. Vive en la tab
+    //Recolección (no en un header global): el play/pause controla SOLO la
+    //recolección de aldeas, no afecta a los otros módulos (cada uno tiene
+    //su propio control). Replica visualmente lo que era el header global,
+    //pero scopeado a este módulo.
+    function renderBannerRecoleccion() {
       const captcha = core.isCaptchaActive();
       const captchaState = core.getCaptchaState ? core.getCaptchaState() : (captcha ? "pending" : "none");
       const pausado = core.isPaused();
       //En "pending" mostramos pill rojo "CAPTCHA" y deshabilitamos el botón
-      //(el usuario tiene que resolver vía el cartel del tab Recolección).
-      //En "timeout" mostramos pill gris "TIMEOUT" pero el botón Iniciar SE
+      //(el usuario tiene que resolver vía el cartel grande debajo del
+      //banner). En "timeout" pill gris "TIMEOUT" pero el botón Iniciar SE
       //HABILITA — apretarlo limpia el captcha y arranca un ciclo nuevo.
       const colorPill =
         captchaState === "pending" ? "#e74c3c" :
@@ -919,12 +1067,14 @@
         proximoColor = "#cdd5e0";
       }
 
-      header.innerHTML = "";
       const wrap = document.createElement("div");
-      wrap.style.cssText = "display:flex;align-items:center;gap:10px";
+      wrap.style.cssText =
+        "display:flex;align-items:center;gap:10px;padding:10px 12px;" +
+        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
+        `border-left:3px solid ${colorPill};margin-bottom:10px`;
 
       const izq = document.createElement("div");
-      izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      izq.style.cssText = "flex:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0";
       izq.innerHTML =
         statusPill(label, colorPill) +
         `<span style="color:${proximoColor};font-size:11.5px">${proximoTexto}</span>`;
@@ -945,7 +1095,7 @@
         btn.disabled = true;
         btn.style.opacity = "0.5";
         btn.style.cursor = "not-allowed";
-        btn.title = "Resolvé el CAPTCHA primero (botón en el tab Recolección)";
+        btn.title = "Resolvé el CAPTCHA primero (cartel debajo)";
       }
       btn.addEventListener("click", () => {
         if (bloqueadoPorCaptcha) return;
@@ -956,14 +1106,16 @@
           core.onCaptchaResuelto();
         }
         core.togglePlayPause();
-        //Repaint inmediato del header — sin esto el botón se quedaba con
-        //el label viejo hasta el siguiente tick del setInterval (1s),
-        //como si el click no hubiera tomado.
-        actualizarHeaderPanel(panel);
+        //Repaint inmediato del body — sin esto el banner queda con el label
+        //viejo hasta el siguiente tick del setInterval (1s), como si el
+        //click no hubiera tomado.
+        const panel = document.getElementById("panelConfigJam");
+        const body = panel && panel.querySelector(".pcj-body");
+        if (body) renderTabRecoleccion(body);
       });
       wrap.appendChild(btn);
 
-      header.appendChild(wrap);
+      return wrap;
     }
 
     //—— Tab Dashboard ——————————————————————————————————————————————————
@@ -979,17 +1131,63 @@
 
     function renderTabDashboard(body) {
       body.innerHTML = "";
-      //La barra de estado + botón play/pause vive en el header global del
-      //panel (visible en TODOS los tabs), no acá. Antes estaba duplicada
-      //en este Dashboard — quedaba inconsistente al saltar a otros tabs.
-
-      //Métricas de Recolección
+      //Vista minimalista: solo Recolección, con el botón Iniciar/Pausar y
+      //una línea con "Último ciclo: hace Xs · Próximo en Ys". El resto de
+      //métricas (ciclos OK, tasa, aldeas farmeadas, recursos, etc.) viven
+      //en el tab Recolección para no inflar el dashboard.
       body.appendChild(crearTituloSeccion("Recolección"));
-      body.appendChild(renderMetricasRecoleccion());
+      body.appendChild(renderBannerRecoleccion());
+      body.appendChild(renderResumenCiclosDashboard());
+    }
 
-      //Métricas de Construcción
-      body.appendChild(crearTituloSeccion("Construcción"));
-      body.appendChild(renderMetricasConstruccion());
+    //Línea compacta con "Último ciclo: hace Xs · Próximo: en Ys". El banner
+    //que va arriba ya tiene el countdown del próximo en su sub-text — acá
+    //repetimos ambos juntos en un layout consistente y agregamos el "último"
+    //que no está en el banner.
+    function renderResumenCiclosDashboard() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:flex;gap:10px;padding:10px 12px;" +
+        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
+        "font-size:12px";
+
+      //Último ciclo terminado: tomamos el más reciente de la lista
+      //persistida. `c.fin` se setea cuando el ciclo cierra (ver línea ~3121).
+      //Si no hay todavía ciclos cerrados, mostramos "—".
+      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
+      const ultimoTxt = (ultimo && ultimo.fin)
+        ? `hace ${formatRelativo(ultimo.fin)}`
+        : "—";
+
+      //Próximo ciclo: si hay uno agendado (proximoTickAt) y no estamos
+      //pausados, lo formateamos como countdown. Si hay un ciclo en curso,
+      //mostramos eso en su lugar. Si está pausado, "—".
+      let proxTxt;
+      if (cicloActual) {
+        proxTxt = `en curso · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
+      } else if (proximoTickAt && !core.isPaused()) {
+        const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
+        proxTxt = `en ${core.formatDuracion(seg)}`;
+      } else if (core.isPaused()) {
+        proxTxt = "pausado";
+      } else {
+        proxTxt = "—";
+      }
+
+      const colItem = (label, valor, valorColor) => {
+        const c = document.createElement("div");
+        c.style.cssText = "flex:1;min-width:0";
+        c.innerHTML =
+          `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold;margin-bottom:3px">${escapeHtml(label)}</div>` +
+          `<div style="color:${valorColor || "#e6e9ee"};font-weight:bold;font-size:13.5px;font-family:monospace">${escapeHtml(valor)}</div>`;
+        return c;
+      };
+      wrap.appendChild(colItem("Último ciclo", ultimoTxt, ultimo ? "#27ae60" : "#7a8aa0"));
+      wrap.appendChild(colItem("Próximo", proxTxt,
+        cicloActual ? "#f39c12" : (core.isPaused() ? "#7a8aa0" : "#3498db")
+      ));
+
+      return wrap;
     }
 
     function renderMetricasRecoleccion() {
@@ -1012,14 +1210,14 @@
         let cicloOk = true;
         for (const cd of Object.values(c.ciudades || {})) {
           aldeasOk += cd.claims || 0;
-          aldeasError += Math.max(0, (cd.esperado || 6) - (cd.claims || 0));
+          aldeasError += Math.max(0, (cd.esperado ?? 6) - (cd.claims || 0));
           aldeasSinRecursos += cd.limiteDiario || 0;
           aldeasNoObtenidas += cd.bloqueadas || 0;
           aldeasCiudadLlena += cd.recursosLlenos || 0;
           totWood += cd.wood || 0;
           totStone += cd.stone || 0;
           totIron += cd.iron || 0;
-          if ((cd.claims || 0) < (cd.esperado || 6)) cicloOk = false;
+          if ((cd.claims || 0) < (cd.esperado ?? 6)) cicloOk = false;
         }
         if (cicloOk) ciclosCompletos += 1;
       }
@@ -1178,9 +1376,18 @@
     //—— Tab Settings (configuración) ——————————————————————————————————————
 
     function renderTabSettings(body) {
-      //Sección: features globales
-      body.appendChild(crearTituloSeccion("Funciones"));
-      body.appendChild(crearFilaToggleFinalizar());
+      //El toggle de "Finalizar construcción gratis" ya no vive acá — cada
+      //módulo es independiente y tiene su propio control en su tab. El de
+      //finalizar está en la tab "Construcción" como banner Iniciar/Detener.
+
+      //Sección: desbloqueo premium (solo si todavía no se ingresó la pwd).
+      //Al confirmarse, core dispara onPremiumUnlock, se re-renderea el
+      //panel entero y este botón desaparece junto con el aparecer de los
+      //tabs Ataques/Defensa/Hechizos.
+      if (!core.isPremiumUnlocked()) {
+        body.appendChild(crearTituloSeccion("Premium"));
+        body.appendChild(renderBotonPermisoPremium());
+      }
 
       //Sección: tiempo por ciudad
       body.appendChild(crearTituloSeccion("Tiempo de recolección por ciudad"));
@@ -1192,6 +1399,30 @@
 
       //Footer con nombre + versión
       body.appendChild(renderFooterVersion());
+    }
+
+    function renderBotonPermisoPremium() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "margin-top:6px";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.style.cssText =
+        "display:flex;align-items:center;gap:10px;padding:10px 14px;width:100%;" +
+        "background:#9b59b6;color:#fff;border:0;border-radius:4px;cursor:pointer;" +
+        "font-size:12.5px;font-weight:bold;text-align:left;letter-spacing:0.3px;" +
+        "transition:background 0.15s";
+      btn.addEventListener("mouseenter", () => { btn.style.background = "#8e44ad"; });
+      btn.addEventListener("mouseleave", () => { btn.style.background = "#9b59b6"; });
+      btn.innerHTML =
+        `<span style="font-size:16px;flex-shrink:0">🔓</span>` +
+        `<div style="flex:1">` +
+        `<div>Papi jam me dio permiso del premium</div>` +
+        `<div style="color:#e8d5f5;font-size:10.5px;font-weight:normal;margin-top:2px">` +
+        `Desbloquea Construcción · Oro · Comercio · Ataques · Defensa · Hechizos</div>` +
+        `</div>`;
+      btn.addEventListener("click", () => { core.pedirContraseñaPremium(); });
+      wrap.appendChild(btn);
+      return wrap;
     }
 
     //Color único para todas las ciudades. Antes había una paleta cíclica
@@ -1552,19 +1783,74 @@
     }
 
     //—— Tab Recolección ——————————————————————————————————————————————————
+    //
+    //El tab tiene 2 subtabs:
+    //  "ciudades" — estado live por aldea (cooldown, próxima claim, dots
+    //               históricos). Lo que casi siempre querés ver.
+    //  "ciclos"   — vista clásica con el ciclo actual + último + anteriores.
+    //               Útil para auditar barridos individuales.
+    //
+    //renderTabRecoleccion es el wrapper: pinta CAPTCHA (si hay) + las
+    //sub-tabs + delega el cuerpo a renderSubtabPorCiudades / PorCiclos.
 
     function renderTabRecoleccion(body) {
       body.innerHTML = "";
 
-      //Cartel CAPTCHA — pinned en el tope cuando hay captcha activo (o en
-      //timeout). Es la pieza más importante del tab mientras el bot está
-      //esperando al humano: dice qué pasó, qué aldea/ciudad disparó el
-      //captcha, cuántas aldeas quedaron en cola y cuánto falta para el
-      //timeout. Botón "Ya resolví" gatilla la sincronización del server.
+      //Banner Iniciar/Pausar — exclusivo del módulo recolección. Está
+      //ARRIBA del cartel de CAPTCHA para que el usuario vea de un vistazo
+      //el estado y el botón sin scrollear.
+      body.appendChild(renderBannerRecoleccion());
+
       if (core.isCaptchaActive && core.isCaptchaActive()) {
         body.appendChild(renderCartelCaptcha());
       }
 
+      body.appendChild(renderSubtabsRecoleccion());
+
+      if (subtabRecoleccion === "ciudades") renderSubtabPorCiudades(body);
+      else renderSubtabPorCiclos(body);
+    }
+
+    function renderSubtabsRecoleccion() {
+      const cont = document.createElement("div");
+      cont.style.cssText =
+        "display:flex;gap:0;margin:0 0 10px;border-bottom:1px solid #2c3a4d";
+      const mk = (id, label) => {
+        const activo = subtabRecoleccion === id;
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.style.cssText =
+          `padding:6px 14px;background:${activo ? "#1f2a36" : "transparent"};` +
+          `color:${activo ? "#3498db" : "#7a8aa0"};border:none;` +
+          `border-bottom:2px solid ${activo ? "#3498db" : "transparent"};` +
+          "margin-bottom:-1px;cursor:pointer;font-weight:bold;font-size:11.5px;" +
+          "letter-spacing:0.3px;transition:all 0.15s";
+        if (!activo) {
+          b.addEventListener("mouseenter", () => {
+            b.style.background = "#1a232e";
+            b.style.color = "#cdd5e0";
+          });
+          b.addEventListener("mouseleave", () => {
+            b.style.background = "transparent";
+            b.style.color = "#7a8aa0";
+          });
+        }
+        b.addEventListener("click", () => {
+          subtabRecoleccion = id;
+          window.localStorage.setItem(STORAGE_KEY_SUBTAB_RECOLECCION, id);
+          //Re-render del cuerpo del tab Recolección para reflejar el cambio.
+          renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
+        });
+        return b;
+      };
+      cont.appendChild(mk("ciudades", "🏘  Por ciudad"));
+      cont.appendChild(mk("ciclos", "🔁  Por ciclo"));
+      return cont;
+    }
+
+    //—— Subtab "Por ciclo" — vista clásica del histórico de ciclos ——————
+
+    function renderSubtabPorCiclos(body) {
       //Sección 1: ciclo en curso (si lo hay) — colapsable, abierto por default
       if (cicloActual) {
         body.appendChild(seccionColapsable(
@@ -1586,7 +1872,7 @@
       const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       if (ultimoCiclo) {
         const total = (ultimoCiclo.totalAldeas != null) ? ultimoCiclo.totalAldeas
-          : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado || 6), 0);
+          : Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.esperado ?? 6), 0);
         const claims = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.claims || 0), 0);
         const sCool = Object.values(ultimoCiclo.ciudades || {}).reduce((s, c) => s + (c.saltadasCooldown || 0), 0);
         //Mismo criterio que renderListaCiclosAnteriores: cubierto cuando
@@ -1599,7 +1885,7 @@
         //completo — el corte sucedió por causas externas (reload, F5).
         const interrumpido = ultimoCiclo.interrumpido === true;
         const tieneAdvertencia = Object.values(ultimoCiclo.ciudades || {})
-          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0 || (x.bloqueadas || 0) > 0);
 
         let icono, color;
         if (interrumpido) {
@@ -1666,6 +1952,286 @@
       ));
     }
 
+    //—— Subtab "Por ciudad" — estado live de cada aldea ————————————————————
+    //
+    //Vista eje-ciudad (no eje-tiempo). Lista todas las ciudades con un
+    //resumen del estado de sus 6 aldeas, expandible a una tabla con:
+    //  - última claim (status + hace cuánto)
+    //  - próxima claim (countdown vivo, "LISTO YA" o razón de advertencia)
+    //  - dots históricos de las últimas 10 entradas, coloreados por status
+    //
+    //Soluciona la confusión de la vista por ciclos cuando los cooldowns de
+    //aldea no encajan con el ritmo del ciclo global: acá no importa qué
+    //ciclo claimeó qué — solo el estado actual de cada aldea.
+
+    function esAdvertenciaPersistente(status) {
+      return status === "no-pertenece" || status === "limite-diario" || status === "recursos-llenos";
+    }
+
+    function labelAdvertencia(status) {
+      if (status === "no-pertenece") return "sin acceso";
+      if (status === "limite-diario") return "sin recursos";
+      if (status === "recursos-llenos") return "ciudad llena";
+      return status;
+    }
+
+    //Próxima recolección disponible para una aldea, en ms epoch. Combina
+    //dos fuentes:
+    //  - lastClaimAtPorAldea[id] + cooldownCiudad: lo que sabe el BOT por
+    //    sus propias claims (persistente entre sesiones).
+    //  - aldea.loot (timestamp en segundos): lo que el SERVER reporta como
+    //    next-available al boot. Cubre claims manuales del usuario antes
+    //    de cargar la pestaña, o cooldowns vivos heredados.
+    //Tomamos el máximo entre ambos: si el bot claimeó después que el server
+    //reportó cooldown (porque el cooldown ya había vencido), gana el bot;
+    //si el server tenía cooldown vivo al boot y el bot todavía no claimeó,
+    //gana el server. Devuelve 0 si no hay info — la aldea figura como lista.
+    function getNextAvailableMs(aldea, cooldownMs) {
+      const lastClaim = lastClaimAtPorAldea[aldea.id];
+      const lootMs = (aldea.loot || 0) * 1000;
+      let next = 0;
+      //Guardas con Number.isFinite: si el storage tiene un valor sucio
+      //(p.ej. NaN persistido por una sincronización post-CAPTCHA que se
+      //hizo con cooldownMs indefinido), Math.max propaga NaN y el render
+      //termina mostrando "en NaNm NaNs". Validar acá lo evita en raíz.
+      if (Number.isFinite(lastClaim) && lastClaim > 0 && Number.isFinite(cooldownMs)) {
+        next = Math.max(next, lastClaim + cooldownMs);
+      }
+      if (Number.isFinite(lootMs) && lootMs > 0) {
+        next = Math.max(next, lootMs);
+      }
+      return next;
+    }
+
+    function renderSubtabPorCiudades(body) {
+      if (!ciudadesConAldeas.length) {
+        const v = document.createElement("div");
+        v.textContent = "Cargando ciudades…";
+        v.style.cssText = "opacity:0.7;font-style:italic;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+
+      const ahoraMs = Date.now();
+      const cooldownMsPorCiudad = {};
+
+      //Acumuladores globales para el header.
+      let total = 0, listas = 0, enCool = 0, conAdv = 0;
+      let proximoMs = Infinity;
+
+      for (const ciudad of ciudadesConAldeas) {
+        const cdMin = cooldownPorCiudad[ciudad.codigoCiudad];
+        const cooldownMs = (cdMin || 10) * 60 * 1000;
+        cooldownMsPorCiudad[ciudad.codigoCiudad] = cooldownMs;
+        for (const aldea of ciudad.aldeas || []) {
+          total++;
+          const histo = historialPorAldea[aldea.id] || [];
+          const ult = histo[histo.length - 1];
+          const nextMs = getNextAvailableMs(aldea, cooldownMs);
+          if (ult && esAdvertenciaPersistente(ult.status)) {
+            conAdv++;
+          } else if (nextMs === 0 || nextMs <= ahoraMs) {
+            listas++;
+          } else {
+            enCool++;
+            if (nextMs < proximoMs) proximoMs = nextMs;
+          }
+        }
+      }
+
+      //Header global
+      const header = document.createElement("div");
+      header.style.cssText =
+        "padding:10px 12px;background:#172029;border:1px solid #2c3a4d;" +
+        "border-left:3px solid #3498db;border-radius:4px;margin-bottom:10px;" +
+        "font-size:11.5px";
+      let proximoTxt;
+      if (listas > 0) {
+        proximoTxt = ` · <span style="color:#27ae60">hay aldeas listas ya</span>`;
+      } else if (proximoMs !== Infinity) {
+        const seg = Math.max(0, Math.round((proximoMs - ahoraMs) / 1000));
+        proximoTxt = ` · próxima en <b>${core.formatDuracion(seg)}</b>`;
+      } else {
+        proximoTxt = "";
+      }
+      header.innerHTML =
+        `<div style="color:#e6e9ee">` +
+        `<b>${total}</b> aldeas en <b>${ciudadesConAldeas.length}</b> ciudades:&nbsp;&nbsp;` +
+        `<span style="color:#27ae60;font-weight:bold">${listas} listas</span> · ` +
+        `<span style="color:#8a96a6;font-weight:bold">${enCool} en cooldown</span> · ` +
+        `<span style="color:#f39c12;font-weight:bold">${conAdv} advertencia</span>` +
+        `<span style="color:#7a8aa0">${proximoTxt}</span>` +
+        `</div>`;
+      body.appendChild(header);
+
+      //Lista de ciudades, ordenadas alfanuméricamente.
+      const ordenadas = ciudadesConAldeas.slice().sort((a, b) =>
+        (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
+      );
+      for (const ciudad of ordenadas) {
+        body.appendChild(renderCardCiudadEstado(
+          ciudad, ahoraMs, cooldownMsPorCiudad[ciudad.codigoCiudad]
+        ));
+      }
+    }
+
+    function renderCardCiudadEstado(ciudad, ahoraMs, cooldownMs) {
+      const aldeas = ciudad.aldeas || [];
+      let listas = 0, enCool = 0, conAdv = 0;
+      let proximoMs = Infinity;
+      const advertencias = {};
+      for (const aldea of aldeas) {
+        const histo = historialPorAldea[aldea.id] || [];
+        const ult = histo[histo.length - 1];
+        const nextMs = getNextAvailableMs(aldea, cooldownMs);
+        if (ult && esAdvertenciaPersistente(ult.status)) {
+          conAdv++;
+          advertencias[ult.status] = (advertencias[ult.status] || 0) + 1;
+        } else if (nextMs === 0 || nextMs <= ahoraMs) {
+          listas++;
+        } else {
+          enCool++;
+          if (nextMs < proximoMs) proximoMs = nextMs;
+        }
+      }
+
+      //Color dominante: verde si hay aldeas listas, naranja si todo es
+      //advertencia, gris si todo cooldown. La idea es que de un vistazo el
+      //usuario sepa qué ciudades requieren atención (naranja) vs cuáles
+      //están saludables (verde / gris pasivo).
+      let color;
+      if (listas > 0) color = "#27ae60";
+      else if (conAdv > 0 && enCool === 0) color = "#f39c12";
+      else color = "#8a96a6";
+
+      //Descripción del estado de la ciudad.
+      const partes = [];
+      if (listas) partes.push(`${listas} listas`);
+      if (enCool) {
+        if (proximoMs !== Infinity) {
+          const seg = Math.max(0, Math.round((proximoMs - ahoraMs) / 1000));
+          partes.push(`${enCool} cooldown (próx ${core.formatDuracion(seg)})`);
+        } else {
+          partes.push(`${enCool} en cooldown`);
+        }
+      }
+      for (const [k, n] of Object.entries(advertencias)) {
+        partes.push(`${n} ${labelAdvertencia(k)}`);
+      }
+      const desc = partes.join(" · ") || "sin actividad registrada";
+
+      const header =
+        `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
+        `  <div style="flex:1;min-width:0;text-align:left;line-height:1.25">` +
+        `    <div style="font-size:12px;color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad)}</div>` +
+        `    <div style="font-size:10.5px;color:#7a8aa0;margin-top:2px">${escapeHtml(desc)}</div>` +
+        `  </div>` +
+        `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:36px;text-align:right">${listas}/${aldeas.length}</span>` +
+        `</div>`;
+
+      return seccionColapsable(
+        header,
+        uiColapso.ciudades[ciudad.codigoCiudad] === true,
+        (v) => uiColapso.ciudades[ciudad.codigoCiudad] = v,
+        () => renderTablaAldeasEstado(ciudad, ahoraMs, cooldownMs),
+        color
+      );
+    }
+
+    function renderTablaAldeasEstado(ciudad, ahoraMs, cooldownMs) {
+      const aldeas = (ciudad.aldeas || []).slice().sort((a, b) =>
+        (a.name || "").localeCompare(b.name || "", undefined, { numeric: true })
+      );
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "background:#0f1620;border:1px solid #2c3a4d;border-radius:3px;overflow:hidden";
+
+      const headHTML = `
+        <tr style="background:#1a232e;color:#7a8aa0;font-size:10px;text-transform:uppercase;letter-spacing:0.5px">
+          <th style="padding:6px 8px;text-align:left">Aldea</th>
+          <th style="padding:6px 8px;text-align:left">Última claim</th>
+          <th style="padding:6px 8px;text-align:left">Próxima</th>
+          <th style="padding:6px 8px;text-align:left">Últimas 10</th>
+        </tr>
+      `;
+
+      let rows = "";
+      for (const aldea of aldeas) {
+        const histo = historialPorAldea[aldea.id] || [];
+        const ult = histo[histo.length - 1];
+        const lastClaim = lastClaimAtPorAldea[aldea.id];
+        const nextMs = getNextAvailableMs(aldea, cooldownMs);
+        //Cooldown server-side al boot (aldea.loot en seg). Si está vivo y
+        //es la fuente que está dominando el cálculo de "próxima" (el bot
+        //no claimeó después), lo marcamos al usuario.
+        const lootMs = (aldea.loot || 0) * 1000;
+        const cooldownServer = lootMs > ahoraMs && (!lastClaim || lootMs >= lastClaim + cooldownMs);
+
+        //Última claim: prioridad al historial (lo más detallado). Si no
+        //hay historial pero el server dice que hay cooldown vivo (claim
+        //manual o pre-boot), inferimos cuándo fue aproximadamente:
+        //last = loot - cooldownCiudad (aproximación: el server no nos
+        //dice el last_looted_at por aldea, pero el cooldown típico de la
+        //ciudad alcanza para una estimación útil).
+        let ultHTML = `<span style="color:#5a6776">—</span>`;
+        if (ult) {
+          const p = presentarStatus(ult.status);
+          ultHTML = `<span style="color:${p.color}">${p.icono} hace ${escapeHtml(formatRelativo(ult.ts))}</span>`;
+        } else if (lootMs > ahoraMs) {
+          const estimado = lootMs - cooldownMs;
+          if (estimado > 0 && estimado <= ahoraMs) {
+            ultHTML = `<span style="color:#7a8aa0" title="estimado a partir del cooldown del server — el bot no claimeó esta aldea aún en esta sesión">~hace ${escapeHtml(formatRelativo(estimado))}</span>`;
+          } else {
+            ultHTML = `<span style="color:#7a8aa0" title="server reporta cooldown vivo pero no podemos estimar cuándo fue">cooldown server</span>`;
+          }
+        }
+
+        //Próxima claim: si la última fue advertencia persistente, lo
+        //decimos en lugar del countdown (el bot no va a reintentar pronto
+        //porque el cupo/lleno/acceso persiste). Si no hay cooldown vivo
+        //por ninguna fuente → "LISTO YA". Si no → countdown.
+        let proximaHTML;
+        if (ult && esAdvertenciaPersistente(ult.status)) {
+          proximaHTML = `<span style="color:#f39c12">⚠ ${labelAdvertencia(ult.status)}</span>`;
+        } else if (nextMs === 0 || nextMs <= ahoraMs) {
+          proximaHTML = `<span style="color:#27ae60;font-weight:bold">LISTO YA</span>`;
+        } else {
+          const seg = Math.max(0, Math.round((nextMs - ahoraMs) / 1000));
+          const sufijo = cooldownServer
+            ? ` <span style="color:#7a8aa0;font-size:9px" title="cooldown reportado por el server al cargar la pestaña — claim manual previo o cooldown heredado">(server)</span>`
+            : "";
+          proximaHTML = `<span style="color:#8a96a6">en ${escapeHtml(core.formatDuracion(seg))}</span>${sufijo}`;
+        }
+
+        //Dots últimas 10 entradas. Si hay menos de 10, rellenamos con
+        //círculos vacíos en gris muy oscuro para que el ancho de la
+        //columna sea consistente entre filas.
+        const ultimos = histo.slice(-10);
+        let dots = "";
+        for (const e of ultimos) {
+          const p = presentarStatus(e.status);
+          const tooltip = `${escapeHtml(p.label)} · hace ${escapeHtml(formatRelativo(e.ts))}` +
+            (e.errorMsg ? ` · ${escapeHtml(String(e.errorMsg).slice(0, 80))}` : "");
+          dots += `<span style="color:${p.color};font-size:13px;line-height:1" title="${tooltip}">●</span>`;
+        }
+        for (let i = ultimos.length; i < 10; i++) {
+          dots += `<span style="color:#1f2a36;font-size:13px;line-height:1">○</span>`;
+        }
+
+        rows += `
+          <tr style="border-top:1px solid #2c3a4d;font-size:11.5px">
+            <td style="padding:6px 8px;color:#e6e9ee">${escapeHtml(aldea.name || "")}</td>
+            <td style="padding:6px 8px">${ultHTML}</td>
+            <td style="padding:6px 8px">${proximaHTML}</td>
+            <td style="padding:6px 8px;letter-spacing:3px;white-space:nowrap">${dots}</td>
+          </tr>
+        `;
+      }
+
+      wrap.innerHTML = `<table style="width:100%;border-collapse:collapse">${headHTML}${rows}</table>`;
+      return wrap;
+    }
+
     //—— Tab Construcción ——————————————————————————————————————————————————
 
     function renderTabConstruccion(body) {
@@ -1679,28 +2245,50 @@
         return;
       }
 
-      //Header de estado de la feature — 2 cards lado a lado
-      const headerWrap = document.createElement("div");
-      headerWrap.style.cssText =
-        "display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px";
+      //Banner Iniciar/Detener propio del módulo — independiente del
+      //play/pause global del bot. Cambia el flag persistido vía la API
+      //expuesta por finalizarConstruccion.js.
+      const api =
+        JamBot.features.finalizarConstruccion &&
+        JamBot.features.finalizarConstruccion.api;
+      const habilitada = api ? !!api.isHabilitada() : !!ds.habilitada;
+      const estadoColor = habilitada ? "#27ae60" : "#7a8aa0";
+      const estadoTxt = habilitada ? "Activa" : "Detenida";
 
-      const estadoColor = !ds.habilitada ? "#7a8aa0" : (core.isPaused() ? "#27ae60" : "#3498db");
-      const estadoTxt = !ds.habilitada ? "Deshabilitada"
-        : core.isPaused() ? "Pausada"
-        : "Activa";
-      const estadoSub = !ds.habilitada ? "Activar en Settings"
-        : core.isPaused() ? "Bot global pausado"
-        : "";
+      const banner = document.createElement("div");
+      banner.style.cssText =
+        `display:flex;align-items:center;gap:10px;padding:10px 12px;` +
+        `background:#172029;border:1px solid #2c3a4d;border-radius:4px;` +
+        `border-left:3px solid ${estadoColor};margin-bottom:10px`;
+      const izq = document.createElement("div");
+      izq.style.cssText = "flex:1;min-width:0";
+      const titulo = document.createElement("div");
+      titulo.textContent = `Finalizar construcción gratis · ${estadoTxt}`;
+      titulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
+      const sub = document.createElement("div");
+      sub.textContent = habilitada
+        ? "Activa el botón \"Gratis\" cuando faltan <5 min en cualquier ciudad"
+        : "Apretá Iniciar para que el módulo arranque su propio ciclo";
+      sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
+      izq.appendChild(titulo);
+      izq.appendChild(sub);
+      banner.appendChild(izq);
 
-      const card1 = document.createElement("div");
-      card1.style.cssText =
-        `padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid ${estadoColor}`;
-      card1.innerHTML =
-        `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Estado</div>` +
-        `<div style="color:${estadoColor};font-weight:bold;font-size:14px;margin-top:2px">${estadoTxt}</div>` +
-        (estadoSub ? `<div style="color:#7a8aa0;font-size:10px;margin-top:1px">${estadoSub}</div>` : "");
-      headerWrap.appendChild(card1);
+      const btn = document.createElement("button");
+      btn.textContent = habilitada ? "⏸  Detener" : "▶  Iniciar";
+      btn.style.cssText =
+        `padding:6px 14px;background:${habilitada ? "#7a8aa0" : "#27ae60"};` +
+        `color:#fff;border:none;border-radius:4px;cursor:pointer;` +
+        `font-weight:bold;font-size:12px;letter-spacing:0.3px;flex-shrink:0`;
+      btn.addEventListener("click", () => {
+        if (!api) return;
+        api.setHabilitada(!api.isHabilitada());
+        renderTabConstruccion(body);
+      });
+      banner.appendChild(btn);
+      body.appendChild(banner);
 
+      //Próximo tick — info secundaria
       let proximoTxt = "—";
       if (ds.proximoTickAt) {
         const seg = Math.max(0, Math.round((ds.proximoTickAt - Date.now()) / 1000));
@@ -1708,13 +2296,11 @@
       }
       const card2 = document.createElement("div");
       card2.style.cssText =
-        "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid #3498db";
+        "padding:7px 10px;background:#172029;border-radius:3px;border-left:3px solid #3498db;margin-bottom:10px";
       card2.innerHTML =
         `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold">Próximo tick</div>` +
         `<div style="color:#cdd5e0;font-weight:bold;font-size:14px;margin-top:2px">${proximoTxt}</div>`;
-      headerWrap.appendChild(card2);
-
-      body.appendChild(headerWrap);
+      body.appendChild(card2);
 
       //Sección 1: último ciclo
       if (ds.ultimoCiclo) {
@@ -1942,7 +2528,7 @@
       uiColapso.cicloPorN = uiColapso.cicloPorN || {};
       for (const c of anteriores) {
         const total = (c.totalAldeas != null) ? c.totalAldeas
-          : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado || 6), 0);
+          : Object.values(c.ciudades || {}).reduce((s, x) => s + (x.esperado ?? 6), 0);
         const claims = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.claims || 0), 0);
         const sCool = Object.values(c.ciudades || {}).reduce((s, x) => s + (x.saltadasCooldown || 0), 0);
         //Cubrimos cuando claims + cooldown legítimo ≥ total esperado
@@ -1951,7 +2537,7 @@
         const cubierto = (claims + sCool) >= total;
         const interrumpido = c.interrumpido === true;
         const tieneAdvertencia = Object.values(c.ciudades || {})
-          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0);
+          .some((x) => (x.limiteDiario || 0) > 0 || (x.recursosLlenos || 0) > 0 || (x.bloqueadas || 0) > 0);
 
         let icono, color;
         if (interrumpido) {
@@ -1996,10 +2582,13 @@
         .sort((a, b) => (a.nombre || "").localeCompare(b.nombre || "", undefined, { numeric: true }));
       uiColapso.cicloCiudades[ciclo.n] = uiColapso.cicloCiudades[ciclo.n] || {};
       for (const c of ciudadesArr) {
-        const totalEsp = c.esperado || 6;
+        const totalEsp = c.esperado ?? 6;
         const claimsOk = c.claims || 0;
         const sCool = c.saltadasCooldown || 0;
-        const tieneAdvertencia = (c.limiteDiario || 0) > 0 || (c.recursosLlenos || 0) > 0;
+        const tieneAdvertencia =
+          (c.limiteDiario || 0) > 0 ||
+          (c.recursosLlenos || 0) > 0 ||
+          (c.bloqueadas || 0) > 0;
         //Estado "cubierto" = todas las aldeas farmeables están
         //contabilizadas (claim OK o saltadas por cooldown legítimo). El
         //esperado ya viene decrementado por bloqueadas, cupo diario y
@@ -2032,15 +2621,39 @@
           color = "#e74c3c"; icon = "✗";
         }
 
-        //Header HTML que replica la fila plana anterior: badge + nombre +
-        //ratio + recursos. seccionColapsable agrega su propio arrow.
+        //Desglose textual del estado de la ciudad: cuántas aldeas cayeron en
+        //cada categoría. Las "fallidas reales" son las que el esperado dice
+        //que debían claimearse pero no se contabilizaron como OK ni como
+        //cooldown — es decir, errores genuinos del server (rechazo sin causa
+        //identificable). Las advertencias (no-pertenece, cupo diario, ciudad
+        //llena) ya están sustraídas del esperado.
+        const fallidasReales = Math.max(
+          0,
+          (c.esperado ?? 6) - (c.claims || 0) - (c.saltadasCooldown || 0)
+        );
+        const partes = [];
+        if ((c.claims || 0) > 0) partes.push(`${c.claims} OK`);
+        if ((c.saltadasCooldown || 0) > 0) partes.push(`${c.saltadasCooldown} en cooldown`);
+        if ((c.limiteDiario || 0) > 0) partes.push(`${c.limiteDiario} sin recursos`);
+        if ((c.recursosLlenos || 0) > 0) partes.push(`${c.recursosLlenos} ciudad llena`);
+        if ((c.bloqueadas || 0) > 0) partes.push(`${c.bloqueadas} sin acceso`);
+        if (fallidasReales > 0) partes.push(`${fallidasReales} fallidas`);
+        const descripcion = partes.join(" · ");
+
+        //Header HTML: badge + bloque ciudad (nombre + descripción de estados)
+        //+ ratio + recursos. seccionColapsable agrega su propio arrow.
         const headerTxt =
           `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
           `  <span style="display:inline-flex;align-items:center;justify-content:center;` +
           `width:20px;height:20px;background:${color}22;color:${color};` +
           `border-radius:3px;font-weight:bold;font-size:12px;flex-shrink:0">${icon}</span>` +
-          `  <span style="flex:1;font-size:12px;color:#e6e9ee;text-align:left">${escapeHtml(c.nombre)}</span>` +
-          `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right">${c.claims}/${c.esperado || 6}</span>` +
+          `  <div style="flex:1;min-width:0;text-align:left;line-height:1.25">` +
+          `    <div style="font-size:12px;color:#e6e9ee">${escapeHtml(c.nombre)}</div>` +
+          (descripcion
+            ? `    <div style="font-size:10.5px;color:#7a8aa0;margin-top:2px">${escapeHtml(descripcion)}</div>`
+            : "") +
+          `  </div>` +
+          `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:30px;text-align:right">${c.claims}/${c.esperado ?? 6}</span>` +
           `  <span style="color:#7a8aa0;font-family:monospace;font-size:10.5px;min-width:140px;text-align:right">+${c.wood} / +${c.stone} / +${c.iron}</span>` +
           `</div>`;
 
@@ -2259,22 +2872,18 @@
     }
 
 
-    //Reflejar cambios de CAPTCHA en el botón. Cuando se resuelve, volver
-    //al estado anterior según core.isPaused().
-    core.onCaptcha((active) => {
-      actualizarEstadoCard();
-      void active;
-    });
+    //La card del bot ya no muestra estado de CAPTCHA — quedó solo el
+    //logo y "Jam". El cartel grande del tab Recolección sigue siendo la
+    //fuente de verdad para resolver el captcha.
+    core.onCaptcha((active) => { void active; });
 
-    //Repintar UI cuando cambia el contexto del CAPTCHA — el bridge avisó
-    //"resueltoEnJuego" o el timeout disparó. La card del pulpo y el cartel
-    //grande del tab Recolección leen de core.getCaptchaContext / state.
+    //Repintar el tab Recolección cuando cambia el contexto del CAPTCHA
+    //(bridge avisó "resueltoEnJuego" o timeout disparó). El cartel
+    //grande dentro de ese tab lee de core.getCaptchaContext / state.
     if (core.onCaptchaContextChange) {
       core.onCaptchaContextChange(() => {
-        actualizarEstadoCard();
         const panel = document.getElementById("panelConfigJam");
         if (panel && panel.style.display !== "none") {
-          actualizarHeaderPanel(panel);
           if (tabActivo === "recoleccion") {
             const body = panel.querySelector(".pcj-body");
             if (body) renderTabRecoleccion(body);
@@ -2319,6 +2928,15 @@
           { method: "GET", headers: { "X-Requested-With": "XMLHttpRequest", accept: "text/plain, */*; q=0.01" } }
         );
         res = await res.json();
+        //Re-dispatch notifs a Backbone para que el juego refresque su UI con
+        //los cambios que el server hizo durante el CAPTCHA (cooldowns,
+        //recursos, cola, etc.). Sin esto la UI puede quedar stale.
+        const notifs = res && res.json && res.json.notifications;
+        if (Array.isArray(notifs) && notifs.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifs },
+          }));
+        }
         return (res && res.json && res.json.json && res.json.json.farm_town_list) || null;
       } catch (e) {
         core.logError("recoleccion", `refrescarAldeasCiudad falló (ciudad=${codigoCiudad})`, e);
@@ -2470,7 +3088,6 @@
 
     async function recolectarRecursos() {
       if (core.isPaused()) return;
-      actualizarEstadoCard();
 
       nCiclo += 1;
       const inicioCiclo = Date.now();
@@ -2564,7 +3181,6 @@
           `ciclo #${nCiclo} interrumpido por CAPTCHA · duró ${core.formatDuracion(duracionCiclo / 1000)} · esperando al humano`,
           "warn"
         );
-        actualizarEstadoCard();
         return;
       }
 
@@ -2656,7 +3272,6 @@
         );
       }
 
-      actualizarEstadoCard();
       programarSiguienteTick(tiempoEspera);
 
       //Refresh auto-detección del cooldown si quedó alguna ciudad sin
@@ -2675,7 +3290,9 @@
 
       //Reset por ciclo: si en un ciclo previo se cacheó "recursos llenos",
       //volvemos a intentar — quizá el jugador construyó cosas y bajaron.
-      for (const c of ciudadesConAldeas) c.recursosLlenos = false;
+      for (const c of ciudadesConAldeas) {
+        c.recursosLlenos = false;
+      }
 
       //Refresca el baseline del diff con el estado actual del Town en MM.
       //Sin esto, el primer claim del ciclo arrastra los 5 minutos transcurridos
@@ -2881,7 +3498,7 @@
           if (cicloActual && cicloActual.ciudades[t.ciudad.codigoCiudad]) {
             const cc = cicloActual.ciudades[t.ciudad.codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3222,7 +3839,7 @@
         if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
           const cc = cicloActual.ciudades[codigoCiudad];
           const eraCompleta = cc.claims >= cc.esperado;
-          cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+          cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
           cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
           cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
           if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3383,7 +4000,7 @@
           if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
             const cc = cicloActual.ciudades[codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.bloqueadas = (cc.bloqueadas || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3426,7 +4043,7 @@
           if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
             const cc = cicloActual.ciudades[codigoCiudad];
             const eraCompleta = cc.claims >= cc.esperado;
-            cc.esperado = Math.max(0, (cc.esperado || 6) - 1);
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
             cc.limiteDiario = (cc.limiteDiario || 0) + 1;
             cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
             if (!eraCompleta && cc.claims >= cc.esperado) {
@@ -3472,6 +4089,50 @@
       );
 
       if (!townNotification) {
+        //Distinguir "ciudad con almacén lleno" de "CAPTCHA real". Cuando los
+        //3 recursos están al tope, el server procesa el claim pero NO emite
+        //notification 'Town' (no hubo cambio de estado). Antes esto se
+        //confundía con CAPTCHA y paraba el ciclo entero — ahora chequeamos
+        //el cap cacheado (poblado en claims previos del cycle/sesión) contra
+        //los recursos cacheados de la ciudad. Si los 3 están en cap, es
+        //ciudad llena: marcamos la ciudad para que las aldeas restantes se
+        //salten (mismo path que la detección "lleno" post-claim exitoso) y
+        //el ciclo sigue con el resto de ciudades. La próxima vuelta volverá
+        //a intentar — si el jugador gastó recursos o subió almacén, fluye.
+        const cap = storageCapPorCiudad[codigoCiudad];
+        const prev = recursosPrevPorCiudad[codigoCiudad];
+        const almacenLleno = cap > 0 && prev &&
+          prev.wood >= cap && prev.stone >= cap && prev.iron >= cap;
+
+        if (almacenLleno) {
+          core.logWarn(
+            "recoleccion",
+            `aldea ${farmTownId} (${ciudadNombreSafe}): sin Town notification + almacén al tope (${prev.wood}/${prev.stone}/${prev.iron} de ${cap}) — ciudad llena, no CAPTCHA`,
+            response.json.notifications
+          );
+          const idxCiudad = ciudadesConAldeas.findIndex((c) => c.codigoCiudad == codigoCiudad);
+          if (idxCiudad >= 0) ciudadesConAldeas[idxCiudad].recursosLlenos = true;
+          registrarClaim({
+            aldeaId: farmTownId, ciudadId: codigoCiudad,
+            ciudadNombre: ciudadNombreSafe, aldeaNombre: aldeaNombreSafe,
+            ciclo: nCiclo, status: "recursos-llenos",
+            errorMsg: "almacén lleno (server omitió Town notification)",
+          });
+          if (acumulador) acumulador.recursosLlenos += 1;
+          if (cicloActual && cicloActual.ciudades[codigoCiudad]) {
+            const cc = cicloActual.ciudades[codigoCiudad];
+            const eraCompleta = cc.claims >= cc.esperado;
+            cc.esperado = Math.max(0, (cc.esperado ?? 6) - 1);
+            cc.recursosLlenos = (cc.recursosLlenos || 0) + 1;
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+            if (!eraCompleta && cc.claims >= cc.esperado) {
+              cicloActual.ciudadesCompletadas += 1;
+            }
+            actualizarIndicadorVivo();
+          }
+          return { status: "descartar" };
+        }
+
         core.logWarn(
           "recoleccion",
           `sin notificación 'Town' para aldea ${farmTownId} — probable CAPTCHA`,
@@ -3517,6 +4178,10 @@
 
       const town = JSON.parse(townNotification.param_str)["Town"];
       const { storage, last_wood, last_iron, last_stone, resources } = town;
+      //Cacheamos el cap del almacén para que la rama "no Town" pueda
+      //distinguir ciudad llena de CAPTCHA real (ver bloque !townNotification
+      //arriba).
+      if (storage) storageCapPorCiudad[codigoCiudad] = storage;
 
       const nombreCiudad = ciudadNombreSafe;
       const nombreAldea = aldeaNombreSafe;
@@ -3614,6 +4279,14 @@
         },
       });
       res = await res.json();
+      //Re-dispatch notifs (Town, BuildingOrders, Units, etc.) para que la
+      //UI del juego no quede stale tras este refetch del mapa de relaciones.
+      const notifs = res && res.json && res.json.notifications;
+      if (Array.isArray(notifs) && notifs.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifs },
+        }));
+      }
 
       const items =
         (res.json &&
@@ -3646,6 +4319,15 @@
         }
       );
       ciudadesJugador = await ciudadesJugador.json();
+      //Re-dispatch notifs antes de consumir el payload — el bootstrap dispara
+      //este refetch al arrancar la página, y el server suele incluir el
+      //estado actual de Town/BuildingOrders que el juego necesita ver.
+      const notifsCJ = ciudadesJugador && ciudadesJugador.json && ciudadesJugador.json.notifications;
+      if (Array.isArray(notifsCJ) && notifsCJ.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifsCJ },
+        }));
+      }
       ciudadesJugador = ciudadesJugador.json.collections.Towns.data;
 
       //Para reportar cuántas aldeas vienen ya con cooldown server vivo desde
@@ -3669,6 +4351,15 @@
           }
         );
         aldeasCiudad = await aldeasCiudad.json();
+        //Re-dispatch notifs por ciudad. Bootstrap recorre N ciudades — cada
+        //island_info devuelve notifs que el juego necesita para mantener su
+        //UI sincronizada (recursos, cola, tropas).
+        const notifsAC = aldeasCiudad && aldeasCiudad.json && aldeasCiudad.json.notifications;
+        if (Array.isArray(notifsAC) && notifsAC.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifsAC },
+          }));
+        }
         aldeasCiudad = aldeasCiudad.json.json.farm_town_list;
 
         //Cada aldea trae `loot` (timestamp Unix en segundos): el momento en
