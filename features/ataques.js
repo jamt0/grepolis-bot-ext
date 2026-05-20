@@ -585,7 +585,7 @@
             "ataques",
             `town=${nombreCiudad(attackerTownId)} sin tropas según server (${errStr}) — reintento próximo ciclo`
           );
-          return { ok: false, error: "sin tropas (server)", noTropas: true };
+          return { ok: false, error: errStr || "sin tropas (server)", noTropas: true };
         }
         core.logWarn("ataques", `respuesta sin success (town=${attackerTownId} → ${targetTownId})`, response);
         //Heurística captcha: si el response no trae notification "Units"
@@ -764,6 +764,7 @@
         islaRuntimePorCiudad.set(tid, {
           islandId: "", ciudades: null, seleccionadas: new Set(),
           loading: false, error: null, atacando: false, progreso: null,
+          resultados: new Map(),
         });
       }
       return islaRuntimePorCiudad.get(tid);
@@ -1393,6 +1394,7 @@
         rt.error = null;
         rt.ciudades = null;
         rt.seleccionadas = new Set();
+        rt.resultados = new Map();
         rerenderTab();
         try {
           const ciudades = await obtenerCiudadesDeIsla(v, tid);
@@ -1462,18 +1464,26 @@
       uhint.textContent = "Escribí cuántas mandar de cada tipo. Dejá vacío o 0 para no incluir esa unidad.";
       wrap.appendChild(uhint);
 
-      //Orden: con tropas disponibles primero, después las que ya tienen
-      //cantidad asignada (aunque no haya stock en este momento), después el
-      //resto. Dentro de cada grupo mantenemos el orden de TIPOS_UNIDAD.
-      const ordenadas = TIPOS_UNIDAD.slice().sort((a, b) => {
-        const aTropas = Number(cache[a.key] || 0) > 0 ? 0 : 1;
-        const bTropas = Number(cache[b.key] || 0) > 0 ? 0 : 1;
-        if (aTropas !== bTropas) return aTropas - bTropas;
-        const aAsig = Number(isla.counts[a.key] || 0) > 0 ? 0 : 1;
-        const bAsig = Number(isla.counts[b.key] || 0) > 0 ? 0 : 1;
-        if (aAsig !== bAsig) return aAsig - bAsig;
-        return 0;
-      });
+      //Mostrar SOLO unidades con tropas disponibles o ya configuradas (count>0).
+      //Si el cache todavía no cargó (queryUnits async), mostramos todas para no
+      //ocultar la UI mientras llega. Orden: con tropas primero, luego las
+      //asignadas-sin-stock-momentáneo. Mismo orden interno de TIPOS_UNIDAD.
+      const cacheVacio = Object.keys(cache).length === 0;
+      const ordenadas = TIPOS_UNIDAD
+        .filter((t) =>
+          cacheVacio ||
+          Number(cache[t.key] || 0) > 0 ||
+          Number(isla.counts[t.key] || 0) > 0
+        )
+        .sort((a, b) => {
+          const aTropas = Number(cache[a.key] || 0) > 0 ? 0 : 1;
+          const bTropas = Number(cache[b.key] || 0) > 0 ? 0 : 1;
+          if (aTropas !== bTropas) return aTropas - bTropas;
+          const aAsig = Number(isla.counts[a.key] || 0) > 0 ? 0 : 1;
+          const bAsig = Number(isla.counts[b.key] || 0) > 0 ? 0 : 1;
+          if (aAsig !== bAsig) return aAsig - bAsig;
+          return 0;
+        });
 
       const unitGrid = document.createElement("div");
       unitGrid.style.cssText = "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px";
@@ -1584,6 +1594,52 @@
       });
       wrap.appendChild(btnAtacar);
 
+      //Resumen del último ataque — visible bajo el botón para que el usuario
+      //vea el resultado sin tener que scrollear hasta el checklist. Lista cada
+      //ciudad con su status (✓ verde / ✗ rojo + mensaje del server).
+      if (rt.resultados && rt.resultados.size > 0 && !rt.atacando) {
+        const okCount = Array.from(rt.resultados.values()).filter((r) => r.ok).length;
+        const failCount = rt.resultados.size - okCount;
+        const hayFallos = failCount > 0;
+
+        const resumenBox = document.createElement("div");
+        resumenBox.style.cssText =
+          "margin-top:10px;padding:8px 10px;border-radius:3px;" +
+          (hayFallos
+            ? "background:#1a0e0e;border:1px solid #5a2424"
+            : "background:#0f1a13;border:1px solid #1f5a2b");
+
+        const head = document.createElement("div");
+        head.style.cssText =
+          `color:${hayFallos ? "#e74c3c" : "#27ae60"};font-size:11px;` +
+          "font-weight:bold;margin-bottom:6px";
+        head.textContent = `Último ataque · ✓ ${okCount} OK · ✗ ${failCount} fallaron`;
+        resumenBox.appendChild(head);
+
+        const lista = document.createElement("div");
+        lista.style.cssText =
+          "display:flex;flex-direction:column;gap:2px;max-height:240px;overflow-y:auto;" +
+          "font-size:10.5px;font-family:monospace";
+        //Recorremos rt.ciudades para que el orden coincida con el checklist.
+        for (const c of rt.ciudades || []) {
+          const res = rt.resultados.get(c.id);
+          if (!res) continue;
+          const fila = document.createElement("div");
+          fila.style.cssText =
+            "padding:2px 4px;white-space:normal;word-break:break-word;" +
+            (res.ok ? "color:#27ae60" : "color:#e74c3c");
+          if (res.ok) {
+            fila.textContent = `✓ ${c.name} (#${c.id})`;
+          } else {
+            fila.textContent = `✗ ${c.name} (#${c.id}): ${res.error}`;
+            fila.title = res.error || "";
+          }
+          lista.appendChild(fila);
+        }
+        resumenBox.appendChild(lista);
+        wrap.appendChild(resumenBox);
+      }
+
       //Hint si falta config
       if (!habilitado && !rt.atacando) {
         const hint = document.createElement("div");
@@ -1672,6 +1728,23 @@
         row.appendChild(info);
 
         lista.appendChild(row);
+
+        //Resultado del último ataque a esta ciudad (si lo hubo). Lo mostramos
+        //como fila separada bajo el row para no romper el flex horizontal y
+        //que el mensaje completo del server (a veces largo) tenga su línea.
+        const res = rt.resultados && rt.resultados.get(c.id);
+        if (res) {
+          const resRow = document.createElement("div");
+          resRow.style.cssText =
+            "padding:3px 10px 5px 30px;font-size:10.5px;font-family:monospace;" +
+            "border-top:0;white-space:normal;word-break:break-word;" +
+            (res.ok
+              ? "color:#27ae60;background:#0f1a13"
+              : "color:#e74c3c;background:#1a0e0e");
+          resRow.textContent = res.ok ? "✓ enviado" : `✗ ${res.error}`;
+          if (res.error) resRow.title = res.error;
+          lista.appendChild(resRow);
+        }
       }
       cont.appendChild(lista);
       return cont;
@@ -1700,6 +1773,7 @@
 
       rt.atacando = true;
       rt.progreso = { actual: 0, total: objetivos.length, ok: 0, fail: 0 };
+      rt.resultados = new Map();
       rerenderTab();
 
       core.log("ataques", `🏝️ ataque a isla ${cfg.isla.islandId} — ${objetivos.length} ciudades · ${formatCountsCorto(counts)} por ciudad`, "info");
@@ -1711,6 +1785,7 @@
         }
         const r = await enviarAtaque(tid, obj.id, counts);
         rt.progreso.actual += 1;
+        rt.resultados.set(obj.id, { ok: !!r.ok, error: r.ok ? null : (r.error || "fallo") });
         if (r.ok) {
           rt.progreso.ok += 1;
           registrarHistorial({
@@ -1822,24 +1897,28 @@
     //Chips multi-select. Genérico — recibe la lista de keys seleccionadas
     //y un callback que se llama con el array nuevo al togglear. Reutilizado
     //por la sección round-trip (cfg.unitTypes) y la sección spam (cfg.spamUnitTypes).
-    //Mostramos los 21 tipos siempre, ordenados por: seleccionados primero,
-    //luego con tropas, luego vacíos.
+    //Mostramos solo las unidades con tropas disponibles o ya seleccionadas
+    //(para no perder la selección si la ciudad queda sin stock momentáneo).
+    //Si el cache no cargó aún, mostramos todas para no esconder la UI.
     function renderUnitChips(townId, selectedKeys, onToggle) {
       const wrap = document.createElement("div");
       wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px";
 
       const cache = data.ataques.unitsCache[townId] || {};
       const selSet = new Set(selectedKeys || []);
+      const cacheVacio = Object.keys(cache).length === 0;
 
-      const ordenados = TIPOS_UNIDAD.slice().sort((a, b) => {
-        const aSel = selSet.has(a.key) ? 0 : 1;
-        const bSel = selSet.has(b.key) ? 0 : 1;
-        if (aSel !== bSel) return aSel - bSel;
-        const aN = Number(cache[a.key] || 0);
-        const bN = Number(cache[b.key] || 0);
-        if ((aN > 0) !== (bN > 0)) return bN - aN;
-        return 0;
-      });
+      const ordenados = TIPOS_UNIDAD
+        .filter((t) => cacheVacio || Number(cache[t.key] || 0) > 0 || selSet.has(t.key))
+        .sort((a, b) => {
+          const aSel = selSet.has(a.key) ? 0 : 1;
+          const bSel = selSet.has(b.key) ? 0 : 1;
+          if (aSel !== bSel) return aSel - bSel;
+          const aN = Number(cache[a.key] || 0);
+          const bN = Number(cache[b.key] || 0);
+          if ((aN > 0) !== (bN > 0)) return bN - aN;
+          return 0;
+        });
 
       for (const t of ordenados) {
         const count = Number(cache[t.key] || 0);
