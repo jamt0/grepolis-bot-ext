@@ -604,6 +604,280 @@
     };
   }
 
+  //—— Contraseñas para desbloquear módulos ————————————————————————————
+  //
+  //DOS niveles de unlock independientes, ambos in-memory (NO persisten a
+  //F5: cada reload arranca locked y vuelve a pedir la pwd cuando toca).
+  //
+  //  1. RECURSOS  → desbloquea: construcción · oro · comercio.
+  //                 La pwd se pide al PRIMER click en la card "Jam" — no
+  //                 hay modal automático al cargar la página.
+  //
+  //  2. PREMIUM   → desbloquea: ataques · defensa · hechizos.
+  //                 La pwd se ingresa desde el botón "Papi jam me dio
+  //                 permiso del premium" en la tab Settings.
+  //
+  //Son independientes — desbloquear premium no implica recursos ni
+  //viceversa (los tabs visibles dependen de cada flag).
+  //
+  //Mecánica de unlock SIN reload: cuando una pwd se ingresa OK, el flag
+  //se prende y se disparan los callbacks suscritos vía onRecursosUnlock /
+  //onPremiumUnlock. Cada feature protegida usa esa suscripción para que
+  //su init() se vuelva a invocar — la primera vez salió temprano por el
+  //gate, la segunda arma polls/timers normalmente.
+  //
+  //Las contraseñas originales NO están en el código. Acá vive solo el
+  //hash SHA-256 (one-way: ver el hash no permite recuperar el texto).
+
+  const PWD_HASH_RECURSOS = "04e5e47dfbbe89edb2f2e5c82534e5b365c1b47f0c8ff096ffacee174da92a18";
+  const PWD_HASH_PREMIUM  = "4b1df875ffaf176a6475dcb47198c383b6cf70ea24db9ca3339c682e9c0c181a";
+  const MENSAJE_BLOQUEADO = "Eso solo es de Jam";
+  let recursosUnlocked = false;
+  let premiumUnlocked = false;
+  const recursosUnlockListeners = [];
+  const premiumUnlockListeners = [];
+
+  async function sha256Hex(texto) {
+    const enc = new TextEncoder().encode(String(texto));
+    const buf = await crypto.subtle.digest("SHA-256", enc);
+    const arr = Array.from(new Uint8Array(buf));
+    return arr.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function isRecursosUnlocked() { return recursosUnlocked; }
+  function isPremiumUnlocked()  { return premiumUnlocked;  }
+
+  //Suscripción a evento de unlock. Si el flag ya está prendido cuando el
+  //caller se suscribe, el callback corre inmediato — así el caller no
+  //tiene que chequear el flag antes de suscribir.
+  function onRecursosUnlock(cb) {
+    if (typeof cb !== "function") return;
+    if (recursosUnlocked) {
+      try { cb(); } catch (e) { logError("core", "onRecursosUnlock cb (ya unlocked)", e); }
+      return;
+    }
+    recursosUnlockListeners.push(cb);
+  }
+  function onPremiumUnlock(cb) {
+    if (typeof cb !== "function") return;
+    if (premiumUnlocked) {
+      try { cb(); } catch (e) { logError("core", "onPremiumUnlock cb (ya unlocked)", e); }
+      return;
+    }
+    premiumUnlockListeners.push(cb);
+  }
+
+  function dispararUnlock(listeners, nivel) {
+    //Vaciamos la lista mientras la recorremos — los listeners son
+    //one-shot: una vez que el flag está prendido, no necesitan
+    //re-correr (cualquier suscripción nueva sale por el atajo "ya
+    //unlocked" de onXUnlock).
+    while (listeners.length) {
+      const cb = listeners.shift();
+      try { cb(); } catch (e) { logError("core", `unlock listener (${nivel})`, e); }
+    }
+  }
+
+  //Modal HTML coherente con el resto del panel del bot. Es parametrizable
+  //por nivel — RECURSOS y PREMIUM usan el mismo overlay/UX, cambia solo
+  //título, descripción y hash esperado. Devuelve Promise que resuelve
+  //cuando el usuario confirma o cancela.
+  async function mostrarModalPwd({ titulo, descHtml, hashEsperado, onSuccess }) {
+    if (!document.body) {
+      log("core", `modal pwd (${titulo}) — body no disponible`, "warn");
+      return;
+    }
+    //Si ya hay un modal montado (doble click en el trigger, p.ej.), no
+    //montamos otro encima.
+    if (document.getElementById("jambot-pwd-overlay")) return;
+
+    return new Promise((resolve) => {
+      //Overlay semi-transparente para foco visual + bloquear clicks fuera.
+      const overlay = document.createElement("div");
+      overlay.id = "jambot-pwd-overlay";
+      overlay.style.cssText =
+        "position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:99998;" +
+        "display:flex;align-items:center;justify-content:center;" +
+        "font-family:'Segoe UI',Arial,sans-serif";
+
+      const modal = document.createElement("div");
+      modal.style.cssText =
+        "min-width:340px;max-width:420px;background:#172029;" +
+        "border:1px solid #2c3a4d;border-radius:6px;" +
+        "box-shadow:0 8px 32px rgba(0,0,0,0.6);" +
+        "padding:18px 20px;color:#e6e9ee";
+
+      const tituloEl = document.createElement("div");
+      tituloEl.textContent = titulo;
+      tituloEl.style.cssText =
+        "font-size:14px;font-weight:bold;letter-spacing:0.3px;margin-bottom:10px;" +
+        "border-bottom:1px solid #2c3a4d;padding-bottom:8px;color:#e6e9ee";
+      modal.appendChild(tituloEl);
+
+      const desc = document.createElement("div");
+      desc.innerHTML = descHtml;
+      desc.style.cssText = "font-size:12px;color:#bdc3c7;margin-bottom:14px;line-height:1.5";
+      modal.appendChild(desc);
+
+      const input = document.createElement("input");
+      input.type = "password";
+      input.placeholder = "contraseña…";
+      input.style.cssText =
+        "width:100%;box-sizing:border-box;padding:8px 10px;" +
+        "background:#0f1620;color:#e6e9ee;border:1px solid #2c3a4d;border-radius:4px;" +
+        "font-size:13px;outline:none;font-family:'Segoe UI',Arial,sans-serif";
+      input.addEventListener("focus", () => { input.style.borderColor = "#9b59b6"; });
+      input.addEventListener("blur", () => { input.style.borderColor = "#2c3a4d"; });
+      modal.appendChild(input);
+
+      //Mensaje de error inline: vacío al inicio; se rellena si la pwd no
+      //coincide. NO cerramos el modal en ese caso — el usuario puede
+      //reintentar sin perder contexto.
+      const errorEl = document.createElement("div");
+      errorEl.style.cssText =
+        "min-height:16px;margin-top:6px;color:#e74c3c;font-size:11.5px;font-weight:bold";
+      modal.appendChild(errorEl);
+
+      const botones = document.createElement("div");
+      botones.style.cssText = "display:flex;gap:8px;justify-content:flex-end;margin-top:14px";
+
+      const btnCancelar = document.createElement("button");
+      btnCancelar.type = "button";
+      btnCancelar.textContent = "Cancelar";
+      btnCancelar.style.cssText =
+        "padding:7px 14px;background:#2c3a4d;color:#cdd5e0;border:0;" +
+        "border-radius:3px;cursor:pointer;font-size:12px;font-weight:bold";
+
+      const btnAceptar = document.createElement("button");
+      btnAceptar.type = "button";
+      btnAceptar.textContent = "Desbloquear";
+      btnAceptar.style.cssText =
+        "padding:7px 14px;background:#9b59b6;color:#fff;border:0;" +
+        "border-radius:3px;cursor:pointer;font-size:12px;font-weight:bold";
+
+      botones.appendChild(btnCancelar);
+      botones.appendChild(btnAceptar);
+      modal.appendChild(botones);
+      overlay.appendChild(modal);
+      document.body.appendChild(overlay);
+
+      //Foco al input ni bien se monta — UX similar al prompt nativo.
+      setTimeout(() => { try { input.focus(); } catch (_) {} }, 30);
+
+      function cerrar() {
+        try { overlay.remove(); } catch (_) {}
+      }
+
+      async function intentar() {
+        const intento = (input.value || "").trim();
+        if (!intento) {
+          errorEl.textContent = "Ingresá una contraseña o tocá Cancelar.";
+          input.focus();
+          return;
+        }
+        let hash;
+        try {
+          hash = await sha256Hex(intento);
+        } catch (e) {
+          logError("core", "no pude hashear la contraseña ingresada", e);
+          errorEl.textContent = "Error técnico — abrí la consola para más detalle.";
+          return;
+        }
+        if (hash === hashEsperado) {
+          //Mostrar mensaje verde en el mismo lugar que el de error,
+          //deshabilitar controles para que no se pueda interactuar, y
+          //cerrar tras un beat corto. Así el usuario ve el feedback
+          //positivo antes de que el modal desaparezca.
+          errorEl.style.color = "#27ae60";
+          errorEl.textContent = "tienes el permiso de papi jam";
+          input.disabled = true;
+          btnAceptar.disabled = true;
+          btnCancelar.disabled = true;
+          btnAceptar.style.opacity = "0.6";
+          btnCancelar.style.opacity = "0.6";
+          try { onSuccess(); } catch (e) { logError("core", "modal pwd onSuccess", e); }
+          setTimeout(() => { cerrar(); resolve(); }, 1200);
+        } else {
+          errorEl.textContent = "pidele permiso a papi Jam";
+          input.select();
+        }
+      }
+
+      btnAceptar.addEventListener("click", intentar);
+      btnCancelar.addEventListener("click", () => {
+        cerrar();
+        resolve();
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          intentar();
+        } else if (e.key === "Escape") {
+          cerrar();
+          resolve();
+        }
+      });
+    });
+  }
+
+  async function pedirContraseñaRecursos() {
+    if (recursosUnlocked) return;
+    await mostrarModalPwd({
+      titulo: "JamBot — Permiso de recursos",
+      descHtml:
+        "Ingresá la contraseña para desbloquear:<br>" +
+        "<span style=\"color:#9b59b6;font-weight:bold\">construcción · oro · comercio</span>",
+      hashEsperado: PWD_HASH_RECURSOS,
+      onSuccess: () => {
+        recursosUnlocked = true;
+        log("core", "RECURSOS desbloqueado", "ok");
+        dispararUnlock(recursosUnlockListeners, "recursos");
+      },
+    });
+  }
+
+  async function pedirContraseñaPremium() {
+    if (premiumUnlocked) return;
+    await mostrarModalPwd({
+      titulo: "JamBot — Permiso premium",
+      descHtml:
+        "Ingresá la contraseña para desbloquear:<br>" +
+        "<span style=\"color:#9b59b6;font-weight:bold\">construcción · oro · comercio · ataques · defensa · hechizos</span>",
+      hashEsperado: PWD_HASH_PREMIUM,
+      onSuccess: () => {
+        premiumUnlocked = true;
+        log("core", "PREMIUM desbloqueado", "ok");
+        dispararUnlock(premiumUnlockListeners, "premium");
+      },
+    });
+  }
+
+  //Helper para que cada módulo protegido use el mismo placeholder cuando
+  //el usuario aún no ingresó la contraseña del nivel correspondiente. En
+  //la práctica no debería verse: los tabs locked no se muestran en la
+  //barra de tabs. Queda como defensa por si algo invoca renderTab desde
+  //la consola u otra ruta.
+  function renderBloqueoEnTab(body) {
+    body.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.style.cssText =
+      "display:flex;flex-direction:column;align-items:center;justify-content:center;" +
+      "padding:60px 20px;gap:14px;text-align:center;font-family:'Segoe UI',sans-serif";
+    const icono = document.createElement("div");
+    icono.textContent = "🔒";
+    icono.style.cssText = "font-size:42px;line-height:1";
+    const txt = document.createElement("div");
+    txt.textContent = MENSAJE_BLOQUEADO;
+    txt.style.cssText = "color:#e74c3c;font-size:18px;font-weight:bold;letter-spacing:0.3px";
+    const sub = document.createElement("div");
+    sub.textContent = "Desbloqueá la categoría correspondiente para ver este tab.";
+    sub.style.cssText = "color:#7a8aa0;font-size:12px;font-style:italic";
+    wrap.appendChild(icono);
+    wrap.appendChild(txt);
+    wrap.appendChild(sub);
+    body.appendChild(wrap);
+  }
+
   //—— Inicialización compartida ——————————————————————————————————————————
 
   /**
@@ -638,6 +912,14 @@
       return null;
     }
     log("core", `bootstrap world=${world_id} town=${townId} player=${player_id}`, "ok");
+
+    //NO se pide contraseña en el bootstrap: ambos niveles (RECURSOS y
+    //PREMIUM) están locked por defecto y se desbloquean on-demand desde
+    //la UI — RECURSOS al primer click en la card "Jam" (recoleccion.js),
+    //PREMIUM desde el botón en Settings. Las features protegidas leen el
+    //flag en su init: si está locked, salen temprano y se suscriben al
+    //evento onXUnlock para que su init se vuelva a invocar cuando el
+    //usuario ingrese la pwd correcta — así no hace falta reload.
 
     //Escuchar el bridge para detectar cambios de bot_check.
     //  active=true  → onCaptchaDetectado() sin contexto (la feature que
@@ -681,6 +963,13 @@
         logError,
         logCiclo,
         sonarAdvertencia,
+        isRecursosUnlocked,
+        isPremiumUnlocked,
+        onRecursosUnlock,
+        onPremiumUnlock,
+        pedirContraseñaRecursos,
+        pedirContraseñaPremium,
+        renderBloqueoEnTab,
       },
     };
   }
@@ -711,6 +1000,13 @@
     getErrores,
     clearErrores,
     sonarAdvertencia,
+    isRecursosUnlocked,
+    isPremiumUnlocked,
+    onRecursosUnlock,
+    onPremiumUnlock,
+    pedirContraseñaRecursos,
+    pedirContraseñaPremium,
+    renderBloqueoEnTab,
   };
 
   //Atajo para que el usuario pueda invocar desde DevTools:

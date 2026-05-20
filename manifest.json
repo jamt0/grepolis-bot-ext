@@ -29,6 +29,7 @@
                 "features/ataquesEntrantes.js",
                 "features/mercadoOro.js",
                 "features/comercio.js",
+                "features/hechizos.js",
                 "contentScript.js"
             ],
             "run_at": "document_end"

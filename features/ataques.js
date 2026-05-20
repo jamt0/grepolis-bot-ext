@@ -86,6 +86,18 @@
     const { data, game, core } = ctx;
     const { csrfToken, world_id } = game;
 
+    //Módulo PREMIUM: si la pwd no está ingresada, salimos temprano sin
+    //arrancar ciclos/timers. El tab "Ataques" tampoco se muestra en el
+    //panel (recoleccion.js lo oculta). Nos suscribimos al evento de
+    //unlock para que init() se vuelva a invocar cuando el usuario ingrese
+    //la pwd correcta — la segunda corrida pasa el gate y arma todo.
+    if (!core.isPremiumUnlocked()) {
+      core.log("ataques", "bloqueado — sin pwd premium", "warn");
+      JamBot.features.ataques.api = { renderTab: core.renderBloqueoEnTab };
+      core.onPremiumUnlock(() => init(ctx));
+      return;
+    }
+
     const STORAGE_KEY = `jambotAtaques_${world_id}`;
     //Margen post-arrival_at*2 para asegurar que las tropas hayan vuelto
     //(algunas mueren en el ataque, así que el conteo del próximo ciclo es

@@ -440,6 +440,45 @@
     //clickear sin querer. Esta card es solo un "abridor".
 
     const panelConfig = crearPanelConfig();
+
+    //Trigger one-shot del modal RECURSOS: la pwd se pide al PRIMER click
+    //en la card Jam de cada carga. Si el usuario cancela, no se le vuelve
+    //a preguntar (queda con los 3 tabs libres). Al F5 el flag se resetea
+    //y vuelve a pedir.
+    let recursosPwdYaSolicitada = false;
+
+    //Cuando una pwd se ingresa OK en runtime (RECURSOS desde la card,
+    //PREMIUM desde Settings), re-renderear el panel para que aparezcan
+    //los tabs nuevos. Si está cerrado, no hace falta — al abrirse se
+    //construye con el estado actual.
+    const reRenderSiAbierto = () => {
+      const panel = document.getElementById("panelConfigJam");
+      if (panel && panel.style.display !== "none") renderPanelConfig(panel);
+    };
+    core.onRecursosUnlock(reRenderSiAbierto);
+    core.onPremiumUnlock(reRenderSiAbierto);
+    //Repintar el slime cuando se desbloquea PREMIUM (rosa → morado).
+    core.onPremiumUnlock(() => pintarSlime());
+
+    //Paleta del slime de la card "Jam". Morado cuando hay PREMIUM, rosa
+    //cuando no — para que el usuario vea de un vistazo si tiene los
+    //features avanzados activos.
+    function coloresSlime() {
+      return core.isPremiumUnlocked()
+        ? { fill: "#9b59b6", stroke: "#7d3c98" }  // morado premium
+        : { fill: "#e91e63", stroke: "#ad1457" }; // rosa sin premium
+    }
+
+    //Repinta el body del slime in-situ sin remontar la card. Se llama
+    //cuando se dispara onPremiumUnlock.
+    function pintarSlime() {
+      const body = document.querySelector("#jambot-card .jambot-slime-body");
+      if (!body) return;
+      const { fill, stroke } = coloresSlime();
+      body.setAttribute("fill", fill);
+      body.setAttribute("stroke", stroke);
+    }
+
     crearCardJam();
 
     function crearCardJam() {
@@ -466,22 +505,24 @@
         "font-family:'Segoe UI',sans-serif;font-size:13px;font-weight:bold;" +
         "letter-spacing:0.3px;box-shadow:0 2px 6px rgba(0,0,0,0.3);" +
         "transition:background 0.15s,border-color 0.15s";
-      //SVG slime: blob verde con dos ojitos. No hay emoji estándar de
-      //slime; un SVG inline queda más limpio que cualquier emoji forzado.
+      //SVG slime: blob con dos ojitos. Color depende del estado PREMIUM —
+      //morado si está desbloqueado, rosa si no. La clase en el path
+      //principal nos permite repintar in-situ cuando se dispara el unlock
+      //sin tener que remontar la card.
+      const { fill, stroke } = coloresSlime();
       card.innerHTML =
         `<svg width="22" height="22" viewBox="0 0 24 24" style="flex-shrink:0">
            <ellipse cx="12" cy="19" rx="10" ry="3" fill="rgba(0,0,0,0.25)"/>
-           <path d="M3 17 Q3 7 12 5 Q21 7 21 17 Q21 20 12 20 Q3 20 3 17 Z"
-                 fill="#27ae60" stroke="#1e8449" stroke-width="0.8"/>
+           <path class="jambot-slime-body"
+                 d="M3 17 Q3 7 12 5 Q21 7 21 17 Q21 20 12 20 Q3 20 3 17 Z"
+                 fill="${fill}" stroke="${stroke}" stroke-width="0.8"/>
            <path d="M5 12 Q12 4 19 12 Q12 9 5 12 Z" fill="rgba(255,255,255,0.18)"/>
            <circle cx="9" cy="13" r="1.6" fill="#fff"/>
            <circle cx="15" cy="13" r="1.6" fill="#fff"/>
            <circle cx="9.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
            <circle cx="15.4" cy="13.4" r="0.7" fill="#0a0a0a"/>
          </svg>
-         <span>Jam</span>
-         <span id="jambot-card-estado" style="margin-left:4px;font-size:14px"></span>
-         <span id="jambot-card-countdown" style="margin-left:6px;font-size:11px;font-family:monospace;color:#7a8aa0;font-weight:normal"></span>`;
+         <span>Jam</span>`;
       card.addEventListener("mouseenter", () => {
         card.style.background = "#26344a";
         card.style.borderColor = "#3498db";
@@ -490,7 +531,16 @@
         card.style.background = "#1f2a36";
         card.style.borderColor = "#2c3a4d";
       });
-      card.addEventListener("click", () => {
+      card.addEventListener("click", async () => {
+        //Primer click de la sesión y RECURSOS sin desbloquear → modal.
+        //Esperamos que el usuario confirme o cancele antes de abrir el
+        //panel; si confirma, el evento onRecursosUnlock va a re-renderear
+        //sobre el panel ya abierto, así no hay race.
+        if (!core.isRecursosUnlocked() && !recursosPwdYaSolicitada) {
+          recursosPwdYaSolicitada = true;
+          await core.pedirContraseñaRecursos();
+        }
+
         //Click en la card normalmente lleva a Dashboard. EXCEPCIÓN: cuando
         //hay CAPTCHA pendiente, lleva a Recolección — ahí está el cartel
         //con el botón "Ya resolví", que es lo único que el usuario quiere
@@ -514,79 +564,9 @@
       return card;
     }
 
-    function actualizarEstadoCard() {
-      const card = document.getElementById("jambot-card");
-      const span = document.getElementById("jambot-card-estado");
-      const captchaActivo = core.isCaptchaActive();
-      const captchaState = core.getCaptchaState ? core.getCaptchaState() : "none";
-      const ctx = core.getCaptchaContext ? core.getCaptchaContext() : null;
-      const resueltoEnJuego = core.isCaptchaResueltoEnJuego && core.isCaptchaResueltoEnJuego();
-
-      if (span) {
-        if (captchaActivo) {
-          span.textContent = captchaState === "timeout" ? "⏱" : "⚠";
-          span.style.color = captchaState === "timeout" ? "#7a8aa0" : "#e74c3c";
-        } else if (core.isPaused()) {
-          span.textContent = "▶";
-          span.style.color = "#27ae60";
-        } else {
-          //Corriendo: sin icono. El countdown / spinner indican actividad.
-          //Antes mostrábamos ⏸ pero confunde — leer "pausa" cuando en
-          //realidad está corriendo.
-          span.textContent = "";
-        }
-      }
-
-      //Cuando hay CAPTCHA, además del ⚠ pintamos el borde rojo (o verde
-      //si el bridge ya detectó que el captcha del juego se limpió y solo
-      //falta el click "Ya resolví"). En timeout queda gris.
-      if (card) {
-        if (captchaActivo) {
-          card.style.borderColor =
-            captchaState === "timeout" ? "#7a8aa0" :
-            resueltoEnJuego ? "#27ae60" : "#e74c3c";
-          //Tooltip con el contexto.
-          if (ctx && ctx.ciudad && ctx.aldea) {
-            card.title = `CAPTCHA · ${ctx.ciudad.nombre} → ${ctx.aldea.nombre} (click para resolver)`;
-          } else {
-            card.title = "CAPTCHA pendiente — click para resolver";
-          }
-        } else {
-          //Restaurar el borde default (lo manejan los hover handlers).
-          card.style.borderColor = "#2c3a4d";
-          card.title = "";
-        }
-      }
-
-      //Indicador secundario (countdown / spinner / texto CAPTCHA).
-      const cd = document.getElementById("jambot-card-countdown");
-      if (cd) {
-        if (captchaActivo && ctx && ctx.aldea) {
-          //Mostrar la aldea que falló — el usuario lee el pulpo y ya sabe
-          //cuál tiene que recolectar manual sin abrir el panel.
-          cd.innerHTML = `<span style="color:#f39c12">${escapeHtml(ctx.aldea.nombre)}</span>`;
-        } else if (cicloActual) {
-          cd.innerHTML = `<span class="jambot-spinner"></span>`;
-        } else if (proximoTickAt && !core.isPaused()) {
-          const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
-          cd.textContent = core.formatDuracion(seg);
-        } else {
-          cd.innerHTML = "";
-        }
-      }
-    }
-    actualizarEstadoCard();
-    //Tick de 1s SOLO para refrescar el countdown al próximo ciclo.
-    //El spinner es CSS puro y los demás estados se actualizan por evento
-    //(onPlayPauseChange/onCaptcha) o por llamadas explícitas, así que el
-    //interval en sí mismo no es necesario para esos casos. Igual lo
-    //dejamos siempre activo: actualizarEstadoCard es barato (lee globals
-    //y toca 2-3 nodos) y simplifica el ciclo de vida — no hay que
-    //arrancar/parar el interval según el estado.
-    setInterval(actualizarEstadoCard, 1000);
-
-    //Reaccionar al play/pause global: cancelar tick al pausar, arrancar al
-    //despausar. El estado se sincroniza con `core.isPaused()`.
+    //Reaccionar al play/pause global: cancelar tick al pausar, arrancar
+    //al despausar. La card ya no muestra estado/countdown, así que acá
+    //solo manejamos los timers del ciclo.
     core.onPlayPauseChange((p) => {
       if (p) {
         if (proximoTickId) clearTimeout(proximoTickId);
@@ -594,9 +574,7 @@
         proximoTickId = null;
         proximoTickAt = null;
         watchdogId = null;
-        actualizarEstadoCard();
       } else {
-        actualizarEstadoCard();
         recolectarRecursos();
       }
     });
@@ -734,19 +712,6 @@
           .pcj-row:hover { background: rgba(255,255,255,0.04) !important; }
           #panelConfigJam button:focus { outline: 2px solid #3498db44; outline-offset: 1px; }
 
-          /* Spinner para la card "Jam" cuando hay un ciclo en curso.
-             CSS-only (no depende de re-renders en JS). */
-          @keyframes jb-spin { to { transform: rotate(360deg); } }
-          .jambot-spinner {
-            display: inline-block;
-            width: 11px; height: 11px;
-            border: 2px solid rgba(255,255,255,0.15);
-            border-top-color: #f39c12;
-            border-radius: 50%;
-            animation: jb-spin 0.8s linear infinite;
-            vertical-align: -1px;
-          }
-
           /* Scrollbar custom alineado con el dark theme del panel.
              Solo aplica al body con scroll y a cualquier descendiente que
              scrollee. Webkit-only — Firefox usa scrollbar-width/color. */
@@ -843,6 +808,7 @@
           else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
           else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
           else if (tabActivo === "comercio") renderTabComercioDelegado(body);
+          else if (tabActivo === "hechizos") renderTabHechizosDelegado(body);
         });
       }, 1000);
       //Capture phase para correr antes que el click handler del botón ⚙
@@ -899,14 +865,30 @@
       tabs.style.cssText =
         "display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;" +
         "border-bottom:1px solid #2c3a4d;background:#172029";
+      //Tabs libres — siempre visibles.
       tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
-      tabs.appendChild(crearBotonTab("construccion", "Construcción"));
-      tabs.appendChild(crearBotonTab("ataques", "Ataques"));
-      tabs.appendChild(crearBotonTab("defensa", "Defensa"));
-      tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
-      tabs.appendChild(crearBotonTab("comercio", "Comercio"));
+      //Tabs protegidos — todos detrás de PREMIUM. Sin la pwd premium el
+      //usuario solo ve Dashboard / Settings / Recolección. Cuando se
+      //desbloquea, aparecen las 6 pestañas avanzadas de un saque.
+      const premiumUnlocked = core.isPremiumUnlocked && core.isPremiumUnlocked();
+      if (premiumUnlocked) {
+        tabs.appendChild(crearBotonTab("construccion", "Construcción"));
+        tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
+        tabs.appendChild(crearBotonTab("comercio", "Comercio"));
+        tabs.appendChild(crearBotonTab("ataques", "Ataques"));
+        tabs.appendChild(crearBotonTab("defensa", "Defensa"));
+        tabs.appendChild(crearBotonTab("hechizos", "Hechizos"));
+      }
+      //Si el usuario tenía persistido un tab protegido y ahora está
+      //locked (F5 o primer load), lo enviamos a Recolección — sino el
+      //body queda vacío.
+      const TABS_PROTEGIDOS = ["construccion", "mercadoOro", "comercio", "ataques", "defensa", "hechizos"];
+      if (TABS_PROTEGIDOS.includes(tabActivo) && !premiumUnlocked) {
+        tabActivo = "recoleccion";
+        try { window.localStorage.setItem(STORAGE_KEY_TAB, "recoleccion"); } catch (_) {}
+      }
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -971,6 +953,7 @@
       else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
       else if (tabActivo === "mercadoOro") renderTabMercadoOroDelegado(body);
       else if (tabActivo === "comercio") renderTabComercioDelegado(body);
+      else if (tabActivo === "hechizos") renderTabHechizosDelegado(body);
       else renderTabRecoleccion(body);
     }
 
@@ -1027,6 +1010,19 @@
         body.innerHTML = "";
         const v = document.createElement("div");
         v.textContent = "La feature de comercio todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabHechizosDelegado(body) {
+      const api = JamBot.features.hechizos && JamBot.features.hechizos.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de hechizos todavía no está cargada.";
         v.style.cssText = "opacity:0.7;padding:8px 0";
         body.appendChild(v);
         return;
@@ -1135,18 +1131,63 @@
 
     function renderTabDashboard(body) {
       body.innerHTML = "";
-      //El botón Iniciar/Pausar de Recolección vive en su propia tab
-      //(renderBannerRecoleccion), no acá. Cada módulo (Recolección,
-      //Construcción, Ataques) tiene su propio control en su tab, y los
-      //monitores (Defensa, Oro) no necesitan. Dashboard es solo métricas.
-
-      //Métricas de Recolección
+      //Vista minimalista: solo Recolección, con el botón Iniciar/Pausar y
+      //una línea con "Último ciclo: hace Xs · Próximo en Ys". El resto de
+      //métricas (ciclos OK, tasa, aldeas farmeadas, recursos, etc.) viven
+      //en el tab Recolección para no inflar el dashboard.
       body.appendChild(crearTituloSeccion("Recolección"));
-      body.appendChild(renderMetricasRecoleccion());
+      body.appendChild(renderBannerRecoleccion());
+      body.appendChild(renderResumenCiclosDashboard());
+    }
 
-      //Métricas de Construcción
-      body.appendChild(crearTituloSeccion("Construcción"));
-      body.appendChild(renderMetricasConstruccion());
+    //Línea compacta con "Último ciclo: hace Xs · Próximo: en Ys". El banner
+    //que va arriba ya tiene el countdown del próximo en su sub-text — acá
+    //repetimos ambos juntos en un layout consistente y agregamos el "último"
+    //que no está en el banner.
+    function renderResumenCiclosDashboard() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:flex;gap:10px;padding:10px 12px;" +
+        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
+        "font-size:12px";
+
+      //Último ciclo terminado: tomamos el más reciente de la lista
+      //persistida. `c.fin` se setea cuando el ciclo cierra (ver línea ~3121).
+      //Si no hay todavía ciclos cerrados, mostramos "—".
+      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
+      const ultimoTxt = (ultimo && ultimo.fin)
+        ? `hace ${formatRelativo(ultimo.fin)}`
+        : "—";
+
+      //Próximo ciclo: si hay uno agendado (proximoTickAt) y no estamos
+      //pausados, lo formateamos como countdown. Si hay un ciclo en curso,
+      //mostramos eso en su lugar. Si está pausado, "—".
+      let proxTxt;
+      if (cicloActual) {
+        proxTxt = `en curso · ${cicloActual.aldeasCompletadas}/${cicloActual.totalAldeas} aldeas`;
+      } else if (proximoTickAt && !core.isPaused()) {
+        const seg = Math.max(0, Math.round((proximoTickAt - Date.now()) / 1000));
+        proxTxt = `en ${core.formatDuracion(seg)}`;
+      } else if (core.isPaused()) {
+        proxTxt = "pausado";
+      } else {
+        proxTxt = "—";
+      }
+
+      const colItem = (label, valor, valorColor) => {
+        const c = document.createElement("div");
+        c.style.cssText = "flex:1;min-width:0";
+        c.innerHTML =
+          `<div style="color:#7a8aa0;text-transform:uppercase;letter-spacing:0.6px;font-size:9.5px;font-weight:bold;margin-bottom:3px">${escapeHtml(label)}</div>` +
+          `<div style="color:${valorColor || "#e6e9ee"};font-weight:bold;font-size:13.5px;font-family:monospace">${escapeHtml(valor)}</div>`;
+        return c;
+      };
+      wrap.appendChild(colItem("Último ciclo", ultimoTxt, ultimo ? "#27ae60" : "#7a8aa0"));
+      wrap.appendChild(colItem("Próximo", proxTxt,
+        cicloActual ? "#f39c12" : (core.isPaused() ? "#7a8aa0" : "#3498db")
+      ));
+
+      return wrap;
     }
 
     function renderMetricasRecoleccion() {
@@ -1339,6 +1380,15 @@
       //módulo es independiente y tiene su propio control en su tab. El de
       //finalizar está en la tab "Construcción" como banner Iniciar/Detener.
 
+      //Sección: desbloqueo premium (solo si todavía no se ingresó la pwd).
+      //Al confirmarse, core dispara onPremiumUnlock, se re-renderea el
+      //panel entero y este botón desaparece junto con el aparecer de los
+      //tabs Ataques/Defensa/Hechizos.
+      if (!core.isPremiumUnlocked()) {
+        body.appendChild(crearTituloSeccion("Premium"));
+        body.appendChild(renderBotonPermisoPremium());
+      }
+
       //Sección: tiempo por ciudad
       body.appendChild(crearTituloSeccion("Tiempo de recolección por ciudad"));
       body.appendChild(renderTiemposPorCiudad());
@@ -1349,6 +1399,30 @@
 
       //Footer con nombre + versión
       body.appendChild(renderFooterVersion());
+    }
+
+    function renderBotonPermisoPremium() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "margin-top:6px";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.style.cssText =
+        "display:flex;align-items:center;gap:10px;padding:10px 14px;width:100%;" +
+        "background:#9b59b6;color:#fff;border:0;border-radius:4px;cursor:pointer;" +
+        "font-size:12.5px;font-weight:bold;text-align:left;letter-spacing:0.3px;" +
+        "transition:background 0.15s";
+      btn.addEventListener("mouseenter", () => { btn.style.background = "#8e44ad"; });
+      btn.addEventListener("mouseleave", () => { btn.style.background = "#9b59b6"; });
+      btn.innerHTML =
+        `<span style="font-size:16px;flex-shrink:0">🔓</span>` +
+        `<div style="flex:1">` +
+        `<div>Papi jam me dio permiso del premium</div>` +
+        `<div style="color:#e8d5f5;font-size:10.5px;font-weight:normal;margin-top:2px">` +
+        `Desbloquea Construcción · Oro · Comercio · Ataques · Defensa · Hechizos</div>` +
+        `</div>`;
+      btn.addEventListener("click", () => { core.pedirContraseñaPremium(); });
+      wrap.appendChild(btn);
+      return wrap;
     }
 
     //Color único para todas las ciudades. Antes había una paleta cíclica
@@ -2798,19 +2872,16 @@
     }
 
 
-    //Reflejar cambios de CAPTCHA en el botón. Cuando se resuelve, volver
-    //al estado anterior según core.isPaused().
-    core.onCaptcha((active) => {
-      actualizarEstadoCard();
-      void active;
-    });
+    //La card del bot ya no muestra estado de CAPTCHA — quedó solo el
+    //logo y "Jam". El cartel grande del tab Recolección sigue siendo la
+    //fuente de verdad para resolver el captcha.
+    core.onCaptcha((active) => { void active; });
 
-    //Repintar UI cuando cambia el contexto del CAPTCHA — el bridge avisó
-    //"resueltoEnJuego" o el timeout disparó. La card del pulpo y el cartel
-    //grande del tab Recolección leen de core.getCaptchaContext / state.
+    //Repintar el tab Recolección cuando cambia el contexto del CAPTCHA
+    //(bridge avisó "resueltoEnJuego" o timeout disparó). El cartel
+    //grande dentro de ese tab lee de core.getCaptchaContext / state.
     if (core.onCaptchaContextChange) {
       core.onCaptchaContextChange(() => {
-        actualizarEstadoCard();
         const panel = document.getElementById("panelConfigJam");
         if (panel && panel.style.display !== "none") {
           if (tabActivo === "recoleccion") {
@@ -3017,7 +3088,6 @@
 
     async function recolectarRecursos() {
       if (core.isPaused()) return;
-      actualizarEstadoCard();
 
       nCiclo += 1;
       const inicioCiclo = Date.now();
@@ -3111,7 +3181,6 @@
           `ciclo #${nCiclo} interrumpido por CAPTCHA · duró ${core.formatDuracion(duracionCiclo / 1000)} · esperando al humano`,
           "warn"
         );
-        actualizarEstadoCard();
         return;
       }
 
@@ -3203,7 +3272,6 @@
         );
       }
 
-      actualizarEstadoCard();
       programarSiguienteTick(tiempoEspera);
 
       //Refresh auto-detección del cooldown si quedó alguna ciudad sin

@@ -28,7 +28,7 @@
   const JamBot = (window.JamBot = window.JamBot || {});
   JamBot.features = JamBot.features || {};
 
-  const POLL_INTERVAL_MS = 3 * 1000;
+  const POLL_INTERVAL_MS = 5 * 1000;
   const REDESCUBRIR_INTERVAL_MS = 30 * 60 * 1000;
   const UMBRAL = 100;
   const BEEP_INTERVAL_MS = 700;
@@ -47,9 +47,26 @@
     const { game, core } = ctx;
     const { csrfToken, world_id, townId } = game;
 
+    //Módulo PREMIUM: sin pwd no arrancamos polls. El tab "Oro" tampoco
+    //se muestra. Nos suscribimos al evento de unlock para que init() se
+    //vuelva a invocar cuando se ingrese la pwd.
+    if (!core.isPremiumUnlocked()) {
+      core.log("mercadoOro", "bloqueado — sin pwd premium", "warn");
+      JamBot.features.mercadoOro.api = { renderTab: core.renderBloqueoEnTab };
+      core.onPremiumUnlock(() => init(ctx));
+      return;
+    }
+
     const STORAGE_KEY_MAPA = `jambotMercadoOroMapa_${world_id}`;
     const STORAGE_KEY_ALERTAS = `jambotMercadoOroAlertas_${world_id}`;
     const STORAGE_KEY_MUTE = `jambotMercadoOroMute_${world_id}`;
+    const STORAGE_KEY_HABILITADA = `jambotMercadoOroHabilitada_${world_id}`;
+
+    //Toggle Iniciar/Detener — el monitor ya no arranca automáticamente. El
+    //usuario lo enciende explícitamente desde el botón en el header del tab
+    //Oro. Por defecto false (silencioso) para que la extensión no genere
+    //requests sin que el usuario lo pida.
+    let habilitada = false;
 
     let mapaSeaIdToTown = {};
     let ultimoDescubrimiento = 0;
@@ -82,10 +99,13 @@
       try {
         const obj = await new Promise((resolve) => {
           chrome.storage.local.get(
-            [STORAGE_KEY_MAPA, STORAGE_KEY_ALERTAS, STORAGE_KEY_MUTE],
+            [STORAGE_KEY_MAPA, STORAGE_KEY_ALERTAS, STORAGE_KEY_MUTE, STORAGE_KEY_HABILITADA],
             (o) => resolve(o || {})
           );
         });
+        if (typeof obj[STORAGE_KEY_HABILITADA] === "boolean") {
+          habilitada = obj[STORAGE_KEY_HABILITADA];
+        }
         //Mute persistido: shape nuevo es Array<seaId:number>. Shape viejo
         //era boolean (true=todo muteado). Si veo el shape viejo lo descarto
         //(Set vacío) — no sabemos qué mares existían cuando se muteó, y
@@ -136,6 +156,26 @@
       try {
         chrome.storage.local.set({ [STORAGE_KEY_MUTE]: Array.from(maresMuteados) });
       } catch (_) {}
+    }
+    function persistirHabilitada() {
+      try {
+        chrome.storage.local.set({ [STORAGE_KEY_HABILITADA]: habilitada });
+      } catch (_) {}
+    }
+
+    //Setter del toggle Iniciar/Detener. Detener NO descarta las alarmas
+    //activas — solo evita nuevos polls. La alarma que ya estaba sonando sigue
+    //hasta que el usuario apriete ✓ por mar o "Descartar todas". Iniciar
+    //gatilla un ciclo inmediato para feedback rápido.
+    function setHabilitada(b) {
+      if (habilitada === !!b) return;
+      habilitada = !!b;
+      persistirHabilitada();
+      core.log("mercadoOro", habilitada ? "INICIADO desde el panel" : "DETENIDO desde el panel", habilitada ? "ok" : "warn");
+      refrescarPanelOroSiVisible();
+      if (habilitada) {
+        ciclo().catch((e) => core.logError("mercadoOro", "ciclo (post-iniciar) falló", e));
+      }
     }
 
     let saveAlertasTimer = null;
@@ -665,6 +705,7 @@
     async function ciclo() {
       if (!core.isExtensionContextValid()) return;
       if (core.isCaptchaActive()) return;
+      if (!habilitada) return; //toggle Iniciar/Detener del header del tab Oro
 
       const ahora = Date.now();
       const sinMapa = Object.keys(mapaSeaIdToTown).length === 0;
@@ -730,11 +771,21 @@
     function renderHeader() {
       const mares = Object.keys(mapaSeaIdToTown).length;
       const wrap = document.createElement("div");
-      const corriendo = !core.isCaptchaActive();
+      const captcha = core.isCaptchaActive();
+      const corriendo = habilitada && !captcha;
+      //Border color refleja el estado real: rojo si alarma, verde si corriendo,
+      //naranja si pausado por el usuario, gris si CAPTCHA.
+      const borderColor = hayAlarma()
+        ? "#e74c3c"
+        : corriendo
+          ? "#27ae60"
+          : captcha
+            ? "#7a8aa0"
+            : "#f39c12";
       wrap.style.cssText =
         "display:flex;align-items:center;gap:12px;padding:10px 12px;" +
         "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
-        `border-left:3px solid ${hayAlarma() ? "#e74c3c" : (corriendo ? "#27ae60" : "#7a8aa0")}`;
+        `border-left:3px solid ${borderColor}`;
       const left = document.createElement("div");
       left.style.cssText = "flex:1;min-width:0";
       const titulo = document.createElement("div");
@@ -744,13 +795,37 @@
       const enAlarma = Array.from(maresEnAlarma).sort((a, b) => a - b);
       sub.textContent = hayAlarma()
         ? `🔔 ALARMA — ${enAlarma.length} mar(es) pendientes: ${enAlarma.join(", ")} · confirmá cada uno con ✓`
-        : corriendo
-          ? `Activo · revisa cada ${POLL_INTERVAL_MS / 1000}s · alerta si hay ≥${UMBRAL} de espacio para vender · ${mares} mar(es) · ${alertas.length} alertas`
-          : "En espera — CAPTCHA activo";
+        : captcha
+          ? "En espera — CAPTCHA activo"
+          : habilitada
+            ? `Activo · revisa cada ${POLL_INTERVAL_MS / 1000}s · alerta si hay ≥${UMBRAL} de espacio para vender · ${mares} mar(es) · ${alertas.length} alertas`
+            : "Detenido — apretá Iniciar para empezar a monitorear";
       sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
       left.appendChild(titulo);
       left.appendChild(sub);
       wrap.appendChild(left);
+
+      //Botón Iniciar/Detener — toggle del monitor. Separado del play/pause
+      //global del bot: mercadoOro tiene su propio ciclo (mismo patrón que
+      //ataques y finalizarConstruccion). Deshabilitado mientras CAPTCHA.
+      const accionBtn = document.createElement("button");
+      accionBtn.type = "button";
+      accionBtn.textContent = (habilitada ? "⏸  " : "▶  ") + (habilitada ? "Detener" : "Iniciar");
+      accionBtn.title = habilitada
+        ? "Detener el polling del mercado de oro"
+        : "Iniciar el polling del mercado de oro";
+      const colorBtn = habilitada ? "#e74c3c" : "#27ae60";
+      accionBtn.style.cssText =
+        `background:${colorBtn};color:#fff;border:0;padding:6px 14px;` +
+        "cursor:pointer;border-radius:3px;font-size:11.5px;font-weight:bold;" +
+        "white-space:nowrap;letter-spacing:0.3px";
+      if (captcha) {
+        accionBtn.disabled = true;
+        accionBtn.style.opacity = "0.55";
+        accionBtn.style.cursor = "not-allowed";
+      }
+      accionBtn.addEventListener("click", () => setHabilitada(!habilitada));
+      wrap.appendChild(accionBtn);
 
       //Botón "Descartar todas" — atajo para limpiar todas las notifications
       //en alarma de un saque, en vez de hacer ✓ por mar. Solo aparece si hay
@@ -1022,14 +1097,19 @@
     }
 
     //—— Arranque ———————————————————————————————————————————————————————
+    //El setInterval corre siempre; el ciclo retorna temprano si `habilitada`
+    //es false. Eso permite al usuario activar/desactivar desde el botón sin
+    //tener que iniciar/detener el timer.
     setInterval(() => {
       ciclo().catch((e) => core.logError("mercadoOro", "ciclo falló", e));
     }, POLL_INTERVAL_MS);
-    ciclo().catch((e) => core.logError("mercadoOro", "ciclo inicial falló", e));
+    if (habilitada) {
+      ciclo().catch((e) => core.logError("mercadoOro", "ciclo inicial falló", e));
+    }
 
     core.log(
       "mercadoOro",
-      `iniciado (poll cada ${POLL_INTERVAL_MS / 1000}s, umbral=${UMBRAL}, re-descubrir cada ${REDESCUBRIR_INTERVAL_MS / 60000}min)`,
+      `iniciado (poll cada ${POLL_INTERVAL_MS / 1000}s, umbral=${UMBRAL}, re-descubrir cada ${REDESCUBRIR_INTERVAL_MS / 60000}min) · estado=${habilitada ? "ACTIVO" : "DETENIDO"}`,
       "ok"
     );
 

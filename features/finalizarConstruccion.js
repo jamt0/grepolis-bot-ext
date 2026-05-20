@@ -30,6 +30,16 @@
     const { data, game, core } = ctx;
     const { csrfToken, world_id, townId } = game;
 
+    //Módulo PREMIUM: sin pwd no arrancamos polls ni timers. El tab
+    //"Construcción" tampoco se muestra. Nos suscribimos al evento de
+    //unlock para que init() se vuelva a invocar cuando se ingrese la pwd.
+    if (!core.isPremiumUnlocked()) {
+      core.log("finalizar", "bloqueado — sin pwd premium", "warn");
+      JamBot.features.finalizarConstruccion.api = { renderTab: core.renderBloqueoEnTab };
+      core.onPremiumUnlock(() => init(ctx));
+      return;
+    }
+
     //Margen de seguridad: el juego permite "free finish" si quedan <5min
     //(300s). Disparamos a los 290s para evitar race conditions con el reloj
     //del servidor.

@@ -233,6 +233,243 @@
   });
 
   /**
+   * Devuelve el estado actual de PlayerGods: favor por dios + qué dioses tienen
+   * templo. Lo leemos del modelo Backbone que el cliente ya tiene cargado —
+   * cualquier cast (incluso uno fallido) actualiza este modelo via notification.
+   *
+   * Shape (lo que devolvemos):
+   *   { favor: {zeus:0, poseidon:500, ...}, temples: {zeus:false, ...}, maxFavor:500 }
+   * Si MM no está listo o no hay PlayerGods, devuelve {favor:{}, temples:{}, maxFavor:null}.
+   */
+  window.addEventListener("JamBot:queryPlayerGods", function () {
+    const out = { favor: {}, temples: {}, maxFavor: null };
+    try {
+      if (window.MM && typeof window.MM.getModels === "function") {
+        const pgs = window.MM.getModels().PlayerGods || {};
+        for (const id of Object.keys(pgs)) {
+          const a = pgs[id] && pgs[id].attributes;
+          if (!a) continue;
+          if (a.production_overview) {
+            for (const god of Object.keys(a.production_overview)) {
+              const cur = a.production_overview[god] && a.production_overview[god].current;
+              out.favor[god] = typeof cur === "number" ? cur : 0;
+            }
+          }
+          if (a.temples_for_gods) {
+            for (const god of Object.keys(a.temples_for_gods)) {
+              out.temples[god] = !!a.temples_for_gods[god];
+            }
+          }
+          if (typeof a.max_favor === "number") out.maxFavor = a.max_favor;
+          break; //un solo PlayerGods por jugador
+        }
+      }
+    } catch (_) { /* defensivo */ }
+    window.postMessage({ type: "JamBot:playerGodsResult", data: out }, "*");
+  });
+
+  /**
+   * Devuelve { [townId]: god } para todas las ciudades del jugador cargadas en MM.
+   * `god` es el string del dios que adora esa ciudad (zeus, poseidon, hera, athena,
+   * hades, artemis, aphrodite, ares) o null si todavía no eligió uno.
+   *
+   * Pequeño truco: en Grepolis el atributo `god` en Town puede aparecer como
+   * `god` o como `current_god` según versión — probamos ambos para defensa.
+   */
+  window.addEventListener("JamBot:queryTownsGods", function () {
+    const out = {};
+    try {
+      if (window.MM && typeof window.MM.getModels === "function") {
+        const towns = window.MM.getModels().Town || {};
+        for (const id of Object.keys(towns)) {
+          const a = towns[id] && towns[id].attributes;
+          if (!a) continue;
+          const g = a.god || a.current_god || null;
+          out[a.id || id] = g;
+        }
+      }
+    } catch (_) { /* defensivo */ }
+    window.postMessage({ type: "JamBot:townsGodsResult", data: out }, "*");
+  });
+
+  /**
+   * Descubre el catálogo de poderes divinos del cliente del juego. Grepolis
+   * guarda esto en `GameData.powers` (clave-valor por power_id), donde cada
+   * entrada trae:
+   *   { name, god, favor (costo), is_ranged ("town"/"command"/...) }
+   *
+   * Probamos rutas conocidas en orden. Devolvemos un array uniforme:
+   *   [{ id, name, god, favor, target }]
+   * `target` se normaliza a "town" o "command" según `range_type`/`type`.
+   * Si no encontramos catálogo, devolvemos [].
+   */
+  window.addEventListener("JamBot:queryPowersCatalog", function () {
+    let raw = null;
+    try {
+      if (window.GameData && window.GameData.powers) raw = window.GameData.powers;
+      else if (window.Game && window.Game.powers) raw = window.Game.powers;
+    } catch (_) { /* defensivo */ }
+
+    //Algunos campos del catálogo vienen como objetos i18n del tipo
+    //  {en:"...", es:"...", de:"..."}  o  {default:"...", value:"..."}.
+    //Reducimos a string para que el content script pueda hacer .localeCompare
+    //y mostrar el nombre tal cual. Preferimos el idioma del cliente (es),
+    //luego en, luego cualquier valor del objeto. Si ya es string, lo
+    //devolvemos como está.
+    function toI18nString(v) {
+      if (v == null) return null;
+      if (typeof v === "string") return v;
+      if (typeof v === "object") {
+        if (typeof v.es === "string") return v.es;
+        if (typeof v.en === "string") return v.en;
+        if (typeof v.default === "string") return v.default;
+        if (typeof v.value === "string") return v.value;
+        for (const k of Object.keys(v)) {
+          if (typeof v[k] === "string") return v[k];
+        }
+        return null;
+      }
+      return String(v);
+    }
+
+    const list = [];
+    if (raw && typeof raw === "object") {
+      for (const id of Object.keys(raw)) {
+        const p = raw[id] || {};
+        //Normalizar target. El cliente usa varias claves históricamente:
+        //  range_type / type / target_type / cast_on
+        //Valores comunes que vimos: "command", "town", "movement", "self".
+        let target = toI18nString(p.target || p.target_type || p.cast_on || p.range_type || p.type) || null;
+        if (target === "movement") target = "command";
+        if (target === "self") target = "town";
+        list.push({
+          id,
+          name: toI18nString(p.name) || toI18nString(p.title) || toI18nString(p.label) || id,
+          god: toI18nString(p.god) || null,
+          favor: typeof p.favor === "number" ? p.favor : (typeof p.cost === "number" ? p.cost : null),
+          target: target || null,
+        });
+      }
+    }
+    window.postMessage({ type: "JamBot:powersCatalogResult", data: list }, "*");
+  });
+
+  /**
+   * Devuelve los movimientos del modelo `MovementsUnits` + los flags del
+   * modelo `Attack` desde MM. Reemplaza al endpoint HTTP `command_overview`
+   * que está gated detrás de Administrador premium (sin Admin el server
+   * responde {error:"Necesitas al administrador..."}).
+   *
+   * `MovementsUnits` tiene el detalle (command_id, arrival_at, type,
+   * player_id, home_town_id, target_town_id, nombres de origen/destino)
+   * pero parece poblarse solo para la ciudad activa del cliente. `Attack`
+   * es global y trae {id, town_id, incoming} — sirve para flaggear que una
+   * ciudad NO-activa tiene ataque entrante aunque no tengamos su command_id.
+   *
+   * El content script combina ambos: usa MovementsUnits cuando puede y cae
+   * a Attack model cuando solo necesita saber "hay entrante en X".
+   */
+  window.addEventListener("JamBot:queryMovements", function () {
+    const out = { movements: [], attacks: [], activeTown: null, myPlayerId: null };
+    try {
+      if (window.Game) {
+        if (window.Game.townId != null) out.activeTown = Number(window.Game.townId);
+        if (window.Game.player_id != null) out.myPlayerId = Number(window.Game.player_id);
+      }
+      if (window.MM && typeof window.MM.getModels === "function") {
+        const mods = window.MM.getModels();
+        const mu = mods.MovementsUnits || {};
+        for (const k of Object.keys(mu)) {
+          const a = mu[k] && mu[k].attributes;
+          if (!a) continue;
+          out.movements.push({
+            id: a.id,
+            command_id: a.command_id,
+            type: a.type,
+            command_name: a.command_name,
+            player_id: a.player_id,
+            home_town_id: a.home_town_id,
+            target_town_id: a.target_town_id,
+            town_name_origin: a.town_name_origin,
+            town_name_destination: a.town_name_destination,
+            link_origin: a.link_origin,
+            link_destination: a.link_destination,
+            started_at: a.started_at,
+            arrival_at: a.arrival_at,
+            cancelable_until: a.cancelable_until,
+          });
+        }
+        const att = mods.Attack || {};
+        for (const k of Object.keys(att)) {
+          const a = att[k] && att[k].attributes;
+          if (!a) continue;
+          out.attacks.push({ id: a.id, town_id: a.town_id, incoming: a.incoming });
+        }
+      }
+    } catch (_) { /* defensivo */ }
+    window.postMessage({ type: "JamBot:movementsResult", data: out }, "*");
+  });
+
+  /**
+   * Devuelve el id de la ciudad actualmente activa en el cliente del juego.
+   * Es la ciudad que se ve en el header superior con el nombre + flechitas.
+   * El bot la usa para decidir si necesita "abrir" otra ciudad antes de
+   * castear (sin Administrator, el server exige que `town_id` del cast
+   * coincida con la ciudad activa).
+   */
+  window.addEventListener("JamBot:queryActiveTown", function () {
+    let townId = null;
+    try {
+      if (window.Game && window.Game.townId != null) townId = Number(window.Game.townId);
+      else if (window.Game && window.Game.town_id != null) townId = Number(window.Game.town_id);
+    } catch (_) { /* defensivo */ }
+    window.postMessage({ type: "JamBot:activeTownResult", townId }, "*");
+  });
+
+  /**
+   * Cambia la ciudad actualmente activa del cliente del juego. Replica el
+   * efecto de tocar las flechitas del town-switcher superior. Probamos varias
+   * rutas conocidas del cliente — distintas versiones de Grepolis usan
+   * helpers diferentes; la primera que exista gana. Esto es síncrono del
+   * lado del bot (devolvemos resultado por postMessage), pero la red del
+   * cliente puede tardar 100-300ms en actualizar los modelos — el caller
+   * debería esperar un poco antes del siguiente request al server.
+   */
+  window.addEventListener("JamBot:changeTown", function (e) {
+    const townId = e && e.detail && e.detail.townId;
+    let ok = false;
+    let metodo = null;
+    if (townId != null) {
+      const id = Number(townId);
+      try {
+        //Helper más común en Grepolis moderno.
+        if (window.HelperTown && typeof window.HelperTown.switchTown === "function") {
+          window.HelperTown.switchTown(id);
+          ok = true; metodo = "HelperTown.switchTown";
+        }
+        //Fallback 1: método directo en Game (versiones más viejas).
+        else if (window.Game && typeof window.Game.switchTown === "function") {
+          window.Game.switchTown(id);
+          ok = true; metodo = "Game.switchTown";
+        }
+        //Fallback 2: PlayerTowns collection en MM (Backbone) — disparamos
+        //un click sintético en el town-switcher si los modelos están vivos.
+        else if (window.MM && typeof window.MM.getModels === "function") {
+          const towns = window.MM.getModels().Town || {};
+          const town = towns[id] || towns[String(id)];
+          if (town && typeof town.open === "function") {
+            town.open();
+            ok = true; metodo = "Town.open";
+          }
+        }
+      } catch (err) {
+        console.warn("[JamBot bridge] changeTown lanzó:", err);
+      }
+    }
+    window.postMessage({ type: "JamBot:changeTownResult", townId, ok, metodo }, "*");
+  });
+
+  /**
    * Vigila Game.bot_check. En estado normal vale null; cuando Grepolis exige
    * un challenge anti-bot pasa a un objeto con la info del CAPTCHA. Cualquier
    * cambio se notifica al content script vía postMessage para que pause el
