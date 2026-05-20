@@ -609,11 +609,12 @@
   //DOS niveles de unlock independientes, ambos in-memory (NO persisten a
   //F5: cada reload arranca locked y vuelve a pedir la pwd cuando toca).
   //
-  //  1. RECURSOS  → desbloquea: construcción · oro · comercio.
+  //  1. RECURSOS  → desbloquea: recolección (acceso al panel).
   //                 La pwd se pide al PRIMER click en la card "Jam" — no
   //                 hay modal automático al cargar la página.
   //
-  //  2. PREMIUM   → desbloquea: ataques · defensa · hechizos.
+  //  2. PREMIUM   → desbloquea: construcción · oro · comercio · ataques ·
+  //                 defensa · hechizos (todo lo no-público).
   //                 La pwd se ingresa desde el botón "Papi jam me dio
   //                 permiso del premium" en la tab Settings.
   //
@@ -826,7 +827,7 @@
       titulo: "JamBot — Permiso de recursos",
       descHtml:
         "Ingresá la contraseña para desbloquear:<br>" +
-        "<span style=\"color:#9b59b6;font-weight:bold\">construcción · oro · comercio</span>",
+        "<span style=\"color:#9b59b6;font-weight:bold\">recolección</span>",
       hashEsperado: PWD_HASH_RECURSOS,
       onSuccess: () => {
         recursosUnlocked = true;
