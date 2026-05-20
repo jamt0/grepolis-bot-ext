@@ -176,6 +176,17 @@
     let ultimoPollOk = false;
     let ultimoPollError = null;
     let commandsVivos = new Set(); //set de ids del último poll, para detectar slots huérfanos
+    //ts del último render del tab — sirve como "usuario está mirando esta tab".
+    //Si renderTab corrió hace <2s, el tab está activo (recoleccion lo invoca
+    //cada 1s mientras está visible). Si no, no gastamos HTTP en el poll.
+    let ultimoRenderTs = 0;
+    //Referencia al PRIMER elemento que renderTab agrega al body del panel.
+    //Sirve de "ancla" para detectar si Hechizos sigue siendo la tab activa:
+    //cuando el usuario cambia a otra tab, recoleccion hace `body.innerHTML = ""`
+    //y el ancla desaparece. Re-renders externos (pollCommands, ejecutarIntento)
+    //chequean `body.contains(ultimoAnclaRender)` antes de tocar el body — así
+    //evitan pisar Dashboard/otras tabs con contenido de Hechizos.
+    let ultimoAnclaRender = null;
 
     //—— Persistencia ————————————————————————————————————————————————————
 
@@ -442,16 +453,10 @@
         `poll: ${cmds.length} commands · ${totalConsiderados} ataque(s) · entrantes=${totalEntrantes} · salientes=${totalSalientes} · descartados (no-ataque)=${totalDescartados}`
       );
 
-      //Repintar el panel si está abierto en el tab Hechizos — así los cambios
-      //(nuevo ataque entrante, ataque que llegó, etc.) se ven sin esperar al
-      //tick de 1s del interval de recoleccion.
-      const panel = document.getElementById("panelConfigJam");
-      if (panel && panel.style.display !== "none") {
-        const body = panel.querySelector(".pcj-body");
-        if (body) {
-          try { renderTab(body, /*soft=*/true); } catch (_) {}
-        }
-      }
+      //Repintar el panel si está abierto Y el usuario está en la tab Hechizos
+      //(rerenderSiTabActiva chequea el ancla — evita pisar Dashboard/otras
+      //tabs con contenido de hechizos cuando un slot castea en background).
+      rerenderSiTabActiva();
 
       //Refrescar info auxiliar también (favor + dios por ciudad). Esto no
       //hace HTTP — solo lee modelos Backbone, es barato.
@@ -711,11 +716,11 @@
       }
       persistir();
 
-      //Repintar panel si está abierto (re-render barato del tab activo).
-      const body = document.querySelector("#panelConfigJam .pcj-body");
-      if (body && JamBot.features.hechizos && JamBot.features.hechizos.api) {
-        try { JamBot.features.hechizos.api.renderTab(body, /*soft=*/true); } catch (_) {}
-      }
+      //Repintar el panel SOLO si el usuario está en la tab Hechizos. Sin esta
+      //guarda, un slot casteando en background pisaba el contenido de Dashboard
+      //u otra tab donde estuviera el usuario, dándole impresión de "se cambió
+      //solo de tab al spamear".
+      rerenderSiTabActiva();
 
       //Re-agendar siguiente intento — no importa si OK o fail, el usuario
       //quiere spamear hasta pausar.
@@ -1195,11 +1200,24 @@
     //—— renderTab (entry-point para el panel) ——————————————————————————
 
     function rerenderTab() {
-      const body = document.querySelector("#panelConfigJam .pcj-body");
-      if (body) renderTab(body);
+      //Disparado por botones del propio panel (iniciar/pausar/quitar slot).
+      //Si el usuario los clickea, está en la tab — pero igual chequeamos
+      //el ancla por consistencia.
+      rerenderSiTabActiva();
     }
 
     function renderTab(body, soft) {
+      //Detectamos "tab recién abierta": si el último renderTab fue hace >2s,
+      //es porque el usuario acaba de entrar al tab (click en Jam, o switch
+      //desde otra tab). En ese momento disparamos el ÚNICO poll de la
+      //sesión-en-este-tab. Mientras la tab queda abierta, recoleccion sigue
+      //llamando renderTab cada 1s para el reloj/UI, pero no gatilla más HTTP.
+      const ahora = Date.now();
+      const tabReciénAbierta = (ahora - ultimoRenderTs) > 2000;
+      ultimoRenderTs = ahora;
+      if (tabReciénAbierta) {
+        pollCommands().catch((e) => core.logError("hechizos", "poll on-open falló", e));
+      }
       //Si hay foco en un input/select → saltar el re-render entero. Si no
       //hacemos esto, el tick de 1s del interval (que llama renderTab sin
       //soft) destruye el `<select>` mientras el usuario lo tiene abierto y
@@ -1215,7 +1233,9 @@
       const scrollPrev = listaPrev ? listaPrev.scrollTop : 0;
 
       body.innerHTML = "";
-      body.appendChild(renderHeader());
+      const header = renderHeader();
+      body.appendChild(header);
+      ultimoAnclaRender = header; //ver "ultimoAnclaRender" arriba
       body.appendChild(renderConfig());
       body.appendChild(renderFavorChips());
       body.appendChild(renderCardsCiudades());
@@ -1225,6 +1245,17 @@
         const listaNew = body.querySelector("#hechizosLogLista");
         if (listaNew) listaNew.scrollTop = scrollPrev;
       }
+    }
+
+    //Helper compartido para los re-renders externos: solo escribe en el body
+    //si Hechizos sigue siendo la tab activa (su ancla sigue insertada). Si
+    //el usuario cambió de tab, el ancla desapareció y devolvemos false.
+    function rerenderSiTabActiva() {
+      const body = document.querySelector("#panelConfigJam .pcj-body");
+      if (!body) return false;
+      if (!ultimoAnclaRender || !body.contains(ultimoAnclaRender)) return false;
+      try { renderTab(body, /*soft=*/true); } catch (_) {}
+      return true;
     }
 
     //—— CAPTCHA ————————————————————————————————————————————————————————
@@ -1252,12 +1283,15 @@
     //tiene cargado, perfecto; si no, queda el fallback con effort_of_the_huntress.
     refrescarPowers().catch(() => {});
 
-    setInterval(() => {
-      pollCommands().catch((e) => core.logError("hechizos", "poll falló", e));
-    }, POLL_COMMANDS_MS);
-    pollCommands().catch((e) => core.logError("hechizos", "poll inicial falló", e));
+    //Sin polling periódico — el usuario pidió que la llamada se haga solo
+    //cuando entra al tab Hechizos (por click en Jam, o navegando al tab).
+    //`renderTab` detecta la transición "tab recién abierta" y dispara una
+    //única llamada. Mientras la tab queda abierta, no hay más HTTP.
+    //Trade-off conocido: si un slot está casteando y su command muere mientras
+    //la tab está cerrada, el slot sigue intentando hasta que el usuario abre
+    //el panel y se hace cleanup.
 
-    core.log("hechizos", `iniciado (poll cada ${POLL_COMMANDS_MS/1000}s, cadencia spam ${cadenciaSeg}s) · ${slots.size} slot(s) rehidratado(s)`, "ok");
+    core.log("hechizos", `iniciado (poll on-demand al abrir tab, cadencia spam ${cadenciaSeg}s) · ${slots.size} slot(s) rehidratado(s)`, "ok");
 
     JamBot.features.hechizos.api = { renderTab };
   }
