@@ -1,11 +1,25 @@
 # Grepolis JamBot
 
-Extensión de Chrome / navegadores Chromium (Edge, Brave, Vivaldi, Opera) que automatiza dos tareas repetitivas de Grepolis:
-
-- **Recolección de recursos** en las aldeas farmeables de cada ciudad (botón "Recoger" — la opción rápida de 5/10 min).
-- **Finalización gratis de construcciones** que entran en la ventana de menos de 5 min restantes (el botón "Gratis" del juego).
+Extensión de Chrome / navegadores Chromium (Edge, Brave, Vivaldi, Opera) que automatiza la **recolección de recursos** en las aldeas farmeables de cada ciudad de Grepolis (botón "Recoger" — la opción rápida de 5/10 min).
 
 Funciona como **extensión local cargada en modo desarrollador**. No se publica en la Chrome Web Store y no se conecta a ningún servidor externo: todo el estado vive en `chrome.storage.local`.
+
+---
+
+## Versión PREMIUM
+
+Esta versión pública incluye únicamente la feature de **Recolección**. Existen features adicionales en la versión PREMIUM, accesibles por contraseña que entrego por canal privado.
+
+Features PREMIUM (acceso bajo contraseña):
+
+- Construcción
+- Oro
+- Comercio
+- Ataques
+- Defensa
+- Hechizos
+
+Si te interesa acceso, contactame directamente.
 
 ---
 
@@ -15,7 +29,7 @@ Funciona como **extensión local cargada en modo desarrollador**. No se publica 
 2. [Requisitos](#2-requisitos)
 3. [Instalación paso a paso](#3-instalación-paso-a-paso)
 4. [Cómo usarlo](#4-cómo-usarlo)
-5. [Configuración por ciudad (importante)](#5-configuración-por-ciudad-importante)
+5. [Cooldown por ciudad (auto-detectado)](#5-cooldown-por-ciudad-auto-detectado)
 6. [El panel de información](#6-el-panel-de-información)
 7. [Solución de problemas frecuentes](#7-solución-de-problemas-frecuentes)
 8. [Privacidad y datos](#8-privacidad-y-datos)
@@ -31,12 +45,6 @@ Funciona como **extensión local cargada en modo desarrollador**. No se publica 
 - Si una aldea aún tiene cooldown del servidor (porque la claimeaste manualmente o desde otra pestaña), la **salta sin atacar al server**.
 - Si el server rechaza un claim por borde de cooldown, **reintenta hasta 3 veces** al final del ciclo (espera 5s entre rondas).
 - Sobrevive a recargas de la pestaña: recuerda cuándo claimeó cada aldea y respeta los cooldowns vivos.
-
-### Finalización de construcciones gratis
-- Cada vez que una construcción entra en la **ventana de menos de 5 minutos** restantes, dispara el botón "Gratis" automáticamente.
-- Lee la cola de **todas** tus ciudades (no solo la activa).
-- Reagenda según la próxima orden que entre en ventana — no hace polling innecesario.
-- Se enciende/apaga desde el panel del bot.
 
 ### Anti-detección / CAPTCHA
 - Espera **2-2.5 s entre claims** con jitter aleatorio (rompe el patrón de "request exactamente cada N ms").
@@ -147,7 +155,6 @@ No hay botones para cambiar — es informativo. Si investigás Lealtad en una ci
 
 ### Otras opciones del tab Settings
 
-- **"Finalizar construcción gratis"** — toggle para activar/desactivar la feature de construcción independientemente del bot principal.
 - **Mantenimiento**:
   - *Limpiar historial*: borra el historial de claims persistido. Útil si querés empezar limpio.
   - *Exportar JSON*: descarga un archivo con todo el historial — sirve como backup.
@@ -157,7 +164,7 @@ No hay botones para cambiar — es informativo. Si investigás Lealtad en una ci
 
 ## 6. El panel de información
 
-La card **Jam** abre un panel con 4 tabs (default: Dashboard):
+La card **Jam** abre un panel con tabs (default: Dashboard):
 
 ### Tab "Dashboard"
 Vista resumen de un golpe de vista — totales del último ciclo, próximo, errores recientes. Es el tab que se abre por default cuando hacés click en la card sin captcha activo.
@@ -171,13 +178,6 @@ Configuración (ver punto 5).
 - **Último ciclo**: resumen del último ciclo terminado — verde si fue completo, rojo si quedó tanda incompleta. Expandí una ciudad para ver sus 6 aldeas, expandí una aldea para ver sus últimas 36 recolecciones (timestamp, deltas de recursos, status, número de ciclo).
 - **Ciclos anteriores** (colapsable): los últimos 36 ciclos persistidos (~6 horas a 10 min/ciclo). Click en cada uno para ver el detalle con la misma estructura.
 - **Errores y warnings recientes**: últimos eventos del buffer compartido — útil para diagnosticar si algo no anda bien.
-
-### Tab "Construcción"
-- Estado de la feature + countdown del próximo tick.
-- **Último ciclo** de finalización.
-- **Cola actual**: todas las órdenes de construcción pendientes en cualquiera de tus ciudades, ordenadas por tiempo restante. Las que entraron en la ventana de free-finish quedan marcadas en naranja.
-- **Últimas finalizadas**: las últimas 20 órdenes finalizadas con éxito.
-- **Errores y warnings** filtrados a la feature de construcción.
 
 ### Cerrar el panel
 
@@ -217,7 +217,7 @@ Configuración (ver punto 5).
 
 ## 8. Privacidad y datos
 
-- **Todo se ejecuta localmente**. La extensión no envía datos a ningún servidor que no sea el propio Grepolis (las requests legítimas del juego: claims, finalizar construcción, etc.).
+- **Todo se ejecuta localmente**. La extensión no envía datos a ningún servidor que no sea el propio Grepolis (las requests legítimas del juego: claims, etc.).
 - El historial, configuración y buffer de errores viven en `chrome.storage.local`, **únicamente en tu navegador**.
 - No hay tracking, telemetría, ni "phone home".
 
@@ -229,7 +229,6 @@ Para entender cómo funciona el código por dentro:
 
 - [docs/arquitectura.md](docs/arquitectura.md) — overview de la arquitectura modular (core + features + bridge).
 - [docs/recoleccion.md](docs/recoleccion.md) — la feature de recolección en profundidad: ciclo, cooldown, retry, persistencia.
-- [docs/finalizar-construccion.md](docs/finalizar-construccion.md) — la feature de finalizar construcción gratis.
 - [docs/panel.md](docs/panel.md) — la UI del panel (tabs, secciones, auto-refresh).
 - [docs/persistencia.md](docs/persistencia.md) — qué se guarda dónde y por qué.
 - [docs/logging.md](docs/logging.md) — sistema de logs unificado y buffer de errores.
