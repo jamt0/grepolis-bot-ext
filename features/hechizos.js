@@ -91,7 +91,17 @@
   //cuando el cliente lo tiene cargado.
   const POWERS_FALLBACK = [
     { id: "effort_of_the_huntress", name: "Esfuerzo de la cazadora", god: "artemis", favor: 100, target: "command" },
+    { id: "strength_of_heroes", name: "Fuerza sobrehumana", god: "athena", favor: 200, target: "command" },
   ];
+
+  //Whitelist de poderes visibles en la UI. NO afecta al catálogo en memoria
+  //(refrescarPowers sigue trayendo todos los de GameData.powers) — solo
+  //limita lo que el usuario ve en el <select>. Para volver a mostrar TODO
+  //el catálogo, vaciar este Set: `new Set()`.
+  const POWERS_VISIBLES = new Set([
+    "effort_of_the_huntress",
+    "strength_of_heroes",
+  ]);
 
   //—— Helpers ————————————————————————————————————————————————————————————
 
@@ -126,16 +136,6 @@
   async function init(ctx) {
     const { data, game, core } = ctx;
     const { csrfToken, world_id, townId, player_id } = game;
-
-    //Módulo PREMIUM: sin pwd no arrancamos polls ni timers. El tab
-    //"Hechizos" tampoco se muestra. Nos suscribimos al evento de unlock
-    //para que init() se vuelva a invocar cuando se ingrese la pwd.
-    if (!core.isPremiumUnlocked()) {
-      core.log("hechizos", "bloqueado — sin pwd premium", "warn");
-      JamBot.features.hechizos.api = { renderTab: core.renderBloqueoEnTab };
-      core.onPremiumUnlock(() => init(ctx));
-      return;
-    }
 
     const STORAGE_KEY = `jambotHechizos_${world_id}`;
 
@@ -176,6 +176,20 @@
     let ultimoPollOk = false;
     let ultimoPollError = null;
     let commandsVivos = new Set(); //set de ids del último poll, para detectar slots huérfanos
+
+    //—— Modo manual ——————————————————————————————————————————————————————
+    //
+    //Sin Administrator Premium, el endpoint command_overview falla y
+    //`commandsVivos` queda vacío. Para esos casos, el usuario carga a mano
+    //el commandId + ciudad eje + tipo. Esos ids se "fingen" como vivos para
+    //que `ejecutarIntento` no los descarte y `sincronizarSlotsConPoll` no
+    //los borre tras un poll exitoso futuro (cuando vuelva el Admin).
+    //
+    //  commandIdsManuales: Set<string> — ids ingresados a mano.
+    //  manualesMeta:       Map<string, {type, ciudadEjeId, ciudadEjeName}>
+    //                       — datos mínimos para construir el slot.
+    let commandIdsManuales = new Set();
+    let manualesMeta = new Map();
     //ts del último render del tab — sirve como "usuario está mirando esta tab".
     //Si renderTab corrió hace <2s, el tab está activo (recoleccion lo invoca
     //cada 1s mientras está visible). Si no, no gastamos HTTP en el poll.
@@ -216,11 +230,22 @@
               ultimoTs: s.ultimoTs || null,
             });
           }
+          const manualesPlain = [];
+          for (const id of commandIdsManuales) {
+            const m = manualesMeta.get(id) || {};
+            manualesPlain.push({
+              commandId: id,
+              type: m.type || "entrante",
+              ciudadEjeId: m.ciudadEjeId || null,
+              ciudadEjeName: m.ciudadEjeName || null,
+            });
+          }
           chrome.storage.local.set({
             [STORAGE_KEY]: {
               cadenciaSeg,
               slots: slotsPlain,
               log: logIntentos.slice(-LOG_INTENTOS_MAX),
+              manuales: manualesPlain,
             },
           });
         } catch (e) {
@@ -237,6 +262,23 @@
             cadenciaSeg = blob.cadenciaSeg;
           }
           if (Array.isArray(blob.log)) logIntentos = blob.log.slice(-LOG_INTENTOS_MAX);
+          if (Array.isArray(blob.manuales)) {
+            //Rehidratar manuales antes que los slots — así cuando el slot
+            //se rehidrata, su commandId ya está en commandsVivos vía el set
+            //de manuales (los slots manuales no van a tener match en el
+            //poll mientras no haya Admin).
+            for (const m of blob.manuales) {
+              if (!m || !m.commandId) continue;
+              const id = String(m.commandId);
+              commandIdsManuales.add(id);
+              manualesMeta.set(id, {
+                type: m.type === "saliente" ? "saliente" : "entrante",
+                ciudadEjeId: m.ciudadEjeId || null,
+                ciudadEjeName: m.ciudadEjeName || null,
+              });
+              commandsVivos.add(id);
+            }
+          }
           if (Array.isArray(blob.slots)) {
             //Rehidratamos slots persistidos. Los timers no persisten — se
             //arrancan al primer poll cuando confirmamos que el command sigue
@@ -444,6 +486,10 @@
 
       commands = { entrantesPorCiudad, salientesPorCiudad };
       commandsVivos = vivos;
+      //Reinyectar los manuales: sin esto, el primer poll exitoso post-Admin
+      //sobreescribiría commandsVivos y `sincronizarSlotsConPoll` borraría
+      //los slots manuales aunque su ataque siga vivo en el juego.
+      for (const id of commandIdsManuales) commandsVivos.add(id);
 
       //Diagnóstico: log breve con el conteo. Si el usuario dice "no detecta
       //ataques" pero acá ve totalEntrantes > 0, el bug está en el render;
@@ -471,6 +517,10 @@
     function sincronizarSlotsConPoll() {
       const aRemover = [];
       for (const [key, s] of slots) {
+        //Saltar manuales: su commandId no aparece en el poll (sin Admin)
+        //o aparece y conviven sin problema (con Admin). En ningún caso
+        //queremos que el poll los descarte — el usuario los gestiona a mano.
+        if (commandIdsManuales.has(String(s.commandId))) continue;
         if (!commandsVivos.has(String(s.commandId))) {
           //Command ya no existe — detener slot.
           if (s.timerId) { clearTimeout(s.timerId); s.timerId = null; }
@@ -888,6 +938,244 @@
       return wrap;
     }
 
+    //—— Modo manual ——————————————————————————————————————————————————————
+    //
+    //Sin Admin Premium el poll de commands falla y no se descubren ataques
+    //automáticamente. Esta sección permite cargar a mano un ataque con su
+    //commandId + ciudad propia eje + tipo, para poder castear sobre él.
+
+    function agregarManual({ commandId, ciudadEjeId, ciudadEjeName, type, powerId }) {
+      const idStr = String(commandId).trim();
+      //El cliente real del juego manda el id como número en el payload del
+      //cast. Si lo dejamos como string, algunas respuestas vienen con error.
+      //Si no es entero válido, lo dejamos como string (fallback defensivo).
+      const idCast = /^\d+$/.test(idStr) ? Number(idStr) : idStr;
+      commandIdsManuales.add(idStr);
+      manualesMeta.set(idStr, {
+        type: type === "saliente" ? "saliente" : "entrante",
+        ciudadEjeId: Number(ciudadEjeId) || null,
+        ciudadEjeName: ciudadEjeName || null,
+      });
+      commandsVivos.add(idStr);
+      //Construir un "command" sintético: crearSlot toma id, type y nombres
+      //del objeto, no necesita los timestamps reales (arrivalAt es solo UI).
+      const cmdSintetico = {
+        id: idCast,
+        type: "attack",
+        originTownId: type === "saliente" ? Number(ciudadEjeId) || null : null,
+        originTownName: type === "saliente" ? (ciudadEjeName || null) : null,
+        destTownId: type === "entrante" ? Number(ciudadEjeId) || null : null,
+        destTownName: type === "entrante" ? (ciudadEjeName || null) : null,
+      };
+      crearSlot({ command: cmdSintetico, powerId, type: type === "saliente" ? "saliente" : "entrante" });
+      persistir();
+    }
+
+    function quitarManual(commandId) {
+      const id = String(commandId);
+      commandIdsManuales.delete(id);
+      manualesMeta.delete(id);
+      commandsVivos.delete(id);
+      //Quitar también todos los slots ligados a ese commandId.
+      for (const [key, s] of slots) {
+        if (String(s.commandId) === id) {
+          if (s.timerId) { clearTimeout(s.timerId); s.timerId = null; }
+          slots.delete(key);
+        }
+      }
+      persistir();
+    }
+
+    function renderModoManual() {
+      const cont = document.createElement("div");
+      cont.style.cssText =
+        "margin-top:12px;padding:10px 12px;background:#172029;" +
+        "border:1px solid #2c3a4d;border-left:3px solid #f39c12;border-radius:4px";
+
+      const head = document.createElement("div");
+      head.style.cssText =
+        "color:#f39c12;font-size:10.5px;font-weight:bold;text-transform:uppercase;" +
+        "letter-spacing:0.6px;margin-bottom:4px";
+      head.textContent = "Modo manual (sin Administrator)";
+      cont.appendChild(head);
+
+      const hint = document.createElement("div");
+      hint.style.cssText = "color:#7a8aa0;font-size:11px;margin-bottom:8px;line-height:1.4";
+      hint.innerHTML =
+        "Cargá a mano el <b>id del ataque</b> y la <b>ciudad propia</b> donde " +
+        "casteás (origen si es saliente, destino si es entrante). " +
+        "El bot mete el id en la lista de comandos vivos y empieza el spam con el hechizo elegido.";
+      cont.appendChild(hint);
+
+      //Form
+      const form = document.createElement("div");
+      form.style.cssText = "display:flex;flex-direction:column;gap:6px";
+
+      //Fila 1: tipo (radio segmentado) + commandId
+      const fila1 = document.createElement("div");
+      fila1.style.cssText = "display:flex;gap:6px;align-items:center";
+      const tipoSel = document.createElement("select");
+      tipoSel.style.cssText =
+        "padding:4px 6px;background:#0f1620;color:#e6e9ee;border:1px solid #2c3a4d;" +
+        "border-radius:3px;font-size:11px";
+      const optEnt = document.createElement("option"); optEnt.value = "entrante"; optEnt.textContent = "Entrante";
+      const optSal = document.createElement("option"); optSal.value = "saliente"; optSal.textContent = "Saliente";
+      tipoSel.appendChild(optEnt); tipoSel.appendChild(optSal);
+      const cmdInput = document.createElement("input");
+      cmdInput.type = "text"; cmdInput.placeholder = "id del ataque (ej. 12345678)";
+      cmdInput.style.cssText =
+        "flex:1;min-width:0;padding:4px 8px;background:#0f1620;color:#e6e9ee;" +
+        "border:1px solid #2c3a4d;border-radius:3px;font-size:11px;font-family:monospace";
+      fila1.appendChild(tipoSel); fila1.appendChild(cmdInput);
+      form.appendChild(fila1);
+
+      //Fila 2: town_id eje (con dropdown de ciudades propias si están disponibles)
+      const fila2 = document.createElement("div");
+      fila2.style.cssText = "display:flex;gap:6px;align-items:center";
+      const ciudadesPropias = data.ciudadesConAldeas || [];
+      let townInput;
+      let townSel;
+      if (ciudadesPropias.length) {
+        townSel = document.createElement("select");
+        townSel.style.cssText =
+          "flex:1;min-width:0;padding:4px 6px;background:#0f1620;color:#e6e9ee;" +
+          "border:1px solid #2c3a4d;border-radius:3px;font-size:11px";
+        const optV = document.createElement("option");
+        optV.value = ""; optV.textContent = "— ciudad propia (eje) —";
+        townSel.appendChild(optV);
+        const ordenadas = ciudadesPropias.slice().sort((a, b) =>
+          String(a.nombreCiudad || "").localeCompare(String(b.nombreCiudad || ""), undefined, { numeric: true })
+        );
+        for (const c of ordenadas) {
+          const o = document.createElement("option");
+          o.value = String(c.codigoCiudad);
+          o.textContent = `${c.nombreCiudad || "#" + c.codigoCiudad}`;
+          o.dataset.name = c.nombreCiudad || "";
+          townSel.appendChild(o);
+        }
+        fila2.appendChild(townSel);
+      } else {
+        townInput = document.createElement("input");
+        townInput.type = "text"; townInput.placeholder = "town_id de tu ciudad eje";
+        townInput.style.cssText =
+          "flex:1;min-width:0;padding:4px 8px;background:#0f1620;color:#e6e9ee;" +
+          "border:1px solid #2c3a4d;border-radius:3px;font-size:11px;font-family:monospace";
+        fila2.appendChild(townInput);
+      }
+      form.appendChild(fila2);
+
+      //Fila 3: power + botón
+      const fila3 = document.createElement("div");
+      fila3.style.cssText = "display:flex;gap:6px;align-items:center";
+      const powerSel = document.createElement("select");
+      powerSel.style.cssText =
+        "flex:1;min-width:0;padding:4px 6px;background:#0f1620;color:#e6e9ee;" +
+        "border:1px solid #2c3a4d;border-radius:3px;font-size:11px";
+      const optP0 = document.createElement("option");
+      optP0.value = ""; optP0.textContent = "— elegí un hechizo —";
+      powerSel.appendChild(optP0);
+      const visibles = POWERS_VISIBLES.size
+        ? powers.filter((p) => POWERS_VISIBLES.has(p.id))
+        : powers.slice();
+      for (const p of visibles) {
+        const o = document.createElement("option");
+        o.value = p.id;
+        const g = LABEL_DIOS[p.god] || p.god || "?";
+        const cost = p.favor != null ? ` · ${p.favor}` : "";
+        o.textContent = `${p.name} (${g})${cost}`;
+        powerSel.appendChild(o);
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "+ Agregar manual";
+      btn.style.cssText =
+        "padding:5px 10px;background:#9b59b6;color:#fff;border:0;border-radius:3px;" +
+        "cursor:pointer;font-size:11px;font-weight:bold;flex-shrink:0";
+      btn.addEventListener("click", () => {
+        const cid = (cmdInput.value || "").trim();
+        if (!cid) { cmdInput.focus(); return; }
+        if (!powerSel.value) { powerSel.focus(); return; }
+        let tid, tname;
+        if (townSel) {
+          if (!townSel.value) { townSel.focus(); return; }
+          tid = townSel.value;
+          tname = townSel.options[townSel.selectedIndex] && townSel.options[townSel.selectedIndex].dataset.name;
+        } else {
+          tid = (townInput.value || "").trim();
+          if (!tid) { townInput.focus(); return; }
+          tname = null;
+        }
+        agregarManual({
+          commandId: cid,
+          ciudadEjeId: tid,
+          ciudadEjeName: tname || `#${tid}`,
+          type: tipoSel.value,
+          powerId: powerSel.value,
+        });
+        cmdInput.value = "";
+        rerenderSiTabActiva();
+      });
+      fila3.appendChild(powerSel); fila3.appendChild(btn);
+      form.appendChild(fila3);
+
+      cont.appendChild(form);
+
+      //Lista de manuales ya agregados. Cada fila es un commandId con su
+      //"Quitar"; abajo (anidados) van los slots ya casteando, con su propio
+      //Pausar/Reanudar — mismo `renderSlotActivo` que usa el modo automático,
+      //así el comportamiento es idéntico en ambas vías.
+      if (commandIdsManuales.size) {
+        const lista = document.createElement("div");
+        lista.style.cssText = "margin-top:10px;display:flex;flex-direction:column;gap:8px";
+        const cab = document.createElement("div");
+        cab.style.cssText =
+          "color:#7a8aa0;font-size:10px;font-weight:bold;text-transform:uppercase;letter-spacing:0.5px";
+        cab.textContent = `Manuales activos (${commandIdsManuales.size})`;
+        lista.appendChild(cab);
+        for (const id of commandIdsManuales) {
+          const meta = manualesMeta.get(id) || {};
+          const wrap = document.createElement("div");
+          wrap.style.cssText =
+            "background:#0f1620;border:1px solid #2c3a4d;border-radius:3px;" +
+            "padding:6px 8px;display:flex;flex-direction:column;gap:6px";
+
+          const row = document.createElement("div");
+          row.style.cssText = "display:flex;align-items:center;gap:8px;font-size:11px";
+          const txt = document.createElement("span");
+          txt.style.cssText = "flex:1;color:#cdd5e0;font-family:monospace";
+          const nameCiudad = meta.ciudadEjeName || `#${meta.ciudadEjeId || "?"}`;
+          txt.textContent = `${meta.type === "saliente" ? "→" : "←"} #${id} · ${nameCiudad}`;
+          const del = document.createElement("button");
+          del.type = "button";
+          del.textContent = "Quitar";
+          del.style.cssText =
+            "padding:3px 8px;background:transparent;color:#e74c3c;border:1px solid #5c2018;" +
+            "border-radius:3px;cursor:pointer;font-size:10.5px;font-weight:bold";
+          del.addEventListener("click", () => {
+            quitarManual(id);
+            rerenderSiTabActiva();
+          });
+          row.appendChild(txt); row.appendChild(del);
+          wrap.appendChild(row);
+
+          //Slots vinculados al manual — uno por powerId. Comparamos con
+          //String() porque agregarManual puede haber normalizado commandId
+          //a Number, pero la key del set sigue siendo string.
+          const slotsManual = Array.from(slots.values()).filter(
+            (s) => String(s.commandId) === id
+          );
+          for (const s of slotsManual) {
+            wrap.appendChild(renderSlotActivo(s));
+          }
+
+          lista.appendChild(wrap);
+        }
+        cont.appendChild(lista);
+      }
+
+      return cont;
+    }
+
     function renderCardsCiudades() {
       const cont = document.createElement("div");
       cont.style.cssText = "display:flex;flex-direction:column;gap:10px;margin-top:12px";
@@ -1036,7 +1324,12 @@
       //Ordenar por dios para que sea fácil escanear. String() defensivo:
       //si por algún motivo el bridge devolvió god/name como objeto, no rompe
       //el render y el peor caso es que aparezca "[object Object]".
-      const ordenadas = powers.slice().sort((a, b) => {
+      //Filtramos por POWERS_VISIBLES (whitelist) — si el Set tiene items,
+      //solo se muestran esos. Si está vacío, no filtramos (catálogo entero).
+      const powersFiltrados = POWERS_VISIBLES.size
+        ? powers.filter((p) => POWERS_VISIBLES.has(p.id))
+        : powers.slice();
+      const ordenadas = powersFiltrados.sort((a, b) => {
         const ag = String(a.god || "zzz"), bg = String(b.god || "zzz");
         if (ag !== bg) return ag.localeCompare(bg);
         return String(a.name || "").localeCompare(String(b.name || ""));
@@ -1238,6 +1531,7 @@
       ultimoAnclaRender = header; //ver "ultimoAnclaRender" arriba
       body.appendChild(renderConfig());
       body.appendChild(renderFavorChips());
+      body.appendChild(renderModoManual());
       body.appendChild(renderCardsCiudades());
       body.appendChild(renderLog());
 

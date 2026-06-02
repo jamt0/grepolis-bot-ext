@@ -1,25 +1,8 @@
 # Grepolis JamBot
 
-Extensión de Chrome / navegadores Chromium (Edge, Brave, Vivaldi, Opera) que automatiza la **recolección de recursos** en las aldeas farmeables de cada ciudad de Grepolis (botón "Recoger" — la opción rápida de 5/10 min).
+Extensión de Chrome / navegadores Chromium (Edge, Brave, Vivaldi, Opera) que automatiza la **recolección de recursos** en las aldeas farmeables de cada ciudad de Grepolis (botón "Recoger" — la opción rápida de 5/10 min), además de varias features auxiliares: monitor de oro, finalizador de construcciones gratis, alertas de ataques entrantes, comercio entre ciudades, ataques programados y hechizos.
 
 Funciona como **extensión local cargada en modo desarrollador**. No se publica en la Chrome Web Store y no se conecta a ningún servidor externo: todo el estado vive en `chrome.storage.local`.
-
----
-
-## Versión PREMIUM
-
-Esta versión pública incluye únicamente la feature de **Recolección**. Existen features adicionales en la versión PREMIUM, accesibles por contraseña que entrego por canal privado.
-
-Features PREMIUM (acceso bajo contraseña):
-
-- Construcción
-- Oro
-- Comercio
-- Ataques
-- Defensa
-- Hechizos
-
-Si te interesa acceso, contactame directamente.
 
 ---
 
@@ -102,14 +85,6 @@ Si no aparecen:
 - Abrí DevTools (`F12`) → tab **Console** y buscá errores con prefijo `[JamBot/...]`.
 - El error más común: `"window.JamBot incompleto"`. Significa que el orden de carga del manifest es incorrecto — verificá que no hayas modificado `manifest.json`.
 
-### 3.5. Primera vez: ingresar la contraseña
-
-Al hacer click por primera vez en la card **Jam**, el bot te pide una contraseña para desbloquear el panel.
-
-- **Contraseña**: `JamMiPapá`
-
-Ingresala y apretá **Desbloquear**. El panel queda habilitado para esa pestaña — si recargás la pestaña, te la vuelve a pedir (no se persiste, vive solo en memoria de la sesión).
-
 ---
 
 ## 4. Cómo usarlo
@@ -119,11 +94,11 @@ Ingresala y apretá **Desbloquear**. El panel queda habilitado para esa pestaña
 | Acción | Cómo |
 |--------|------|
 | Abrir panel | Click en la card **Jam** (esquina inferior izquierda, al lado del pulpo). |
-| Iniciar la recolección | Abrí el panel → arriba a la derecha, botón **▶ Iniciar**. Pasa a azul "Pausar". |
-| Pausar | Botón **⏸ Pausar** del header del panel. |
+| Pausar la recolección | Abrí el panel → arriba a la derecha, botón **⏸ Pausar**. |
+| Reanudar | Botón **▶ Iniciar** del header del panel. |
 | Cerrar panel | Click en la **✕** del header, o click fuera del panel. |
 
-**El bot arranca pausado** después de cada recarga de la pestaña — tenés que apretar Iniciar manualmente. Eso es a propósito: evita que se dispare claims sin querer si solo abriste Grepolis para mirar algo.
+**El bot arranca corriendo** automáticamente al cargar la pestaña. La recolección y el monitor de oro se activan solos — si querés frenarlos, lo hacés desde el panel.
 
 ### Indicador en tiempo real (en la card Jam)
 

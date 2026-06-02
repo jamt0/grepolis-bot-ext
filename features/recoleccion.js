@@ -304,26 +304,44 @@
       guardarHistorial();
     }
 
-    function limpiarHistorial() {
+    //Borra TODO el estado persistido por el bot: todas las keys jambot* en
+    //`chrome.storage.local` (config, historiales, alertas, cachés por mundo
+    //de todas las features) y en `window.localStorage` (tab activo, scrolls
+    //por tab, subtab de Recolección). El estado in-memory de esta feature
+    //también se vacía, pero las otras features (oro, ataques, comercio,
+    //hechizos, etc.) quedan con su estado en RAM hasta el F5 — por eso
+    //sugerimos al usuario recargar la pestaña después.
+    function limpiarTodosLosDatos() {
       historialPorAldea = {};
       ciclos = [];
       cicloActual = null;
-      try {
-        chrome.storage.local.remove(STORAGE_KEY_HISTORIAL);
-      } catch (e) {
-        core.logWarn("recoleccion", "no pude limpiar historial", e);
-      }
-      core.log("recoleccion", "historial limpiado", "ok");
-    }
-
-    function limpiarLastClaimAt() {
       lastClaimAtPorAldea = {};
+
+      const localKeys = [];
       try {
-        chrome.storage.local.remove(STORAGE_KEY_LAST_CLAIM);
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i);
+          if (k && k.startsWith("jambot")) localKeys.push(k);
+        }
+        for (const k of localKeys) window.localStorage.removeItem(k);
       } catch (e) {
-        core.logWarn("recoleccion", "no pude limpiar lastClaimAt", e);
+        core.logWarn("recoleccion", "no pude limpiar localStorage", e);
       }
-      core.log("recoleccion", "sincronización con server reseteada", "ok");
+
+      try {
+        chrome.storage.local.get(null, (todo) => {
+          const keys = Object.keys(todo || {}).filter((k) => k.startsWith("jambot"));
+          if (!keys.length) {
+            core.log("recoleccion", "no había datos persistidos para limpiar", "ok");
+            return;
+          }
+          chrome.storage.local.remove(keys, () => {
+            core.log("recoleccion", `datos limpiados: ${keys.length} keys de chrome.storage + ${localKeys.length} de localStorage`, "ok");
+          });
+        });
+      } catch (e) {
+        core.logError("recoleccion", "no pude limpiar chrome.storage.local", e);
+      }
     }
 
     function exportarHistorial() {
@@ -441,42 +459,9 @@
 
     const panelConfig = crearPanelConfig();
 
-    //Trigger one-shot del modal RECURSOS: la pwd se pide al PRIMER click
-    //en la card Jam de cada carga. Si el usuario cancela, no se le vuelve
-    //a preguntar (queda con los 3 tabs libres). Al F5 el flag se resetea
-    //y vuelve a pedir.
-    let recursosPwdYaSolicitada = false;
-
-    //Cuando una pwd se ingresa OK en runtime (RECURSOS desde la card,
-    //PREMIUM desde Settings), re-renderear el panel para que aparezcan
-    //los tabs nuevos. Si está cerrado, no hace falta — al abrirse se
-    //construye con el estado actual.
-    const reRenderSiAbierto = () => {
-      const panel = document.getElementById("panelConfigJam");
-      if (panel && panel.style.display !== "none") renderPanelConfig(panel);
-    };
-    core.onRecursosUnlock(reRenderSiAbierto);
-    core.onPremiumUnlock(reRenderSiAbierto);
-    //Repintar el slime cuando se desbloquea PREMIUM (rosa → morado).
-    core.onPremiumUnlock(() => pintarSlime());
-
-    //Paleta del slime de la card "Jam". Morado cuando hay PREMIUM, rosa
-    //cuando no — para que el usuario vea de un vistazo si tiene los
-    //features avanzados activos.
+    //Paleta del slime de la card "Jam".
     function coloresSlime() {
-      return core.isPremiumUnlocked()
-        ? { fill: "#9b59b6", stroke: "#7d3c98" }  // morado premium
-        : { fill: "#e91e63", stroke: "#ad1457" }; // rosa sin premium
-    }
-
-    //Repinta el body del slime in-situ sin remontar la card. Se llama
-    //cuando se dispara onPremiumUnlock.
-    function pintarSlime() {
-      const body = document.querySelector("#jambot-card .jambot-slime-body");
-      if (!body) return;
-      const { fill, stroke } = coloresSlime();
-      body.setAttribute("fill", fill);
-      body.setAttribute("stroke", stroke);
+      return { fill: "#9b59b6", stroke: "#7d3c98" };
     }
 
     crearCardJam();
@@ -505,10 +490,7 @@
         "font-family:'Segoe UI',sans-serif;font-size:13px;font-weight:bold;" +
         "letter-spacing:0.3px;box-shadow:0 2px 6px rgba(0,0,0,0.3);" +
         "transition:background 0.15s,border-color 0.15s";
-      //SVG slime: blob con dos ojitos. Color depende del estado PREMIUM —
-      //morado si está desbloqueado, rosa si no. La clase en el path
-      //principal nos permite repintar in-situ cuando se dispara el unlock
-      //sin tener que remontar la card.
+      //SVG slime: blob con dos ojitos en morado.
       const { fill, stroke } = coloresSlime();
       card.innerHTML =
         `<svg width="22" height="22" viewBox="0 0 24 24" style="flex-shrink:0">
@@ -532,15 +514,6 @@
         card.style.borderColor = "#2c3a4d";
       });
       card.addEventListener("click", async () => {
-        //Primer click de la sesión y RECURSOS sin desbloquear → modal.
-        //Esperamos que el usuario confirme o cancele antes de abrir el
-        //panel; si confirma, el evento onRecursosUnlock va a re-renderear
-        //sobre el panel ya abierto, así no hay race.
-        if (!core.isRecursosUnlocked() && !recursosPwdYaSolicitada) {
-          recursosPwdYaSolicitada = true;
-          await core.pedirContraseñaRecursos();
-        }
-
         //Click en la card normalmente lleva a Dashboard. EXCEPCIÓN: cuando
         //hay CAPTCHA pendiente, lleva a Recolección — ahí está el cartel
         //con el botón "Ya resolví", que es lo único que el usuario quiere
@@ -578,6 +551,24 @@
         recolectarRecursos();
       }
     });
+
+    //Kickoff inicial: como el bot arranca con pausado=false, el listener
+    //de arriba no se va a disparar (no hay transición). Disparamos el
+    //primer ciclo a mano, pero diferido con setTimeout(0): el resto de
+    //init() es síncrono después de este punto (los awaits ya pasaron) y
+    //define varios `let` más abajo (indicadorVivoEl, tabActivo, watchdogId,
+    //etc.) que recolectarRecursos lee directa o indirectamente. Si llamamos
+    //sincrónicamente caemos en TDZ ("Cannot access 'indicadorVivoEl' before
+    //initialization") y el primer ciclo aborta — el usuario ve "0/108 ·
+    //6 fallidas" hasta que pausa-iniciar manual. setTimeout(0) asegura que
+    //el callback corra DESPUÉS de que init termine de inicializar todo.
+    if (!core.isPaused()) {
+      setTimeout(() => {
+        if (!core.isPaused() && !core.isCaptchaActive()) {
+          recolectarRecursos();
+        }
+      }, 0);
+    }
 
     //Indicador en tiempo real bajo los botones — muestra "🍎 X/Y ciudades ·
     //A/B aldeas" mientras hay un ciclo en curso. Se inserta en el mismo
@@ -865,30 +856,15 @@
       tabs.style.cssText =
         "display:flex;flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;" +
         "border-bottom:1px solid #2c3a4d;background:#172029";
-      //Tabs libres — siempre visibles.
       tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
-      //Tabs protegidos — todos detrás de PREMIUM. Sin la pwd premium el
-      //usuario solo ve Dashboard / Settings / Recolección. Cuando se
-      //desbloquea, aparecen las 6 pestañas avanzadas de un saque.
-      const premiumUnlocked = core.isPremiumUnlocked && core.isPremiumUnlocked();
-      if (premiumUnlocked) {
-        tabs.appendChild(crearBotonTab("construccion", "Construcción"));
-        tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
-        tabs.appendChild(crearBotonTab("comercio", "Comercio"));
-        tabs.appendChild(crearBotonTab("ataques", "Ataques"));
-        tabs.appendChild(crearBotonTab("defensa", "Defensa"));
-        tabs.appendChild(crearBotonTab("hechizos", "Hechizos"));
-      }
-      //Si el usuario tenía persistido un tab protegido y ahora está
-      //locked (F5 o primer load), lo enviamos a Recolección — sino el
-      //body queda vacío.
-      const TABS_PROTEGIDOS = ["construccion", "mercadoOro", "comercio", "ataques", "defensa", "hechizos"];
-      if (TABS_PROTEGIDOS.includes(tabActivo) && !premiumUnlocked) {
-        tabActivo = "recoleccion";
-        try { window.localStorage.setItem(STORAGE_KEY_TAB, "recoleccion"); } catch (_) {}
-      }
+      tabs.appendChild(crearBotonTab("construccion", "Construcción"));
+      tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
+      tabs.appendChild(crearBotonTab("comercio", "Comercio"));
+      tabs.appendChild(crearBotonTab("ataques", "Ataques"));
+      tabs.appendChild(crearBotonTab("defensa", "Defensa"));
+      tabs.appendChild(crearBotonTab("hechizos", "Hechizos"));
       panel.appendChild(tabs);
 
       //Body del tab activo. flex:1 + min-height:0 + overflow-y:auto hace
@@ -1379,19 +1355,8 @@
       //El toggle de "Finalizar construcción gratis" ya no vive acá — cada
       //módulo es independiente y tiene su propio control en su tab. El de
       //finalizar está en la tab "Construcción" como banner Iniciar/Detener.
-
-      //Sección: desbloqueo premium (solo si todavía no se ingresó la pwd).
-      //Al confirmarse, core dispara onPremiumUnlock, se re-renderea el
-      //panel entero y este botón desaparece junto con el aparecer de los
-      //tabs Ataques/Defensa/Hechizos.
-      if (!core.isPremiumUnlocked()) {
-        body.appendChild(crearTituloSeccion("Premium"));
-        body.appendChild(renderBotonPermisoPremium());
-      }
-
-      //Sección: tiempo por ciudad
-      body.appendChild(crearTituloSeccion("Tiempo de recolección por ciudad"));
-      body.appendChild(renderTiemposPorCiudad());
+      //El cooldown por ciudad (Lealtad) vive en el subtab "Por ciudad" del
+      //tab Recolección — no se duplica acá.
 
       //Sección: mantenimiento (acciones destructivas)
       body.appendChild(crearTituloSeccion("Mantenimiento"));
@@ -1399,125 +1364,6 @@
 
       //Footer con nombre + versión
       body.appendChild(renderFooterVersion());
-    }
-
-    function renderBotonPermisoPremium() {
-      const wrap = document.createElement("div");
-      wrap.style.cssText = "margin-top:6px";
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.style.cssText =
-        "display:flex;align-items:center;gap:10px;padding:10px 14px;width:100%;" +
-        "background:#9b59b6;color:#fff;border:0;border-radius:4px;cursor:pointer;" +
-        "font-size:12.5px;font-weight:bold;text-align:left;letter-spacing:0.3px;" +
-        "transition:background 0.15s";
-      btn.addEventListener("mouseenter", () => { btn.style.background = "#8e44ad"; });
-      btn.addEventListener("mouseleave", () => { btn.style.background = "#9b59b6"; });
-      btn.innerHTML =
-        `<span style="font-size:16px;flex-shrink:0">🔓</span>` +
-        `<div style="flex:1">` +
-        `<div>Papi jam me dio permiso del premium</div>` +
-        `<div style="color:#e8d5f5;font-size:10.5px;font-weight:normal;margin-top:2px">` +
-        `Desbloquea Construcción · Oro · Comercio · Ataques · Defensa · Hechizos</div>` +
-        `</div>`;
-      btn.addEventListener("click", () => { core.pedirContraseñaPremium(); });
-      wrap.appendChild(btn);
-      return wrap;
-    }
-
-    //Color único para todas las ciudades. Antes había una paleta cíclica
-    //multicolor pero quedaba "circo" — el color por ciudad no aporta
-    //información, solo confunde. Azul (#3498db = info) es coherente con
-    //el resto del panel.
-    const COLOR_CIUDAD = "#3498db";
-
-    function renderTiemposPorCiudad() {
-      const wrap = document.createElement("div");
-      wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:6px";
-
-      if (!ciudadesConAldeas.length) {
-        const vacio = document.createElement("div");
-        vacio.textContent = "Cargando ciudades...";
-        vacio.style.cssText = "opacity:0.7;font-style:italic;padding:6px 0";
-        wrap.appendChild(vacio);
-        return wrap;
-      }
-
-      const ciudadesOrden = ciudadesConAldeas.slice().sort((a, b) =>
-        (a.nombreCiudad || "").localeCompare(b.nombreCiudad || "", undefined, { numeric: true })
-      );
-
-      ciudadesOrden.forEach((ciudad) => {
-        const det = cooldownPorCiudad[ciudad.codigoCiudad] || detectarMinutosCiudad(ciudad);
-        const color = COLOR_CIUDAD;
-        const minutos = det.minutos;
-
-        const card = document.createElement("div");
-        card.style.cssText =
-          "display:flex;align-items:center;gap:10px;padding:8px 10px;" +
-          `background:#172029;border:1px solid #2c3a4d;border-left:3px solid ${color};` +
-          "border-radius:4px;transition:background 0.15s";
-        card.addEventListener("mouseenter", () => card.style.background = "#1c2733");
-        card.addEventListener("mouseleave", () => card.style.background = "#172029");
-
-        //Bullet circular con el color de la ciudad — refuerza la jerarquía
-        const bullet = document.createElement("div");
-        bullet.style.cssText =
-          `width:28px;height:28px;border-radius:50%;background:${color}22;` +
-          `border:2px solid ${color};display:flex;align-items:center;justify-content:center;` +
-          `flex-shrink:0;color:${color};font-weight:bold;font-size:11px`;
-        //Mostramos los últimos 2 dígitos del codigoCiudad o las primeras 2
-        //letras del nombre — lo que sea más identificable.
-        const nombre = ciudad.nombreCiudad || String(ciudad.codigoCiudad);
-        const matchNum = nombre.match(/(\d+)/);
-        bullet.textContent = matchNum ? matchNum[1].slice(-2) : nombre.slice(0, 2).toUpperCase();
-        card.appendChild(bullet);
-
-        //Nombre + cantidad de aldeas
-        const info = document.createElement("div");
-        info.style.cssText = "flex:1;min-width:0;text-align:left";
-        const nombreEl = document.createElement("div");
-        nombreEl.textContent = nombre;
-        nombreEl.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
-        const subEl = document.createElement("div");
-        subEl.textContent = `${(ciudad.aldeas || []).length} aldeas farmeables`;
-        subEl.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
-        info.appendChild(nombreEl);
-        info.appendChild(subEl);
-        card.appendChild(info);
-
-        //Badge auto-detectado: minutos + estado de Lealtad. Reemplaza al
-        //toggle 5/10 manual — la auto-detección lee `lootable_at -
-        //last_looted_at` del modelo del server, que es exacto. Si la
-        //ciudad no tiene claim histórico (lealtad=null, fuente=fallback)
-        //mostramos el cooldown asumido en gris para que el usuario sepa
-        //que se va a corregir solo al primer claim.
-        const badge = document.createElement("div");
-        const esFallback = det.fuente !== "auto";
-        const colorBadge = esFallback ? "#5a6776" : (det.lealtad ? "#27ae60" : "#3498db");
-        badge.style.cssText =
-          "display:flex;flex-direction:column;align-items:flex-end;gap:2px;flex-shrink:0";
-        const minLine = document.createElement("div");
-        minLine.textContent = `${minutos} min`;
-        minLine.style.cssText =
-          `padding:4px 10px;border-radius:4px;font-size:11.5px;font-weight:bold;` +
-          `background:${colorBadge}22;color:${colorBadge};border:1px solid ${colorBadge}55`;
-        const subBadge = document.createElement("div");
-        subBadge.textContent = esFallback
-          ? "sin datos aún"
-          : (det.lealtad ? "Lealtad investigada" : "sin Lealtad");
-        subBadge.style.cssText = `color:${colorBadge};font-size:9.5px;letter-spacing:0.3px`;
-        badge.appendChild(minLine);
-        badge.appendChild(subBadge);
-        badge.title = esFallback
-          ? "Ninguna aldea de esta ciudad tiene cooldown server registrado todavía. Se va a auto-detectar en el primer ciclo."
-          : `Auto-detectado: el server reporta cooldown de ${minutos*60}s para las aldeas de esta ciudad.`;
-        card.appendChild(badge);
-
-        wrap.appendChild(card);
-      });
-
-      return wrap;
     }
 
     function renderMantenimiento() {
@@ -1551,13 +1397,9 @@
       };
 
       wrap.appendChild(mkBtn("📥", "Exportar historial", "Descarga un JSON con todo el historial", false, exportarHistorial));
-      wrap.appendChild(mkBtn("🔄", "Reset cooldown del server", "Olvida cuándo se claimeó cada aldea — se re-sincroniza solo", false, () => {
-        if (!confirm("¿Resetear el map de lastClaimAt?\nEl próximo ciclo va a respetar los cooldowns que el server marque.")) return;
-        limpiarLastClaimAt();
-      }));
-      wrap.appendChild(mkBtn("🗑", "Limpiar historial", "Borra todos los ciclos y claims persistidos. No se puede deshacer.", true, () => {
-        if (!confirm("¿Borrar todo el historial de claims y los últimos ciclos?\nEsta acción NO se puede deshacer.")) return;
-        limpiarHistorial();
+      wrap.appendChild(mkBtn("🗑", "Limpiar todos los datos", "Borra TODO lo persistido del bot (historial, oro, ataques, comercio, hechizos, config…). No se puede deshacer.", true, () => {
+        if (!confirm("¿Borrar TODOS los datos del bot?\nEsto incluye historial de claims, ciclos, alertas de oro, ataques, comercio, hechizos y toda la configuración persistida. Tras la limpieza conviene recargar la pestaña (F5).\n\nEsta acción NO se puede deshacer.")) return;
+        limpiarTodosLosDatos();
         renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
       }));
 
@@ -2120,10 +1962,30 @@
       }
       const desc = partes.join(" · ") || "sin actividad registrada";
 
+      //Badge de cooldown + Lealtad. Antes vivía en Settings; ahora va en
+      //la card de la ciudad porque pertenece al contexto de Recolección.
+      //Verde si la ciudad investigó Lealtad (10 min, +115% recursos),
+      //azul si no (5 min sin Lealtad), gris si todavía no hay claim
+      //histórico para inferirlo (fallback — se auto-corrige al primer ciclo).
+      const det = cooldownPorCiudad[ciudad.codigoCiudad] || detectarMinutosCiudad(ciudad);
+      const esFallback = det.fuente !== "auto";
+      const colorCd = esFallback ? "#5a6776" : (det.lealtad ? "#27ae60" : "#3498db");
+      const labelCd = esFallback
+        ? `${det.minutos} min · sin datos`
+        : (det.lealtad ? `${det.minutos} min · Lealtad` : `${det.minutos} min`);
+      const tooltipCd = esFallback
+        ? "Ninguna aldea de esta ciudad tiene cooldown server registrado todavía. Se va a auto-detectar en el primer ciclo."
+        : `Auto-detectado: el server reporta cooldown de ${det.minutos * 60}s para las aldeas de esta ciudad.`;
+      const badgeCd =
+        `<span title="${escapeHtml(tooltipCd)}" style="display:inline-block;` +
+        `padding:1px 6px;margin-left:8px;border-radius:3px;font-size:9.5px;` +
+        `font-weight:bold;letter-spacing:0.3px;vertical-align:middle;` +
+        `background:${colorCd}22;color:${colorCd};border:1px solid ${colorCd}55">${escapeHtml(labelCd)}</span>`;
+
       const header =
         `<div style="display:flex;align-items:center;gap:8px;width:100%">` +
         `  <div style="flex:1;min-width:0;text-align:left;line-height:1.25">` +
-        `    <div style="font-size:12px;color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad)}</div>` +
+        `    <div style="font-size:12px;color:#e6e9ee;font-weight:bold">${escapeHtml(ciudad.nombreCiudad)}${badgeCd}</div>` +
         `    <div style="font-size:10.5px;color:#7a8aa0;margin-top:2px">${escapeHtml(desc)}</div>` +
         `  </div>` +
         `  <span style="color:${color};font-weight:bold;font-size:11.5px;min-width:36px;text-align:right">${listas}/${aldeas.length}</span>` +
