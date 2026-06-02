@@ -88,7 +88,7 @@
       try {
         const obj = await new Promise((resolve) => {
           chrome.storage.local.get(
-            [STORAGE_KEY_MAPA, STORAGE_KEY_ALERTAS, STORAGE_KEY_MUTE, STORAGE_KEY_HABILITADA],
+            [STORAGE_KEY_MAPA, STORAGE_KEY_MUTE, STORAGE_KEY_HABILITADA],
             (o) => resolve(o || {})
           );
         });
@@ -122,14 +122,9 @@
           }
           if (necesitaMigrar) ultimoDescubrimiento = 0;
         }
-        if (Array.isArray(obj[STORAGE_KEY_ALERTAS])) alertas = obj[STORAGE_KEY_ALERTAS];
         const n = Object.keys(mapaSeaIdToTown).length;
         if (n > 0) {
-          core.log(
-            "mercadoOro",
-            `mapa ${n} mar(es) cargado · ${alertas.length} alertas`,
-            "ok"
-          );
+          core.log("mercadoOro", `mapa ${n} mar(es) cargado`, "ok");
         }
       } catch (_) { /* sin storage */ }
     }
@@ -167,14 +162,9 @@
       }
     }
 
-    let saveAlertasTimer = null;
-    function persistirAlertas() {
-      if (saveAlertasTimer) return;
-      saveAlertasTimer = setTimeout(() => {
-        saveAlertasTimer = null;
-        try { chrome.storage.local.set({ [STORAGE_KEY_ALERTAS]: alertas }); } catch (_) {}
-      }, 1000);
-    }
+    //Alertas históricas: NO se persisten. Viven en RAM por la sesión actual.
+    //Al F5 arrancan vacías. El usuario no necesita el archivo histórico.
+    function persistirAlertas() { /* no-op */ }
 
     await cargarStorage();
 

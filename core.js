@@ -142,37 +142,17 @@
     persistirErroresBuffer();
   }
 
+  //Buffer de errores: RAM only. Antes lo persistíamos en chrome.storage
+  //(jambotErrores) para que sobreviviera al F5, pero suma hasta 100 KB de
+  //writes con throttle y no aporta valor real — al recargar la pestaña
+  //arrancamos limpios y los errores nuevos se loguean igual.
   function cargarErroresBuffer() {
-    return new Promise((resolve) => {
-      try {
-        chrome.storage.local.get(STORAGE_KEY_ERRORES, (obj) => {
-          const arr = (obj && obj[STORAGE_KEY_ERRORES]) || [];
-          //Reemplazar contenido del buffer in-place para no romper
-          //referencias del array (las funciones getErrores/imprimirErrores
-          //hacen .slice() así que tampoco importa, pero por consistencia).
-          erroresBuffer.length = 0;
-          for (const e of arr) erroresBuffer.push(e);
-          resolve();
-        });
-      } catch (_) {
-        //chrome.storage no disponible (page-context) → arrancar vacío.
-        resolve();
-      }
-    });
+    //Limpiar cualquier key vieja de versiones anteriores que sí persistían.
+    try { chrome.storage.local.remove(STORAGE_KEY_ERRORES); } catch (_) {}
+    return Promise.resolve();
   }
 
-  function persistirErroresBuffer() {
-    if (saveErroresPending) clearTimeout(saveErroresPending);
-    saveErroresPending = setTimeout(() => {
-      saveErroresPending = null;
-      try {
-        chrome.storage.local.set({ [STORAGE_KEY_ERRORES]: erroresBuffer });
-      } catch (_) {
-        //Ya estamos en un código que loggea errores; no podemos llamar a
-        //logError acá sin riesgo de loop. Silencioso.
-      }
-    }, 500);
-  }
+  function persistirErroresBuffer() { /* no-op — RAM only */ }
 
   function getErrores(filtro) {
     const f = filtro || {};
