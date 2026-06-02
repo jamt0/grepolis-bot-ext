@@ -73,17 +73,6 @@
     const { game, core } = ctx;
     const { csrfToken, world_id, townId, player_id } = game;
 
-    //Módulo PREMIUM: sin pwd no arranca el poll de comandos. El tab
-    //"Defensa" tampoco se muestra (recoleccion.js lo oculta). Es lectura
-    //pura del server, pero entra en el bundle premium. Nos suscribimos
-    //al evento de unlock para arrancar cuando se ingrese la pwd correcta.
-    if (!core.isPremiumUnlocked()) {
-      core.log("ataquesEntrantes", "bloqueado — sin pwd premium", "warn");
-      JamBot.features.ataquesEntrantes.api = { renderTab: core.renderBloqueoEnTab };
-      core.onPremiumUnlock(() => init(ctx));
-      return;
-    }
-
     const STORAGE_KEY_ACK = `jambotAtaquesEntrantesAck_${world_id}`;
     const STORAGE_KEY_HISTORIAL = `jambotAtaquesEntrantesHistorial_${world_id}`;
 
@@ -304,10 +293,28 @@
     }
 
     //—— Ciclo ————————————————————————————————————————————————————————
+    //
+    //Guard de reentrada: si el server tarda más que POLL_INTERVAL_MS en
+    //responder (típico sin Admin: el endpoint command_overview falla con
+    //timeout o devuelve payload grande con retries), `setInterval` arrancaría
+    //un ciclo nuevo encima del anterior. El payload trae notifications que
+    //al dispatchearse generan tráfico extra del cliente del juego. Con el
+    //guard, si el anterior sigue corriendo, este tick se descarta.
+    let cicloEnCurso = false;
+
     async function ciclo() {
       if (!core.isExtensionContextValid()) return;
       if (core.isCaptchaActive()) return;
+      if (cicloEnCurso) return;
+      cicloEnCurso = true;
+      try {
+        return await cicloInterno();
+      } finally {
+        cicloEnCurso = false;
+      }
+    }
 
+    async function cicloInterno() {
       let data;
       try {
         data = await obtenerComandos();

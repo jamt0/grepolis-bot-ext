@@ -125,16 +125,6 @@
     const { data, game, core } = ctx;
     const { csrfToken, world_id, townId, player_id } = game;
 
-    //Módulo PREMIUM: sin pwd no arrancamos polls ni timers. El tab
-    //"Comercio" tampoco se muestra. Nos suscribimos al evento de unlock
-    //para que init() se vuelva a invocar cuando se ingrese la pwd.
-    if (!core.isPremiumUnlocked()) {
-      core.log("comercio", "bloqueado — sin pwd premium", "warn");
-      JamBot.features.comercio.api = { renderTab: core.renderBloqueoEnTab };
-      core.onPremiumUnlock(() => init(ctx));
-      return;
-    }
-
     const STORAGE_KEY = `jambotComercio_${world_id}`;
 
     //—— Estado expuesto ————————————————————————————————————————————————

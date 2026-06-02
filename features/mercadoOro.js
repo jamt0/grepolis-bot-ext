@@ -47,26 +47,15 @@
     const { game, core } = ctx;
     const { csrfToken, world_id, townId } = game;
 
-    //Módulo PREMIUM: sin pwd no arrancamos polls. El tab "Oro" tampoco
-    //se muestra. Nos suscribimos al evento de unlock para que init() se
-    //vuelva a invocar cuando se ingrese la pwd.
-    if (!core.isPremiumUnlocked()) {
-      core.log("mercadoOro", "bloqueado — sin pwd premium", "warn");
-      JamBot.features.mercadoOro.api = { renderTab: core.renderBloqueoEnTab };
-      core.onPremiumUnlock(() => init(ctx));
-      return;
-    }
-
     const STORAGE_KEY_MAPA = `jambotMercadoOroMapa_${world_id}`;
     const STORAGE_KEY_ALERTAS = `jambotMercadoOroAlertas_${world_id}`;
     const STORAGE_KEY_MUTE = `jambotMercadoOroMute_${world_id}`;
     const STORAGE_KEY_HABILITADA = `jambotMercadoOroHabilitada_${world_id}`;
 
-    //Toggle Iniciar/Detener — el monitor ya no arranca automáticamente. El
-    //usuario lo enciende explícitamente desde el botón en el header del tab
-    //Oro. Por defecto false (silencioso) para que la extensión no genere
-    //requests sin que el usuario lo pida.
-    let habilitada = false;
+    //Toggle Iniciar/Detener. Por defecto true: el monitor de oro arranca
+    //automáticamente con la extensión. El usuario puede detenerlo desde el
+    //botón en el header del tab Oro si no quiere alertas.
+    let habilitada = true;
 
     let mapaSeaIdToTown = {};
     let ultimoDescubrimiento = 0;
@@ -702,37 +691,54 @@
     }
 
     //—— Ciclo ————————————————————————————————————————————————————————
+    //
+    //Guard de reentrada: el ciclo recorre los mares secuencialmente con
+    //~200ms de fetch + 300-600ms de delay anti-fingerprint. Para 6 mares,
+    //un ciclo dura ~4s — más que el POLL_INTERVAL_MS de 3s. Sin este guard,
+    //`setInterval` arrancaría un ciclo nuevo encima del anterior, solapando
+    //fetches indefinidamente y saturando el thread del renderer (cada
+    //leerPremiumExchange hace dispatchNotifs → el cliente del juego pega
+    //sus propias notify?action=fetch). Con el guard, si el anterior sigue
+    //corriendo, el tick actual se descarta — la próxima oportunidad es el
+    //siguiente tick del interval.
+    let cicloEnCurso = false;
+
     async function ciclo() {
       if (!core.isExtensionContextValid()) return;
       if (core.isCaptchaActive()) return;
       if (!habilitada) return; //toggle Iniciar/Detener del header del tab Oro
-
-      const ahora = Date.now();
-      const sinMapa = Object.keys(mapaSeaIdToTown).length === 0;
-      const expirado = ahora - ultimoDescubrimiento >= REDESCUBRIR_INTERVAL_MS;
-      if (sinMapa || expirado) {
-        await descubrirMares();
-        return;
-      }
-
-      const acumulado = [];
-      const ts = Date.now();
-      for (const [seaId, repTown] of Object.entries(mapaSeaIdToTown)) {
-        if (!core.isExtensionContextValid()) return;
-        if (core.isCaptchaActive()) return;
-        try {
-          const data = await leerPremiumExchange(repTown.id);
-          acumulado.push(...procesarPayload(seaId, repTown, data && data.json, ts));
-          await core.delaySeconds(0.3 + Math.random() * 0.3);
-        } catch (e) {
-          core.logWarn("mercadoOro", `poll mar ${seaId} (town ${repTown.id}): ${e.message}`);
+      if (cicloEnCurso) return;
+      cicloEnCurso = true;
+      try {
+        const ahora = Date.now();
+        const sinMapa = Object.keys(mapaSeaIdToTown).length === 0;
+        const expirado = ahora - ultimoDescubrimiento >= REDESCUBRIR_INTERVAL_MS;
+        if (sinMapa || expirado) {
+          await descubrirMares();
+          return;
         }
+
+        const acumulado = [];
+        const ts = Date.now();
+        for (const [seaId, repTown] of Object.entries(mapaSeaIdToTown)) {
+          if (!core.isExtensionContextValid()) return;
+          if (core.isCaptchaActive()) return;
+          try {
+            const data = await leerPremiumExchange(repTown.id);
+            acumulado.push(...procesarPayload(seaId, repTown, data && data.json, ts));
+            await core.delaySeconds(0.3 + Math.random() * 0.3);
+          } catch (e) {
+            core.logWarn("mercadoOro", `poll mar ${seaId} (town ${repTown.id}): ${e.message}`);
+          }
+        }
+        //dispararAlarma es idempotente por mar (agrega solo seaIds nuevos al
+        //Set), así que lo llamamos sin chequear hayAlarma. Si no hay acumulado
+        //pero la alarma sigue, solo refrescamos el label/beep desde estado.
+        if (acumulado.length) dispararAlarma(acumulado);
+        else if (hayAlarma()) { sincronizarBeep(); actualizarBotonFlotante(); }
+      } finally {
+        cicloEnCurso = false;
       }
-      //dispararAlarma es idempotente por mar (agrega solo seaIds nuevos al
-      //Set), así que lo llamamos sin chequear hayAlarma. Si no hay acumulado
-      //pero la alarma sigue, solo refrescamos el label/beep desde estado.
-      if (acumulado.length) dispararAlarma(acumulado);
-      else if (hayAlarma()) { sincronizarBeep(); actualizarBotonFlotante(); }
     }
 
     //—— Render del tab "Oro" ————————————————————————————————————————————
