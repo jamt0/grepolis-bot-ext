@@ -254,71 +254,54 @@
 
     //—— Storage de historial + último ciclo ——————————————————————————————
 
+    //—— Persistencia minimal del historial ————————————————————————————
+    //
+    //ANTES: persistíamos `porAldea` (hasta 36 entradas por aldea × 6 aldeas
+    //× N ciudades ≈ MB) + `ciclos` (36 ciclos cerrados completos) +
+    //`cicloEnCurso`. El blob crecía y volvía lento el storage.
+    //
+    //AHORA: solo persistimos el ÚLTIMO ciclo cerrado (sin historial por
+    //aldea ni ciclos previos). In-memory los arrays `historialPorAldea` y
+    //`ciclos` siguen creciendo durante la sesión para que la UI funcione,
+    //pero al F5 arrancan vacíos y solo se rehidrata 1 ciclo.
+
     function cargarHistorial() {
       return new Promise((resolve) => {
         chrome.storage.local.get(STORAGE_KEY_HISTORIAL, (obj) => {
           const blob = (obj && obj[STORAGE_KEY_HISTORIAL]) || {};
-          //Retrocompatibilidad: las versiones previas guardaban solo el
-          //último ciclo en `ultimoCiclo`. Si encontramos ese formato lo
-          //promovemos a un array de un elemento. Las próximas escrituras
-          //ya van a usar el formato nuevo `ciclos`.
-          const ciclos = Array.isArray(blob.ciclos)
-            ? blob.ciclos
-            : (blob.ultimoCiclo ? [blob.ultimoCiclo] : []);
+          const ultimo = blob.ultimoCiclo || null;
           resolve({
-            porAldea: blob.porAldea || {},
-            ciclos: ciclos,
-            //cicloEnCurso: snapshot del ciclo que estaba corriendo cuando la
-            //pestaña se cerró/recargó. Si tiene aldeasCompletadas > 0 lo
-            //promovemos a ciclos[] como interrumpido en el bootstrap, así no
-            //se pierde el progreso parcial. Ver flujo en líneas ~136-160.
-            cicloEnCurso: blob.cicloEnCurso || null,
+            porAldea: {},
+            ciclos: ultimo ? [ultimo] : [],
+            cicloEnCurso: null,
           });
         });
       });
     }
 
-    //Snapshot persistible de cicloActual. JSON.parse(JSON.stringify) garantiza
-    //que las mutaciones in-memory posteriores al set() no afecten el blob ya
-    //serializado por chrome.storage. Sin esto, dos guardarHistorial() casi
-    //simultáneos podrían escribir referencias compartidas y truncarse mal.
-    function snapshotCicloActual() {
-      return cicloActual ? JSON.parse(JSON.stringify(cicloActual)) : null;
-    }
-
     function guardarHistorial() {
       if (!core.isExtensionContextValid()) return;
+      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       try {
         chrome.storage.local.set({
-          [STORAGE_KEY_HISTORIAL]: {
-            porAldea: historialPorAldea,
-            ciclos: ciclos,
-            cicloEnCurso: snapshotCicloActual(),
-          },
+          [STORAGE_KEY_HISTORIAL]: { ultimoCiclo: ultimo },
         });
       } catch (e) {
-        core.logWarn("recoleccion", "no pude persistir historial", e);
+        core.logWarn("recoleccion", "no pude persistir último ciclo", e);
       }
     }
 
-    //Versión que retorna Promise — usada en la promoción del ciclo para
-    //garantizar que el ciclo recién terminado llegue al disco ANTES de
-    //volver a programar el siguiente tick. Sin esto, un reload de la
-    //pestaña entre el push a ciclos[] y el set() async (~10-50ms) perdía
-    //el ciclo entero.
     function guardarHistorialAsync() {
       if (!core.isExtensionContextValid()) return Promise.resolve();
+      const ultimo = ciclos.length ? ciclos[ciclos.length - 1] : null;
       return new Promise((resolve) => {
         try {
-          chrome.storage.local.set({
-            [STORAGE_KEY_HISTORIAL]: {
-              porAldea: historialPorAldea,
-              ciclos: ciclos,
-              cicloEnCurso: snapshotCicloActual(),
-            },
-          }, resolve);
+          chrome.storage.local.set(
+            { [STORAGE_KEY_HISTORIAL]: { ultimoCiclo: ultimo } },
+            resolve
+          );
         } catch (e) {
-          core.logWarn("recoleccion", "no pude persistir historial", e);
+          core.logWarn("recoleccion", "no pude persistir último ciclo", e);
           resolve();
         }
       });
@@ -341,7 +324,9 @@
       }
       arr.push({ ts: Date.now(), ...entrada });
       while (arr.length > HISTORIAL_MAX) arr.shift();
-      guardarHistorial();
+      //Sin persistir cada claim: ahora solo guardamos el último ciclo
+      //cerrado, no el historial por aldea. La UI in-memory sigue funcionando
+      //para la sesión actual.
     }
 
     //Borra TODO el estado persistido por el bot: todas las keys jambot* en
@@ -3373,10 +3358,10 @@
         ultimoClaimAt: null,
       };
       actualizarIndicadorVivo();
-      //Persistir el ciclo recién creado ANTES del primer claim. Si la pestaña
-      //se cierra entre acá y el primer registrarClaim el storage queda con
-      //un ciclo vacío en curso que el bootstrap descarta (aldeasCompletadas=0).
-      guardarHistorial();
+      //Ya no persistimos el ciclo "en curso" — solo guardamos el último
+      //ciclo CERRADO (al final de recolectarCiudades). Si la pestaña se
+      //cierra a mitad de ciclo, el progreso parcial se pierde y al F5
+      //arranca un ciclo limpio.
 
       const stats = await recolectarCiudades();
       const duracionCiclo = Date.now() - inicioCiclo;

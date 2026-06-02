@@ -240,11 +240,11 @@
               ciudadEjeName: m.ciudadEjeName || null,
             });
           }
+          //Log de intentos: solo en RAM, no persistimos. Al F5 se pierde.
           chrome.storage.local.set({
             [STORAGE_KEY]: {
               cadenciaSeg,
               slots: slotsPlain,
-              log: logIntentos.slice(-LOG_INTENTOS_MAX),
               manuales: manualesPlain,
             },
           });
@@ -261,7 +261,8 @@
           if (typeof blob.cadenciaSeg === "number" && blob.cadenciaSeg >= CADENCIA_MIN_SEG && blob.cadenciaSeg <= CADENCIA_MAX_SEG) {
             cadenciaSeg = blob.cadenciaSeg;
           }
-          if (Array.isArray(blob.log)) logIntentos = blob.log.slice(-LOG_INTENTOS_MAX);
+          //blob.log existía en versiones anteriores; ahora el log no se
+          //persiste — siempre arranca vacío al rehidratar.
           if (Array.isArray(blob.manuales)) {
             //Rehidratar manuales antes que los slots — así cuando el slot
             //se rehidrata, su commandId ya está en commandsVivos vía el set

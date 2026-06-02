@@ -74,7 +74,11 @@
     const { csrfToken, world_id, townId, player_id } = game;
 
     const STORAGE_KEY_ACK = `jambotAtaquesEntrantesAck_${world_id}`;
-    const STORAGE_KEY_HISTORIAL = `jambotAtaquesEntrantesHistorial_${world_id}`;
+    const STORAGE_KEY_HABILITADA = `jambotAtaquesEntrantesHabilitada_${world_id}`;
+    //Toggle Iniciar/Detener. Por default true: el monitor de ataques arranca
+    //corriendo. El usuario puede detenerlo desde el header del tab Defensa
+    //para que el bot no haga polls cuando no quiere.
+    let habilitada = true;
 
     //ackIds: set de command ids que el usuario ya silenció. Sobrevive a
     //reload. Se purga in-flight cuando el id desaparece del listado del
@@ -100,12 +104,12 @@
       try {
         const obj = await new Promise((resolve) => {
           chrome.storage.local.get(
-            [STORAGE_KEY_ACK, STORAGE_KEY_HISTORIAL],
+            [STORAGE_KEY_ACK, STORAGE_KEY_HABILITADA],
             (o) => resolve(o || {})
           );
         });
         if (Array.isArray(obj[STORAGE_KEY_ACK])) ackIds = new Set(obj[STORAGE_KEY_ACK]);
-        if (Array.isArray(obj[STORAGE_KEY_HISTORIAL])) historial = obj[STORAGE_KEY_HISTORIAL];
+        if (typeof obj[STORAGE_KEY_HABILITADA] === "boolean") habilitada = obj[STORAGE_KEY_HABILITADA];
       } catch (_) { /* sin storage */ }
     }
 
@@ -118,13 +122,27 @@
       }, 500);
     }
 
-    let saveHistTimer = null;
-    function persistirHistorial() {
-      if (saveHistTimer) return;
-      saveHistTimer = setTimeout(() => {
-        saveHistTimer = null;
-        try { chrome.storage.local.set({ [STORAGE_KEY_HISTORIAL]: historial }); } catch (_) {}
-      }, 1000);
+    //Historial: NO se persiste. Vive en RAM por la sesión actual.
+    function persistirHistorial() { /* no-op */ }
+
+    function persistirHabilitada() {
+      try { chrome.storage.local.set({ [STORAGE_KEY_HABILITADA]: habilitada }); } catch (_) {}
+    }
+
+    function setHabilitada(b) {
+      const v = !!b;
+      if (habilitada === v) return;
+      habilitada = v;
+      persistirHabilitada();
+      core.log(
+        "ataquesEntrantes",
+        habilitada ? "INICIADO desde el panel" : "DETENIDO desde el panel",
+        habilitada ? "ok" : "warn"
+      );
+      //Si se reanuda, disparar un ciclo inmediato para feedback rápido.
+      if (habilitada) {
+        ciclo().catch((e) => core.logError("ataquesEntrantes", "ciclo (post-iniciar) falló", e));
+      }
     }
 
     await cargarStorage();
@@ -305,6 +323,7 @@
     async function ciclo() {
       if (!core.isExtensionContextValid()) return;
       if (core.isCaptchaActive()) return;
+      if (!habilitada) return; //toggle Iniciar/Detener
       if (cicloEnCurso) return;
       cicloEnCurso = true;
       try {
@@ -407,8 +426,9 @@
       const wrap = document.createElement("div");
       const noAck = ataquesActuales.filter((a) => !ackIds.has(a.id));
       const totalAtaques = ataquesActuales.length;
-      const corriendo = !core.isCaptchaActive();
+      const corriendo = habilitada && !core.isCaptchaActive();
       const borderColor =
+        !habilitada ? "#7a8aa0" :
         alarmaActiva ? "#e74c3c" :
         noAck.length > 0 ? "#f39c12" :
         corriendo ? "#27ae60" : "#7a8aa0";
@@ -422,17 +442,33 @@
       titulo.textContent = "Monitor de ataques entrantes";
       titulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
       const sub = document.createElement("div");
-      sub.textContent = alarmaActiva
-        ? `🚨 ALARMA ACTIVA — ${noAck.length} ataque(s) sin revisar`
-        : !corriendo
-          ? "En espera — CAPTCHA activo"
-          : totalAtaques === 0
-            ? `Activo · revisa cada ${POLL_INTERVAL_MS / 1000}s · sin ataques entrantes`
-            : `Activo · ${totalAtaques} ataque(s) entrante(s) — todo silenciado`;
+      sub.textContent = !habilitada
+        ? "Detenido — apretá Iniciar para reanudar los polls"
+        : alarmaActiva
+          ? `🚨 ALARMA ACTIVA — ${noAck.length} ataque(s) sin revisar`
+          : !corriendo
+            ? "En espera — CAPTCHA activo"
+            : totalAtaques === 0
+              ? `Activo · revisa cada ${POLL_INTERVAL_MS / 1000}s · sin ataques entrantes`
+              : `Activo · ${totalAtaques} ataque(s) entrante(s) — todo silenciado`;
       sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
       left.appendChild(titulo);
       left.appendChild(sub);
       wrap.appendChild(left);
+
+      //Botón Iniciar/Detener.
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = habilitada ? "⏸ Detener" : "▶ Iniciar";
+      btn.style.cssText =
+        "padding:6px 12px;border:0;border-radius:3px;cursor:pointer;" +
+        "font-size:11.5px;font-weight:bold;flex-shrink:0;" +
+        (habilitada
+          ? "background:#3498db;color:#fff"
+          : "background:#27ae60;color:#fff");
+      btn.addEventListener("click", () => setHabilitada(!habilitada));
+      wrap.appendChild(btn);
+
       return wrap;
     }
 

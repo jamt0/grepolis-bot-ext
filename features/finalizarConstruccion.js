@@ -92,13 +92,15 @@
       finalizadas: [],
     };
 
-    //Restaurar persistencia
+    //Restaurar persistencia. Solo persiste el último ciclo (resumen mínimo).
+    //La lista de `finalizadas` vive en RAM por la sesión actual — no
+    //persistimos el historial para mantener el storage liviano.
     await new Promise((resolve) => {
       try {
         chrome.storage.local.get(STORAGE_KEY_CONSTR, (obj) => {
           const blob = (obj && obj[STORAGE_KEY_CONSTR]) || {};
           data.construccion.ultimoCiclo = blob.ultimoCiclo || null;
-          data.construccion.finalizadas = Array.isArray(blob.finalizadas) ? blob.finalizadas : [];
+          data.construccion.finalizadas = [];
           resolve();
         });
       } catch (_) { resolve(); }
@@ -109,7 +111,6 @@
         chrome.storage.local.set({
           [STORAGE_KEY_CONSTR]: {
             ultimoCiclo: data.construccion.ultimoCiclo,
-            finalizadas: data.construccion.finalizadas,
           },
         });
       } catch (e) {
