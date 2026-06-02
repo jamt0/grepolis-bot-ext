@@ -42,6 +42,26 @@
     const STORAGE_KEY_LAST_CLAIM = `jambotLastClaimAt_${world_id}`;
     let lastClaimAtPorAldea = {};
 
+    //—— Modo de recolección ———————————————————————————————————————————————
+    //
+    //Dos modos exclusivos:
+    //  "capitan" (default): 1 POST claim_loads_multiple con TODAS las
+    //                       ciudades en `towns: [...]`. Reclama todas las
+    //                       aldeas de un saque. Requiere Capitán Premium
+    //                       activo en la cuenta. Próximo tick fijo: 5 min
+    //                       exactos desde la respuesta (todas las aldeas
+    //                       comparten el mismo `lootable_at`).
+    //  "aldea":             flujo original aldea-por-aldea (1 claim por
+    //                       aldea, 6 × N requests por ciclo). No requiere
+    //                       Capitán. Cooldown auto-detectado por ciudad.
+    //
+    //Si Capitán falla (HTTP error, server error, response sin
+    //FarmTownPlayerRelation cuando había aldeas elegibles), el ciclo cae
+    //automáticamente a modo aldea — para no quedarse sin farmeo si el
+    //Capitán expira o el endpoint cambia.
+    const STORAGE_KEY_MODO = `jambotRecoleccionModo_${world_id}`;
+    let modoRecoleccion = "capitan";
+
     //—— Historial por aldea + ciclos completos ——————————————————————————
     //
     //HISTORIAL_MAX = 36 últimos intentos por aldea (FIFO). 36 = ~6 horas a
@@ -186,6 +206,26 @@
         chrome.storage.local.set({ jambotConfig: resto });
       }
     });
+
+    //—— Storage del modo de recolección ——————————————————————————————————
+
+    //Cargamos fire-and-forget: si la lectura se demora, el modo arranca con
+    //el default "capitan" y se corrige al instante que el storage responde.
+    //No bloqueamos el init.
+    try {
+      chrome.storage.local.get(STORAGE_KEY_MODO, (obj) => {
+        const v = obj && obj[STORAGE_KEY_MODO];
+        if (v === "capitan" || v === "aldea") modoRecoleccion = v;
+      });
+    } catch (_) { /* sin storage en page-context */ }
+
+    function setModoRecoleccion(nuevo) {
+      if (nuevo !== "capitan" && nuevo !== "aldea") return;
+      if (modoRecoleccion === nuevo) return;
+      modoRecoleccion = nuevo;
+      try { chrome.storage.local.set({ [STORAGE_KEY_MODO]: nuevo }); } catch (_) {}
+      core.log("recoleccion", `modo cambiado a "${nuevo}"`, "ok");
+    }
 
     //—— Storage de lastClaimAt por mundo ————————————————————————————————
 
@@ -1358,12 +1398,65 @@
       //El cooldown por ciudad (Lealtad) vive en el subtab "Por ciudad" del
       //tab Recolección — no se duplica acá.
 
+      //Sección: modo de recolección (Capitán vs aldea)
+      body.appendChild(crearTituloSeccion("Modo de recolección"));
+      body.appendChild(renderSwitchModoRecoleccion());
+
       //Sección: mantenimiento (acciones destructivas)
       body.appendChild(crearTituloSeccion("Mantenimiento"));
       body.appendChild(renderMantenimiento());
 
       //Footer con nombre + versión
       body.appendChild(renderFooterVersion());
+    }
+
+    function renderSwitchModoRecoleccion() {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "display:flex;flex-direction:column;gap:6px;margin-top:6px";
+
+      const desc = document.createElement("div");
+      desc.style.cssText = "color:#7a8aa0;font-size:11px;line-height:1.45;margin-bottom:4px";
+      desc.innerHTML =
+        "<b style=\"color:#cdd5e0\">Capitán</b> reclama todas las aldeas de un saque en 1 sola request — " +
+        "requiere <i>Capitán Premium</i> activo. <b style=\"color:#cdd5e0\">Aldea por aldea</b> hace un " +
+        "claim individual por aldea (6 × N requests, más lento pero no requiere Premium). " +
+        "Si Capitán falla, el ciclo cae automáticamente a modo aldea.";
+      wrap.appendChild(desc);
+
+      const cont = document.createElement("div");
+      cont.style.cssText =
+        "display:flex;gap:6px;padding:4px;background:#172029;border:1px solid #2c3a4d;" +
+        "border-radius:4px";
+
+      const mkOpcion = (valor, label, sub) => {
+        const activo = modoRecoleccion === valor;
+        const b = document.createElement("button");
+        b.type = "button";
+        b.style.cssText =
+          "flex:1;padding:8px 10px;border-radius:3px;border:0;cursor:pointer;" +
+          "text-align:left;transition:background 0.15s;" +
+          `background:${activo ? "#9b59b6" : "transparent"};` +
+          `color:${activo ? "#fff" : "#cdd5e0"};`;
+        if (!activo) {
+          b.addEventListener("mouseenter", () => { b.style.background = "#1c2733"; });
+          b.addEventListener("mouseleave", () => { b.style.background = "transparent"; });
+        }
+        b.innerHTML =
+          `<div style="font-weight:bold;font-size:12px">${escapeHtml(label)}</div>` +
+          `<div style="font-size:10.5px;opacity:${activo ? "0.85" : "0.65"};margin-top:1px">${escapeHtml(sub)}</div>`;
+        b.addEventListener("click", () => {
+          if (modoRecoleccion === valor) return;
+          setModoRecoleccion(valor);
+          renderTabActivo(document.querySelector("#panelConfigJam .pcj-body"));
+        });
+        return b;
+      };
+
+      cont.appendChild(mkOpcion("capitan", "Capitán", "1 request global · próximo tick en 5 min"));
+      cont.appendChild(mkOpcion("aldea", "Aldea por aldea", "6 × N requests · sin Premium"));
+      wrap.appendChild(cont);
+
+      return wrap;
     }
 
     function renderMantenimiento() {
@@ -2948,8 +3041,282 @@
       }, margenWatchdogMs);
     }
 
+    //—— Modo Capitán ————————————————————————————————————————————————————
+    //
+    //Reclama todas las aldeas de todas las ciudades en 1 sola request POST
+    //a `farm_town_overviews?action=claim_loads_multiple`. El payload manda
+    //`towns: [id1, id2, ...]` con todos los `codigoCiudad` del jugador.
+    //
+    //Requiere Capitán Premium activo. Si el server responde con error o
+    //sin notifications de FarmTownPlayerRelation, el caller hace fallback
+    //automático al modo aldea.
+    //
+    //Retorna true si el claim corrió OK (independientemente de cuántas
+    //aldeas se claimearon — pueden ser 0 si todas estaban en cooldown,
+    //pero la respuesta del server fue válida). Retorna false si hubo
+    //algún error que justifica caer a modo aldea.
+    async function recolectarConCapitan() {
+      if (core.isPaused() || core.isCaptchaActive()) return true;
+      if (!ciudadesConAldeas.length) return true;
+
+      const towns = ciudadesConAldeas.map((c) => Number(c.codigoCiudad));
+      //La ciudad "activa" del cliente — el server la usa como contexto.
+      //Usamos la primera arbitrariamente; el server acepta cualquier town
+      //propia.
+      const activa = towns[0];
+      const jsonPayload = JSON.stringify({
+        towns,
+        time_option_base: 300,   //5min = opción "Recoger" rápida
+        time_option_booty: 600,  //10min cuando la ciudad tiene Botín investigado
+        claim_factor: "normal",
+        town_id: activa,
+        nl_init: true,
+      });
+      const url =
+        `https://${world_id}.grepolis.com/game/farm_town_overviews` +
+        `?town_id=${activa}&action=claim_loads_multiple&h=${csrfToken}`;
+      const form = new URLSearchParams();
+      form.append("town_id", String(activa));
+      form.append("action", "claim_loads_multiple");
+      form.append("h", csrfToken);
+      form.append("json", jsonPayload);
+
+      let body;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "text/plain, */*; q=0.01",
+          },
+          body: form,
+        });
+        if (!res.ok) {
+          core.logWarn("recoleccion", `Capitán: HTTP ${res.status}`);
+          return false;
+        }
+        body = await res.json();
+      } catch (e) {
+        core.logWarn("recoleccion", `Capitán: fetch falló: ${e.message}`);
+        return false;
+      }
+
+      const j = body && body.json;
+      if (!j) {
+        core.logWarn("recoleccion", "Capitán: respuesta sin .json");
+        return false;
+      }
+      if (j.error) {
+        core.logWarn("recoleccion", `Capitán: server error: ${j.error}`);
+        return false;
+      }
+
+      const notifs = Array.isArray(j.notifications) ? j.notifications : [];
+
+      //Parsear FarmTownPlayerRelation — son las aldeas efectivamente
+      //claimeadas en esta request. Cada una trae last_looted_at (segundos
+      //Unix) — lo persistimos en lastClaimAtPorAldea (ms) para que el
+      //modo aldea respete el cooldown si caemos a él más tarde.
+      const aldeasClaimeadas = new Set();
+      for (const n of notifs) {
+        if (n.subject !== "FarmTownPlayerRelation") continue;
+        try {
+          const obj = JSON.parse(n.param_str)["FarmTownPlayerRelation"];
+          if (obj && obj.farm_town_id != null) {
+            const fid = Number(obj.farm_town_id);
+            aldeasClaimeadas.add(fid);
+            if (obj.last_looted_at) {
+              lastClaimAtPorAldea[fid] = obj.last_looted_at * 1000;
+            }
+          }
+        } catch (_) { /* notif malformada — ignoramos */ }
+      }
+
+      //Diagnóstico: si el server respondió OK pero no claimeó nada, dump
+      //completo del body para que podamos ver qué pasó. Probable causa:
+      //Capitán Premium expirado/inactivo (el endpoint igual responde 200
+      //pero sin notifications de FarmTownPlayerRelation).
+      if (aldeasClaimeadas.size === 0) {
+        core.logWarn(
+          "recoleccion",
+          `Capitán: response 200 pero 0 aldeas claimeadas — ¿Capitán Premium inactivo? Body:`,
+          body
+        );
+      }
+
+      //Re-dispatch al cliente del juego — sin esto, los modelos Backbone
+      //(Town resources, FarmTownPlayerRelation) quedan desactualizados y
+      //la UI nativa muestra valores viejos hasta el próximo navegar.
+      if (notifs.length) {
+        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+          detail: { notifications: notifs },
+        }));
+      }
+
+      //Recursos post-claim, por ciudad (de las Town notifications).
+      const recursosPost = {};
+      for (const n of notifs) {
+        if (n.subject !== "Town") continue;
+        try {
+          const obj = JSON.parse(n.param_str)["Town"];
+          if (obj && obj.id != null && obj.resources) {
+            recursosPost[obj.id] = obj.resources;
+          }
+        } catch (_) {}
+      }
+
+      //Snapshot prev ANTES de actualizar el cache global. Sin esto, la
+      //ronda siguiente no tendría baseline para calcular el delta.
+      const recursosPrev = {};
+      for (const cid in recursosPost) {
+        recursosPrev[cid] = recursosPrevPorCiudad[cid] || null;
+      }
+
+      //—— Inicializar cicloActual (recién acá, sabemos que el ciclo cerró)
+      const inicioCiclo = Date.now();
+      nCiclo += 1;
+      const ciudadesIniciales = {};
+      for (const c of ciudadesConAldeas) {
+        ciudadesIniciales[c.codigoCiudad] = {
+          nombre: c.nombreCiudad || c.codigoCiudad,
+          claims: 0, esperado: 6,
+          wood: 0, stone: 0, iron: 0,
+          aldeasFalladas: [],
+          limiteDiario: 0, bloqueadas: 0,
+          saltadasCooldown: 0, recursosLlenos: 0,
+        };
+      }
+      cicloActual = {
+        n: nCiclo, inicio: inicioCiclo, fin: null, duracion: null,
+        captchaDurante: false, ciudades: ciudadesIniciales,
+        totalCiudades: ciudadesConAldeas.length, ciudadesCompletadas: 0,
+        totalAldeas: ciudadesConAldeas.length * 6, aldeasCompletadas: 0,
+        ultimoClaimAt: null,
+        modo: "capitan",
+      };
+
+      //—— Distribuir deltas por ciudad entre aldeas claimeadas
+      //Como el modo Capitán no devuelve delta-por-aldea (solo total por
+      //ciudad), repartimos el delta total entre las aldeas que SÍ vinieron
+      //en aldeasClaimeadas, asignando el resto al último para que la suma
+      //por ciudad cierre exactamente.
+      for (const ciudad of ciudadesConAldeas) {
+        const codigoCiudad = ciudad.codigoCiudad;
+        const cc = cicloActual.ciudades[codigoCiudad];
+        const prev = recursosPrev[codigoCiudad];
+        const post = recursosPost[codigoCiudad];
+        let dW = 0, dS = 0, dI = 0;
+        if (prev && post) {
+          dW = (post.wood || 0) - (prev.wood || 0);
+          dS = (post.stone || 0) - (prev.stone || 0);
+          dI = (post.iron || 0) - (prev.iron || 0);
+        }
+
+        const aldeas = ciudad.aldeas || [];
+        const owned = aldeas.filter((a) =>
+          data.relacionPorAldea && data.relacionPorAldea[a.id]
+        );
+        const notOwned = aldeas.filter((a) =>
+          !(data.relacionPorAldea && data.relacionPorAldea[a.id])
+        );
+        const claimeadas = owned.filter((a) => aldeasClaimeadas.has(Number(a.id)));
+        const enCooldown = owned.filter((a) => !aldeasClaimeadas.has(Number(a.id)));
+
+        //Aldeas no-pertenece: descuentan del esperado (no son fallo).
+        if (notOwned.length) {
+          cc.esperado = Math.max(0, cc.esperado - notOwned.length);
+          cc.bloqueadas = notOwned.length;
+          cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - notOwned.length);
+        }
+
+        //Distribuir deltas entre claimeadas (último absorbe el resto).
+        const nClaim = claimeadas.length;
+        const baseW = nClaim ? Math.floor(dW / nClaim) : 0;
+        const baseS = nClaim ? Math.floor(dS / nClaim) : 0;
+        const baseI = nClaim ? Math.floor(dI / nClaim) : 0;
+        for (let i = 0; i < nClaim; i++) {
+          const a = claimeadas[i];
+          const isLast = i === nClaim - 1;
+          const dWi = isLast ? dW - baseW * (nClaim - 1) : baseW;
+          const dSi = isLast ? dS - baseS * (nClaim - 1) : baseS;
+          const dIi = isLast ? dI - baseI * (nClaim - 1) : baseI;
+
+          registrarClaim({
+            aldeaId: a.id, ciudadId: codigoCiudad,
+            ciudadNombre: ciudad.nombreCiudad || codigoCiudad,
+            aldeaNombre: a.name || `farm_${a.id}`,
+            ciclo: nCiclo, status: "ok",
+            dW: dWi, dS: dSi, dI: dIi,
+            totales: post ? { wood: post.wood, stone: post.stone, iron: post.iron } : null,
+          });
+          cc.claims += 1;
+          cc.wood += dWi; cc.stone += dSi; cc.iron += dIi;
+          cicloActual.aldeasCompletadas += 1;
+          cicloActual.ultimoClaimAt = Date.now();
+        }
+
+        //En cooldown: registrar como saltada (no es fallo).
+        for (const a of enCooldown) {
+          registrarClaim({
+            aldeaId: a.id, ciudadId: codigoCiudad,
+            ciudadNombre: ciudad.nombreCiudad || codigoCiudad,
+            aldeaNombre: a.name || `farm_${a.id}`,
+            ciclo: nCiclo, status: "saltada-cooldown",
+          });
+          cc.saltadasCooldown += 1;
+        }
+
+        if (cc.claims + cc.saltadasCooldown >= cc.esperado) {
+          cicloActual.ciudadesCompletadas += 1;
+        }
+
+        //Actualizar baseline para el próximo ciclo.
+        if (post) recursosPrevPorCiudad[codigoCiudad] = { ...post };
+      }
+
+      actualizarIndicadorVivo();
+
+      //Cerrar ciclo + persistir
+      cicloActual.fin = Date.now();
+      cicloActual.duracion = cicloActual.fin - inicioCiclo;
+      ciclos.push(cicloActual);
+      while (ciclos.length > CICLOS_MAX) ciclos.shift();
+      const cicloCerrado = cicloActual;
+      cicloActual = null;
+      guardarHistorial();
+      guardarLastClaimAt();
+
+      core.log(
+        "recoleccion",
+        `Capitán ciclo #${nCiclo} OK · ${aldeasClaimeadas.size} aldea(s) claimeada(s) en ${cicloCerrado.ciudadesCompletadas}/${ciudadesConAldeas.length} ciudades · próximo en 5min`,
+        "ok"
+      );
+
+      //5 min exactos desde ahora — el server reporta lootable_at =
+      //last_looted_at + 300s, así que esta es la próxima ventana real.
+      programarSiguienteTick(5 * 60 * 1000);
+      return true;
+    }
+
     async function recolectarRecursos() {
       if (core.isPaused()) return;
+
+      //Branch por modo. El Capitán cierra el ciclo entero por su cuenta
+      //y programa su propio siguiente tick — si retorna true, salimos.
+      //Si retorna false, caemos al flujo aldea de abajo como fallback.
+      if (modoRecoleccion === "capitan") {
+        let ok = false;
+        try {
+          ok = await recolectarConCapitan();
+        } catch (e) {
+          core.logError("recoleccion", "Capitán explotó", e);
+          ok = false;
+        }
+        if (ok) return;
+        core.logWarn("recoleccion", "Capitán falló — fallback a modo aldea para este ciclo");
+      }
 
       nCiclo += 1;
       const inicioCiclo = Date.now();
