@@ -236,6 +236,76 @@
       });
     }
 
+    //—— Lookup de info de cualquier ciudad (preview del target) ————————
+    //
+    //Endpoint `town_info?action=info` devuelve nombre + nombre del dueño
+    //de cualquier ciudad por id (propia, aliada o enemiga). Cacheamos
+    //los resultados por la sesión para no spamear el server cuando el
+    //usuario reusa el mismo target.
+    //
+    //   townInfoCache: Map<townId, { name, player, pending?:Promise }>
+    //     - Si la entrada tiene `pending`, otra llamada en vuelo está
+    //       resolviendo el mismo id; reusamos esa Promise.
+    //     - Si tiene `name`, el lookup ya terminó (puede ser éxito o
+    //       fallo silencioso — `name=null` significa "no se encontró").
+    const townInfoCache = new Map();
+
+    function queryTownInfo(townId) {
+      const id = Number(townId);
+      if (!id || !Number.isFinite(id)) return Promise.resolve(null);
+      const cached = townInfoCache.get(id);
+      if (cached) {
+        if (cached.pending) return cached.pending;
+        return Promise.resolve(cached);
+      }
+      //Antes de hacer fetch, lookup en data.ciudadesConAldeas (ciudades
+      //propias) — instantáneo, sin red.
+      const propia = (data.ciudadesConAldeas || [])
+        .find((c) => Number(c.codigoCiudad) === id);
+      if (propia) {
+        const entry = { name: propia.nombreCiudad || `#${id}`, player: null, propia: true };
+        townInfoCache.set(id, entry);
+        return Promise.resolve(entry);
+      }
+
+      const url =
+        `https://${world_id}.grepolis.com/game/town_info` +
+        `?town_id=${id}&action=info&h=${csrfToken}` +
+        `&json=${encodeURIComponent(JSON.stringify({ id, nl_init: true }))}` +
+        `&_=${Date.now()}`;
+      const pending = (async () => {
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "text/plain, */*; q=0.01",
+            },
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const body = await res.json();
+          const j = body && body.json;
+          //El payload trae varios campos según el contexto; el más
+          //universal es `town_name` + `player_name` en `data`. Defensivo:
+          //si la respuesta no los trae, dejamos null y la UI muestra "?".
+          const d = (j && j.data) || j || {};
+          const name = d.town_name || d.name || null;
+          const player = d.player_name || (d.player && d.player.name) || null;
+          const entry = { name, player, propia: false };
+          townInfoCache.set(id, entry);
+          return entry;
+        } catch (e) {
+          //No persistimos el fallo (sin cachear null) — así un retry
+          //manual vuelve a intentar después.
+          townInfoCache.delete(id);
+          return null;
+        }
+      })();
+      townInfoCache.set(id, { pending });
+      return pending;
+    }
+
     //—— Scheduler por ciudad ——————————————————————————————————————————
     //
     //Cada ciudad tiene su propio setTimeout independiente. Iniciar arranca
@@ -1041,13 +1111,67 @@
         "outline:none;transition:border-color 0.15s";
       tinp.addEventListener("focus", () => { tinp.style.borderColor = "#3498db"; });
       tinp.addEventListener("blur", () => { tinp.style.borderColor = "#2c3a4d"; });
+
+      //Preview del nombre de la ciudad target (debajo del input). Lookup
+      //primero local (data.ciudadesConAldeas) y si no es propia, fetch
+      //a town_info (cacheado por sesión). Cubre ciudades aliadas y
+      //enemigas — el endpoint funciona sin Admin Premium.
+      const preview = document.createElement("div");
+      preview.style.cssText = "color:#7a8aa0;font-size:10.5px;min-height:14px";
+
+      let previewDebounce = null;
+      function actualizarPreview(rawValue) {
+        const v = String(rawValue || "").replace(/\D/g, "");
+        if (!v) {
+          preview.textContent = "";
+          preview.style.color = "#7a8aa0";
+          return;
+        }
+        const id = Number(v);
+        const cached = townInfoCache.get(id);
+        if (cached && !cached.pending && cached.name) {
+          //Resuelto y con nombre: pintamos directo, sin "buscando…".
+          renderHit(cached);
+          return;
+        }
+        preview.textContent = `→ buscando ciudad #${id}…`;
+        preview.style.color = "#7a8aa0";
+        queryTownInfo(id).then((entry) => {
+          //Si el usuario siguió tipiando y el id ya cambió, ignorar.
+          if (Number((tinp.value || "").replace(/\D/g, "")) !== id) return;
+          if (!entry || !entry.name) {
+            preview.textContent = `→ ciudad #${id} no encontrada`;
+            preview.style.color = "#e74c3c";
+            return;
+          }
+          renderHit(entry);
+        });
+      }
+      function renderHit(entry) {
+        const playerSuf = entry.player ? ` (${entry.player})` : "";
+        const propiaTag = entry.propia ? " · tuya" : "";
+        preview.textContent = `→ ${entry.name}${playerSuf}${propiaTag}`;
+        preview.style.color = entry.propia ? "#f39c12" : "#27ae60";
+      }
+
+      //Lookup en vivo mientras tipea (debounce 300ms para no spamear).
+      tinp.addEventListener("input", () => {
+        if (previewDebounce) clearTimeout(previewDebounce);
+        previewDebounce = setTimeout(() => actualizarPreview(tinp.value), 300);
+      });
       tinp.addEventListener("change", () => {
         const v = tinp.value.replace(/\D/g, "");
         tinp.value = v;
         setConfigCiudad(tid, { targetTownId: v ? Number(v) : null });
+        if (previewDebounce) clearTimeout(previewDebounce);
+        actualizarPreview(v);
       });
+      //Render inicial al abrir la card si ya hay un target persistido.
+      actualizarPreview(tinp.value);
+
       targetWrap.appendChild(tlbl);
       targetWrap.appendChild(tinp);
+      targetWrap.appendChild(preview);
       body.appendChild(targetWrap);
 
       //Tab bar
