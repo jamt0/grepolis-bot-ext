@@ -124,7 +124,9 @@
       try {
         chrome.storage.local.get(STORAGE_KEY, (obj) => {
           const blob = (obj && obj[STORAGE_KEY]) || {};
-          if (typeof blob.habilitada === "boolean") data.ataques.habilitada = blob.habilitada;
+          //blob.habilitada existía como master switch global; lo
+          //ignoramos: ahora cada toggle (rt/sp por ciudad) controla
+          //independientemente su ciclo.
           if (blob.configPorCiudad && typeof blob.configPorCiudad === "object") {
             data.ataques.configPorCiudad = blob.configPorCiudad;
           }
@@ -195,7 +197,6 @@
         try {
           chrome.storage.local.set({
             [STORAGE_KEY]: {
-              habilitada: data.ataques.habilitada,
               configPorCiudad: data.ataques.configPorCiudad,
               ultimoPorCiudad: data.ataques.ultimoPorCiudad,
               historial: data.ataques.historial,
@@ -290,10 +291,10 @@
     }
 
     function debeCorrer(townId, modo) {
-      if (!data.ataques.habilitada) return false;
-      //Ataques tiene su propio botón Iniciar/Detener — NO se acopla al
-      //play/pause global del bot. Solo CAPTCHA detiene los timers (porque
-      //ahí es la integridad del flujo lo que está en juego, no preferencia).
+      //Cada toggle por (ciudad, modo) controla su propio ciclo. No hay
+      //master switch global — el toggle individual es el botón Iniciar/
+      //Pausar de ese ciclo. Solo CAPTCHA detiene todos los timers (porque
+      //ahí es la integridad del flujo lo que está en juego).
       if (core.isCaptchaActive()) return false;
       const cfg = data.ataques.configPorCiudad[townId];
       if (!cfg) return false;
@@ -638,19 +639,6 @@
 
     //—— API expuesta al panel ———————————————————————————————————————————
 
-    function setHabilitada(b) {
-      if (data.ataques.habilitada === !!b) return;
-      data.ataques.habilitada = !!b;
-      persistir();
-      if (b) {
-        core.log("ataques", "INICIADO desde el panel", "ok");
-        if (!core.isCaptchaActive()) arrancarTodas();
-      } else {
-        core.log("ataques", "DETENIDO desde el panel", "warn");
-        cancelarTodos();
-      }
-    }
-
     function setConfigCiudad(townId, cfg) {
       const prev = data.ataques.configPorCiudad[townId] || {};
       data.ataques.configPorCiudad[townId] = { ...prev, ...cfg };
@@ -708,7 +696,6 @@
     //play/pause global. Solo CAPTCHA detiene/reanuda los timers.
 
     core.onCaptcha((active) => {
-      if (!data.ataques.habilitada) return;
       if (active) {
         cancelarTodos();
       } else {
@@ -716,26 +703,24 @@
       }
     });
 
-    //Si arrancamos con habilitada=true (persistido), esperar a que
-    //recoleccion termine de poblar data.ciudadesConAldeas. Esa carga es
-    //async (depende de modelos del juego) y puede tardar más que el await
-    //de feature.init. Hacemos hasta 6 intentos cada 5s; si en 30s no hay
-    //ciudades (mundo recién creado, problema con MM, etc), abortamos y
-    //dejamos que el usuario arranque manualmente.
+    //Boot: esperar a que recoleccion termine de poblar
+    //data.ciudadesConAldeas. Esa carga es async (depende de modelos del
+    //juego) y puede tardar más que el await de feature.init. Hacemos hasta
+    //6 intentos cada 5s; si en 30s no hay ciudades, abortamos. Sin master
+    //switch: cada toggle de ciudad/modo decide individualmente si corre.
     function bootArrancar(intentos) {
-      if (!data.ataques.habilitada) return;
       if (core.isCaptchaActive()) return;
       if (obtenerListaCiudadesPropias().length) {
         arrancarTodas();
         return;
       }
       if (intentos <= 0) {
-        core.logWarn("ataques", "no hay ciudades cargadas tras 30s — apretá Iniciar manualmente cuando estén listas");
+        core.logWarn("ataques", "no hay ciudades cargadas tras 30s");
         return;
       }
       setTimeout(() => bootArrancar(intentos - 1), 5000);
     }
-    if (data.ataques.habilitada && !core.isCaptchaActive()) {
+    if (!core.isCaptchaActive()) {
       setTimeout(() => bootArrancar(6), 4000);
     }
 
@@ -856,7 +841,9 @@
       body.innerHTML = "";
       const dsa = data.ataques;
 
-      body.appendChild(renderHeaderMaster(dsa));
+      //Subtítulo de info global (sin master switch): cuenta slots activos
+      //y deja claro que cada toggle por (ciudad, modo) controla su ciclo.
+      body.appendChild(renderResumenSlots(dsa));
 
       //Lista de ciudades propias — si recoleccion todavía no las cargó,
       //mostrar placeholder.
@@ -899,20 +886,11 @@
       body.appendChild(renderHistorial(dsa));
     }
 
-    function renderHeaderMaster(dsa) {
+    function renderResumenSlots(dsa) {
       const wrap = document.createElement("div");
-      wrap.style.cssText =
-        "display:flex;align-items:center;gap:12px;padding:10px 12px;" +
-        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
-        `border-left:3px solid ${dsa.habilitada ? "#27ae60" : "#7a8aa0"}`;
-
-      const left = document.createElement("div");
-      left.style.cssText = "flex:1;min-width:0";
-      const titulo = document.createElement("div");
-      titulo.textContent = "Loop de ataques";
-      titulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
-      const sub = document.createElement("div");
-      //Contamos slots activos (no ciudades): una ciudad puede tener rt+sp.
+      //Contamos slots activos por modo — uno por toggle prendido en cada
+      //ciudad. Esto es informativo: NO hay master switch, cada toggle
+      //controla independientemente su propio ciclo.
       let slotsRT = 0, slotsSP = 0;
       for (const c of Object.values(dsa.configPorCiudad)) {
         if (!c || !c.targetTownId) continue;
@@ -920,32 +898,29 @@
         if (c.spamEnabled && Array.isArray(c.spamUnitTypes) && c.spamUnitTypes.length > 0
             && c.spamUnitTypes.every(ut => Number(c.spamCounts && c.spamCounts[ut]) > 0)) slotsSP++;
       }
-      //Ataques es independiente del play/pause global — solo CAPTCHA lo
-      //pausa. Por eso el sub-text NO menciona el bot global.
-      const corriendo = dsa.habilitada && !core.isCaptchaActive();
-      sub.textContent = corriendo
-        ? `Activo · ${slotsRT} round-trip · ${slotsSP} spam`
-        : !dsa.habilitada
-          ? "Detenido — apretá Iniciar para arrancar"
-          : "En espera — CAPTCHA activo";
+      const captcha = core.isCaptchaActive();
+      const total = slotsRT + slotsSP;
+      const borderColor = captcha ? "#7a8aa0" : (total > 0 ? "#27ae60" : "#7a8aa0");
+      wrap.style.cssText =
+        "display:flex;align-items:center;gap:12px;padding:10px 12px;" +
+        "background:#172029;border:1px solid #2c3a4d;border-radius:4px;" +
+        `border-left:3px solid ${borderColor}`;
+
+      const left = document.createElement("div");
+      left.style.cssText = "flex:1;min-width:0";
+      const titulo = document.createElement("div");
+      titulo.textContent = "Loops de ataques";
+      titulo.style.cssText = "font-weight:bold;color:#e6e9ee;font-size:12.5px";
+      const sub = document.createElement("div");
+      sub.textContent = captcha
+        ? "En espera — CAPTCHA activo"
+        : total > 0
+          ? `Activo · ${slotsRT} round-trip · ${slotsSP} spam · cada toggle controla su propio ciclo`
+          : "Sin ciclos activos — prendé el toggle de la ciudad/modo que quieras";
       sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
       left.appendChild(titulo);
       left.appendChild(sub);
       wrap.appendChild(left);
-
-      const btn = document.createElement("button");
-      const accion = dsa.habilitada ? "Detener" : "Iniciar";
-      btn.textContent = (dsa.habilitada ? "⏸  " : "▶  ") + accion;
-      const colorBtn = dsa.habilitada ? "#e74c3c" : "#27ae60";
-      btn.style.cssText =
-        `padding:7px 16px;background:${colorBtn};color:#fff;border:none;` +
-        "border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;" +
-        "letter-spacing:0.3px;flex-shrink:0";
-      btn.addEventListener("click", () => {
-        setHabilitada(!dsa.habilitada);
-        renderTab(document.querySelector("#panelConfigJam .pcj-body"));
-      });
-      wrap.appendChild(btn);
       return wrap;
     }
 
@@ -1878,7 +1853,7 @@
       if (proximoAt) {
         const seg = Math.max(0, Math.round((proximoAt - Date.now()) / 1000));
         proximoTxt.textContent = `próx ${core.formatDuracion(seg)}`;
-      } else if (modoON && data.ataques.habilitada) {
+      } else if (modoON && !core.isCaptchaActive()) {
         proximoTxt.style.color = "#f39c12";
         proximoTxt.textContent = "procesando…";
       } else {
@@ -2065,7 +2040,6 @@
     JamBot.features.ataques.api = {
       TIPOS_UNIDAD,
       labelUnidad,
-      setHabilitada,
       setConfigCiudad,
       setSpamCount,
       setMaxCount,
