@@ -238,10 +238,15 @@
 
     //—— Lookup de info de cualquier ciudad (preview del target) ————————
     //
-    //Endpoint `town_info?action=info` devuelve nombre + nombre del dueño
-    //de cualquier ciudad por id (propia, aliada o enemiga). Cacheamos
-    //los resultados por la sesión para no spamear el server cuando el
-    //usuario reusa el mismo target.
+    //Resolvemos un id de ciudad → {name, player} en este orden:
+    //  1. Cache de sesión.
+    //  2. data.ciudadesConAldeas (ciudades propias) — instantáneo.
+    //  3. MM Town[id] via bridge — cubre ciudades ya cargadas por el cliente
+    //     (clicks en el mapa, ataques recibidos, comercio, etc.).
+    //  4. HTTP fetch a `town_info?action=info`. La respuesta de este
+    //     endpoint trae el dato principalmente vía `notifications` (Town
+    //     y Player). Dispatchamos las notifs al MM y re-leemos.
+    //  5. Como último recurso, parseamos varios shapes del body crudo.
     //
     //   townInfoCache: Map<townId, { name, player, pending?:Promise }>
     //     - Si la entrada tiene `pending`, otra llamada en vuelo está
@@ -249,6 +254,73 @@
     //     - Si tiene `name`, el lookup ya terminó (puede ser éxito o
     //       fallo silencioso — `name=null` significa "no se encontró").
     const townInfoCache = new Map();
+
+    //Bridge → MM.getModels().Town[id]. Resuelve con {name, playerName, ...}
+    //o null si MM no responde dentro del timeout.
+    function queryTownNameFromMM(townId) {
+      return new Promise((resolve) => {
+        let resuelto = false;
+        function onMsg(e) {
+          if (e.source !== window) return;
+          const m = e.data;
+          if (!m || m.type !== "JamBot:townNameResult") return;
+          if (String(m.townId) !== String(townId)) return;
+          if (resuelto) return;
+          resuelto = true;
+          window.removeEventListener("message", onMsg);
+          resolve(m);
+        }
+        window.addEventListener("message", onMsg);
+        window.dispatchEvent(new CustomEvent("JamBot:queryTownName", {
+          detail: { townId },
+        }));
+        setTimeout(() => {
+          if (resuelto) return;
+          resuelto = true;
+          window.removeEventListener("message", onMsg);
+          resolve(null);
+        }, 1200);
+      });
+    }
+
+    //Bridge → búsqueda por substring en MM Towns. Devuelve hasta `limit`
+    //matches, ordenados por relevancia (substring al inicio del nombre va
+    //primero) y luego alfabético.
+    function searchTownsByName(query, limit) {
+      return new Promise((resolve) => {
+        const q = String(query || "").toLowerCase().trim();
+        if (!q) { resolve([]); return; }
+        let resuelto = false;
+        function onMsg(e) {
+          if (e.source !== window) return;
+          const m = e.data;
+          if (!m || m.type !== "JamBot:searchTownsResult") return;
+          if (String(m.query) !== q) return;
+          if (resuelto) return;
+          resuelto = true;
+          window.removeEventListener("message", onMsg);
+          const list = Array.isArray(m.towns) ? m.towns.slice() : [];
+          //Ordenamos: matches que arrancan con el query van primero.
+          list.sort((a, b) => {
+            const aStarts = a.name.toLowerCase().startsWith(q) ? 0 : 1;
+            const bStarts = b.name.toLowerCase().startsWith(q) ? 0 : 1;
+            if (aStarts !== bStarts) return aStarts - bStarts;
+            return a.name.localeCompare(b.name, undefined, { numeric: true });
+          });
+          resolve(list);
+        }
+        window.addEventListener("message", onMsg);
+        window.dispatchEvent(new CustomEvent("JamBot:searchTowns", {
+          detail: { query: q, limit: limit || 8 },
+        }));
+        setTimeout(() => {
+          if (resuelto) return;
+          resuelto = true;
+          window.removeEventListener("message", onMsg);
+          resolve([]);
+        }, 1200);
+      });
+    }
 
     function queryTownInfo(townId) {
       const id = Number(townId);
@@ -258,8 +330,7 @@
         if (cached.pending) return cached.pending;
         return Promise.resolve(cached);
       }
-      //Antes de hacer fetch, lookup en data.ciudadesConAldeas (ciudades
-      //propias) — instantáneo, sin red.
+      //Lookup en ciudades propias — instantáneo, sin red.
       const propia = (data.ciudadesConAldeas || [])
         .find((c) => Number(c.codigoCiudad) === id);
       if (propia) {
@@ -268,13 +339,32 @@
         return Promise.resolve(entry);
       }
 
-      const url =
-        `https://${world_id}.grepolis.com/game/town_info` +
-        `?town_id=${id}&action=info&h=${csrfToken}` +
-        `&json=${encodeURIComponent(JSON.stringify({ id, nl_init: true }))}` +
-        `&_=${Date.now()}`;
       const pending = (async () => {
         try {
+          //Paso A: ¿está ya cargada en MM? (la sesión del cliente puede
+          //haberla traído por cualquier acción previa).
+          let mm = await queryTownNameFromMM(id);
+          if (mm && mm.name) {
+            const entry = { name: mm.name, player: mm.playerName || null, propia: false };
+            townInfoCache.set(id, entry);
+            return entry;
+          }
+
+          //Paso B: fetch al server. Importante: usamos la ciudad PROPIA
+          //como `town_id` de contexto (mismo patrón que el resto del
+          //codebase para `town_info`); el target va en el body como `id`.
+          //Antes acá iba `town_id=${id}` (target) y el server respondía
+          //sin los campos esperados → "no encontrada".
+          const ownTown =
+            game.townId ||
+            (data.ciudadesConAldeas && data.ciudadesConAldeas[0] && data.ciudadesConAldeas[0].codigoCiudad) ||
+            id;
+          const json = JSON.stringify({ id, town_id: ownTown, nl_init: true });
+          const url =
+            `https://${world_id}.grepolis.com/game/town_info` +
+            `?town_id=${ownTown}&action=info&h=${csrfToken}` +
+            `&json=${encodeURIComponent(json)}` +
+            `&_=${Date.now()}`;
           const res = await fetch(url, {
             method: "GET",
             credentials: "include",
@@ -285,20 +375,51 @@
           });
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const body = await res.json();
-          const j = body && body.json;
-          //El payload trae varios campos según el contexto; el más
-          //universal es `town_name` + `player_name` en `data`. Defensivo:
-          //si la respuesta no los trae, dejamos null y la UI muestra "?".
-          const d = (j && j.data) || j || {};
-          const name = d.town_name || d.name || null;
-          const player = d.player_name || (d.player && d.player.name) || null;
-          const entry = { name, player, propia: false };
-          townInfoCache.set(id, entry);
-          return entry;
-        } catch (e) {
-          //No persistimos el fallo (sin cachear null) — así un retry
-          //manual vuelve a intentar después.
+
+          //Dispatch de notifications: acá viene típicamente el modelo Town
+          //(y a veces Player). El bridge las inyecta en MM y la próxima
+          //lectura desde MM ya las ve.
+          const notifs = body && body.json && body.json.notifications;
+          if (Array.isArray(notifs) && notifs.length) {
+            window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+              detail: { notifications: notifs },
+            }));
+          }
+
+          //Paso C: re-lectura desde MM tras el dispatch.
+          mm = await queryTownNameFromMM(id);
+          if (mm && mm.name) {
+            const entry = { name: mm.name, player: mm.playerName || null, propia: false };
+            townInfoCache.set(id, entry);
+            return entry;
+          }
+
+          //Paso D: último recurso — parseo directo del body. Probamos
+          //varios paths conocidos del shape del endpoint.
+          const j = (body && body.json) || {};
+          const candidates = [j.data, j.town, j, j.json && j.json.data, j.json];
+          let name = null, player = null;
+          for (const d of candidates) {
+            if (!d || typeof d !== "object") continue;
+            name = name || d.town_name || d.name || (d.town && d.town.name) || null;
+            player = player || d.player_name || (d.player && d.player.name) || null;
+            if (name) break;
+          }
+          if (name) {
+            const entry = { name, player, propia: false };
+            townInfoCache.set(id, entry);
+            return entry;
+          }
+
+          core.logWarn(
+            "ataques",
+            `town_info?action=info(#${id}) sin nombre — json keys=[${Object.keys(j).join(",")}]`
+          );
           townInfoCache.delete(id);
+          return null;
+        } catch (e) {
+          townInfoCache.delete(id);
+          core.logWarn("ataques", `queryTownInfo(#${id}) falló: ${e.message}`);
           return null;
         }
       })();
@@ -1102,8 +1223,11 @@
         `<span style="color:#5a6776;font-size:10px">(usado por Round-trip y Spam)</span>`;
       const tinp = document.createElement("input");
       tinp.type = "text";
-      tinp.inputMode = "numeric";
-      tinp.placeholder = "ej: 95";
+      //Acepta dígitos O letras: si tipea letras, mostramos abajo una lista
+      //de matches (Towns ya cargadas en MM) para hacer click; si tipea
+      //dígitos, va directo al lookup por ID.
+      tinp.placeholder = "ID o nombre (ej: 4338 o Esparta)";
+      tinp.autocomplete = "off";
       tinp.value = cfg.targetTownId == null ? "" : String(cfg.targetTownId);
       tinp.style.cssText =
         "padding:7px 10px;background:#0f1620;color:#e6e9ee;" +
@@ -1113,13 +1237,63 @@
       tinp.addEventListener("blur", () => { tinp.style.borderColor = "#2c3a4d"; });
 
       //Preview del nombre de la ciudad target (debajo del input). Lookup
-      //primero local (data.ciudadesConAldeas) y si no es propia, fetch
-      //a town_info (cacheado por sesión). Cubre ciudades aliadas y
-      //enemigas — el endpoint funciona sin Admin Premium.
+      //primero en data.ciudadesConAldeas (propias) → MM (cualquier Town ya
+      //conocida por el cliente) → fetch HTTP a town_info?action=info.
       const preview = document.createElement("div");
       preview.style.cssText = "color:#7a8aa0;font-size:10.5px;min-height:14px";
 
+      //Lista de matches por nombre (solo aparece cuando el usuario tipea
+      //letras). Cada item es clickable y rellena el input con el ID.
+      const matchesBox = document.createElement("div");
+      matchesBox.style.cssText =
+        "display:none;flex-direction:column;gap:2px;margin-top:4px;" +
+        "max-height:160px;overflow-y:auto;" +
+        "background:#0a0f17;border:1px solid #2c3a4d;border-radius:3px;padding:4px";
+
+      function limpiarMatches() {
+        matchesBox.innerHTML = "";
+        matchesBox.style.display = "none";
+      }
+
+      function renderMatches(matches, query) {
+        matchesBox.innerHTML = "";
+        if (!matches.length) {
+          const empty = document.createElement("div");
+          empty.style.cssText = "color:#7a8aa0;font-size:10.5px;padding:4px 6px;font-style:italic";
+          empty.textContent =
+            `sin matches para "${query}" — solo se busca entre ciudades ya vistas en el mapa`;
+          matchesBox.appendChild(empty);
+          matchesBox.style.display = "flex";
+          return;
+        }
+        for (const m of matches) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.style.cssText =
+            "text-align:left;padding:5px 8px;border:0;border-radius:2px;cursor:pointer;" +
+            "background:transparent;color:#cdd5e0;font-size:11px;font-family:monospace;" +
+            "transition:background 0.1s";
+          btn.addEventListener("mouseenter", () => { btn.style.background = "#1a2332"; });
+          btn.addEventListener("mouseleave", () => { btn.style.background = "transparent"; });
+          const playerSuf = m.playerName ? ` <span style="color:#7a8aa0">· ${escapeHtml(m.playerName)}</span>` : "";
+          btn.innerHTML =
+            `<span style="color:#e6e9ee">${escapeHtml(m.name)}</span> ` +
+            `<span style="color:#5a6776">#${m.id}</span>${playerSuf}`;
+          btn.addEventListener("click", () => {
+            tinp.value = String(m.id);
+            setConfigCiudad(tid, { targetTownId: m.id });
+            limpiarMatches();
+            actualizarPreview(String(m.id));
+            tinp.focus();
+          });
+          matchesBox.appendChild(btn);
+        }
+        matchesBox.style.display = "flex";
+      }
+
       let previewDebounce = null;
+      let searchDebounce = null;
+
       function actualizarPreview(rawValue) {
         const v = String(rawValue || "").replace(/\D/g, "");
         if (!v) {
@@ -1154,12 +1328,67 @@
         preview.style.color = entry.propia ? "#f39c12" : "#27ae60";
       }
 
-      //Lookup en vivo mientras tipea (debounce 300ms para no spamear).
+      function tieneLetras(s) { return /[^\d\s]/.test(String(s || "")); }
+
+      //Búsqueda en MM por nombre (debounce 250ms). Mezcla resultados de
+      //MM con ciudades propias para que match en "Jam" devuelva las del
+      //jugador también.
+      function buscarPorNombre(query) {
+        const q = String(query || "").trim();
+        if (!q) { limpiarMatches(); return; }
+        searchTownsByName(q, 8).then((mmList) => {
+          if (tinp.value.trim() !== q) return; //el usuario siguió tipiando
+          const propias = (data.ciudadesConAldeas || [])
+            .filter((c) => (c.nombreCiudad || "").toLowerCase().indexOf(q.toLowerCase()) !== -1)
+            .map((c) => ({
+              id: Number(c.codigoCiudad),
+              name: c.nombreCiudad || `#${c.codigoCiudad}`,
+              playerName: "tuya",
+              playerId: null,
+            }));
+          //Dedup por id (MM puede tener una entrada para la propia).
+          const seen = new Set();
+          const merged = [];
+          for (const x of [...propias, ...mmList]) {
+            if (seen.has(x.id)) continue;
+            seen.add(x.id);
+            merged.push(x);
+            if (merged.length >= 8) break;
+          }
+          renderMatches(merged, q);
+        });
+      }
+
+      //Lookup en vivo mientras tipea (debounce 250-300ms para no spamear).
       tinp.addEventListener("input", () => {
-        if (previewDebounce) clearTimeout(previewDebounce);
-        previewDebounce = setTimeout(() => actualizarPreview(tinp.value), 300);
+        const raw = tinp.value;
+        if (tieneLetras(raw)) {
+          //Modo búsqueda por nombre.
+          preview.textContent = "";
+          if (previewDebounce) clearTimeout(previewDebounce);
+          if (searchDebounce) clearTimeout(searchDebounce);
+          searchDebounce = setTimeout(() => buscarPorNombre(raw), 250);
+        } else {
+          //Modo lookup por ID.
+          limpiarMatches();
+          if (searchDebounce) clearTimeout(searchDebounce);
+          if (previewDebounce) clearTimeout(previewDebounce);
+          previewDebounce = setTimeout(() => actualizarPreview(raw), 300);
+        }
       });
       tinp.addEventListener("change", () => {
+        //Solo persistimos cuando el valor son dígitos puros. Si quedaron
+        //letras sin click de match, revertimos al último ID guardado para
+        //no romper el target. Leemos el valor fresco del store (no `cfg`
+        //local) porque un click previo en un match pudo haberlo cambiado.
+        if (tieneLetras(tinp.value)) {
+          const cur = data.ataques.configPorCiudad[tid] || {};
+          tinp.value = cur.targetTownId == null ? "" : String(cur.targetTownId);
+          limpiarMatches();
+          if (previewDebounce) clearTimeout(previewDebounce);
+          actualizarPreview(tinp.value);
+          return;
+        }
         const v = tinp.value.replace(/\D/g, "");
         tinp.value = v;
         setConfigCiudad(tid, { targetTownId: v ? Number(v) : null });
@@ -1172,6 +1401,7 @@
       targetWrap.appendChild(tlbl);
       targetWrap.appendChild(tinp);
       targetWrap.appendChild(preview);
+      targetWrap.appendChild(matchesBox);
       body.appendChild(targetWrap);
 
       //Tab bar
