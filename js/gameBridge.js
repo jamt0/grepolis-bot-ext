@@ -165,6 +165,88 @@
   });
 
   /**
+   * Lookup de nombre + dueño de una ciudad arbitraria via MM. Cubre cualquier
+   * Town cargada en MM — propia, aliada, enemiga: lo que importa es que
+   * exista una entrada en `MM.getModels().Town[id]`. Se popula sola cuando
+   * el cliente recibe `notifications` con un Town nuevo (clicks en el mapa,
+   * island_info, town_info, etc.) o cuando lo forzamos con un refetch.
+   *
+   * Si la Town no está cargada todavía, devolvemos {name:null}. El content
+   * script en ese caso dispara un fetch HTTP, deja que el bridge inyecte
+   * las notifs en MM, y vuelve a pedir.
+   */
+  window.addEventListener("JamBot:queryTownName", function (e) {
+    const townId = e && e.detail && e.detail.townId;
+    let name = null;
+    let playerName = null;
+    let playerId = null;
+    let islandId = null;
+    try {
+      if (window.MM && typeof window.MM.getModels === "function") {
+        const towns = window.MM.getModels().Town;
+        const town = towns && (towns[townId] || towns[String(townId)]);
+        const a = town && town.attributes;
+        if (a) {
+          name = a.name || null;
+          playerId = a.player_id != null ? Number(a.player_id) : null;
+          islandId = a.island_id != null ? Number(a.island_id) : null;
+          //El Town a veces trae player_name embebido; si no, lo resolvemos
+          //via el modelo Player paralelo.
+          if (a.player_name) playerName = a.player_name;
+          if (!playerName && playerId != null) {
+            const players = window.MM.getModels().Player;
+            const p = players && (players[playerId] || players[String(playerId)]);
+            if (p && p.attributes && p.attributes.name) playerName = p.attributes.name;
+          }
+        }
+      }
+    } catch (_) { /* defensivo */ }
+    window.postMessage(
+      { type: "JamBot:townNameResult", townId, name, playerName, playerId, islandId },
+      "*"
+    );
+  });
+
+  /**
+   * Búsqueda por substring en los nombres de Towns cargados en MM. Devuelve
+   * hasta `limit` matches. Solo cubre lo que MM ya conoce — no llega al
+   * server. Útil como ayuda al usuario cuando recuerda el nombre pero no
+   * el ID (la lista crece a medida que abre ciudades en el mapa, recibe
+   * ataques, etc.).
+   */
+  window.addEventListener("JamBot:searchTowns", function (e) {
+    const raw = (e && e.detail && e.detail.query) || "";
+    const q = String(raw).toLowerCase().trim();
+    const limit = (e && e.detail && Number(e.detail.limit)) || 8;
+    const out = [];
+    try {
+      if (q && window.MM && typeof window.MM.getModels === "function") {
+        const towns = window.MM.getModels().Town || {};
+        const players = window.MM.getModels().Player || {};
+        for (const id of Object.keys(towns)) {
+          const a = towns[id] && towns[id].attributes;
+          if (!a || !a.name) continue;
+          if (a.name.toLowerCase().indexOf(q) === -1) continue;
+          const pid = a.player_id;
+          let playerName = a.player_name || null;
+          if (!playerName && pid != null) {
+            const p = players[pid] || players[String(pid)];
+            if (p && p.attributes && p.attributes.name) playerName = p.attributes.name;
+          }
+          out.push({
+            id: Number(a.id || id),
+            name: a.name,
+            playerName,
+            playerId: pid != null ? Number(pid) : null,
+          });
+          if (out.length >= limit) break;
+        }
+      }
+    } catch (_) { /* defensivo */ }
+    window.postMessage({ type: "JamBot:searchTownsResult", query: q, towns: out }, "*");
+  });
+
+  /**
    * Devuelve la lista de comercios (modelo `Trade`) cargados en MM, filtrados
    * por jugador. Útil para que la feature `comercio` muestre los envíos en
    * vuelo y calcule cuándo vuelven los comerciantes. El response del POST
