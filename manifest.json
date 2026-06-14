@@ -3,7 +3,7 @@
     "description": "A grepolis bot",
     "version": "3.7",
     "manifest_version": 3,
-    "permissions": ["storage", "activeTab", "contextMenus", "tabs", "scripting"],
+    "permissions": ["storage", "activeTab", "contextMenus", "tabs", "scripting", "notifications", "alarms"],
     "host_permissions": ["*://*.grepolis.com/*"],
     "background": {
         "service_worker": "background.js"
@@ -41,7 +41,7 @@
     },
     "web_accessible_resources": [
         {
-          "resources": [ "data.json", "/js/saveToken.js", "/js/gameBridge.js" ],
+          "resources": [ "data.json", "/js/saveToken.js", "/js/gameBridge.js", "icon-alerta.png" ],
           "matches": ["*://*.grepolis.com/*"]
         }
     ]
