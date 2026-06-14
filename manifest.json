@@ -24,6 +24,7 @@
             "js": [
                 "core.js",
                 "features/recoleccion.js",
+                "features/recoleccionUnidades.js",
                 "features/finalizarConstruccion.js",
                 "features/ataques.js",
                 "features/ataquesEntrantes.js",
