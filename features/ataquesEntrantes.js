@@ -227,6 +227,23 @@
         on = !on;
         document.title = on ? "🚨 ATAQUE — JamBot" : tituloOriginal;
       }, 800);
+
+      // Notificación del sistema operativo vía service worker. El SO toca
+      // su propio sonido (no depende del AudioContext del content script,
+      // que el browser suspende en background). Garantía 100% de aviso
+      // aunque la pestaña esté minimizada o el browser detrás de otras apps.
+      try {
+        const lineaResumen = nuevos
+          .slice(0, 4)
+          .map((a) => `${LABEL_TIPO[a.type] || a.type} ← ${a.originPlayerName || "?"}`)
+          .join("\n");
+        const extra = nuevos.length > 4 ? `\n…y ${nuevos.length - 4} más` : "";
+        chrome.runtime.sendMessage({
+          type: "JamBot:notifyAttack",
+          title: `🚨 ${nuevos.length} ataque(s) entrante(s) — Grepolis`,
+          message: `${lineaResumen}${extra}`,
+        });
+      } catch (_) { /* sin SW (dev), no fatal */ }
     }
 
     function actualizarBoton() {
@@ -273,6 +290,8 @@
         try { audioCtx.close(); } catch (_) {}
         audioCtx = null;
       }
+      // Limpiar las notifs del OS que el SW pueda haber dejado vivas.
+      try { chrome.runtime.sendMessage({ type: "JamBot:clearAttackNotifs" }); } catch (_) {}
     }
 
     //—— Request ————————————————————————————————————————————————————————
@@ -638,9 +657,24 @@
     }, POLL_INTERVAL_MS);
     ciclo().catch((e) => core.logError("ataquesEntrantes", "ciclo inicial falló", e));
 
+    // Escuchar pings del service worker. El SW corre `chrome.alarms` cada
+    // 30s que no se throttlea aunque la pestaña esté en background — sin
+    // esto, el setInterval de arriba lo capa Chrome a ~1/min cuando la
+    // pestaña pierde foco. Throttle adicional acá: si ya polleamos hace
+    // <5s no volvemos a pegarle al server (el SW puede dispararse cerca
+    // del setInterval del content script).
+    let ultimoCicloPorPing = 0;
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.type !== "JamBot:pollAtaques") return;
+      const ahora = Date.now();
+      if (ahora - ultimoCicloPorPing < 5000) return;
+      ultimoCicloPorPing = ahora;
+      ciclo().catch((e) => core.logError("ataquesEntrantes", "ciclo (ping SW) falló", e));
+    });
+
     core.log(
       "ataquesEntrantes",
-      `iniciado (poll cada ${POLL_INTERVAL_MS / 1000}s, alarma persistente)`,
+      `iniciado (poll cada ${POLL_INTERVAL_MS / 1000}s + ping SW background, alarma persistente)`,
       "ok"
     );
 

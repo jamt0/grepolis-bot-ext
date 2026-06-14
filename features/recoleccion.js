@@ -474,6 +474,150 @@
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
+    //—— Estado de saturación cross-feature (cap diario) ——————————————————
+    //
+    //Set de ciudades que tocaron cap diario en algún ciclo de hoy (TZ Madrid).
+    //El cap no se resetea hasta medianoche, así que una vez saturada queda
+    //saturada todo el día — el set es monotónico. Lo usan recoleccionUnidades
+    //(scan al prender el toggle Auto) y `emitirEventosCiudadesSaturadas`
+    //(emite evento solo en la transición no-saturada → saturada).
+    //
+    //recoleccionUnidades hace su propio dedup de "ya procesé esta hoy", así
+    //que si su toggle estaba apagado cuando emitimos, el evento se pierde y
+    //es el scan-on-enable el que la recupera.
+    //
+    //Solo modo aldea: el Capitán hace 1 POST batch y no popula `limiteDiario`
+    //por ciudad, así que no podríamos detectarlo desde acá.
+    const ciudadesSaturadasHoy = new Set();
+    let diaMadridActual = null;
+    function diaActualMadrid() {
+      try {
+        return new Intl.DateTimeFormat("en-CA", {
+          timeZone: "Europe/Madrid",
+          year: "numeric", month: "2-digit", day: "2-digit",
+        }).format(new Date());
+      } catch (_) {
+        return new Date().toISOString().slice(0, 10);
+      }
+    }
+    function emitirEventosCiudadesSaturadas(ciclo) {
+      if (!ciclo || !ciclo.ciudades) return;
+      const hoy = diaActualMadrid();
+      if (hoy !== diaMadridActual) {
+        diaMadridActual = hoy;
+        ciudadesSaturadasHoy.clear();
+      }
+      for (const [codigoCiudad, cc] of Object.entries(ciclo.ciudades)) {
+        if (ciudadesSaturadasHoy.has(codigoCiudad)) continue;
+        // Ciudad saturada = al menos una aldea reportó cap diario y ninguna
+        // entregó recursos. Ciudades con claims > 0 todavía tienen aldeas
+        // dando recursos, no las consideramos saturadas hasta el próximo
+        // ciclo donde claims caiga a 0.
+        const saturada = (cc.limiteDiario || 0) > 0 && (cc.claims || 0) === 0;
+        if (!saturada) continue;
+        ciudadesSaturadasHoy.add(codigoCiudad);
+        const codigoNum = Number(codigoCiudad);
+        window.dispatchEvent(new CustomEvent("JamBot:ciudadLimiteDiario", {
+          detail: {
+            codigoCiudad: Number.isFinite(codigoNum) ? codigoNum : codigoCiudad,
+            nombreCiudad: cc.nombre,
+            ts: Date.now(),
+          },
+        }));
+        core.log(
+          "recoleccion",
+          `ciudad ${cc.nombre} pegó cap diario — evento emitido para recoleccionUnidades`
+        );
+      }
+    }
+    // Detección de saturación via `lootable_at` — funciona para modo Capitán
+    // donde el batch POST no popula `limiteDiario`. Cuando una aldea pega cap
+    // diario, el server empuja su lootable_at a medianoche Madrid (varias
+    // horas vs los 5-10min de cooldown normal). Si 6/6 aldeas de una ciudad
+    // están sobre el threshold, está saturada.
+    //
+    // Costo: 1 GET extra por ciclo de recolección (refetch de
+    // FarmTownPlayerRelations). Vale la pena: es la única forma de detectar
+    // cap en Capitán y unifica el detector entre modos.
+    const SAT_LOOTABLE_THRESHOLD_SEG = 60 * 60; // 1h > cualquier cooldown normal
+    async function detectarSaturacionViaLootableAt(origenLog) {
+      let relInfo;
+      try {
+        relInfo = await obtenerMapaRelaciones();
+      } catch (e) {
+        core.logWarn("recoleccion", `saturación/${origenLog}: refetch falló (${(e && e.message) || e})`);
+        return;
+      }
+      const lootableAtPorAldea = (relInfo && relInfo.lootableAtPorAldea) || {};
+      const ahoraSeg = Math.floor(Date.now() / 1000);
+
+      const hoy = diaActualMadrid();
+      if (hoy !== diaMadridActual) {
+        diaMadridActual = hoy;
+        ciudadesSaturadasHoy.clear();
+      }
+
+      let nuevas = 0;
+      for (const ciudad of (data.ciudadesConAldeas || [])) {
+        const codigoCiudad = String(ciudad.codigoCiudad);
+        if (ciudadesSaturadasHoy.has(codigoCiudad)) continue;
+        const aldeas = Array.isArray(ciudad.aldeas) ? ciudad.aldeas : [];
+        if (!aldeas.length) continue;
+        let saturadas = 0;
+        for (const aldea of aldeas) {
+          const lootableAt = lootableAtPorAldea[aldea.id];
+          if (lootableAt && lootableAt - ahoraSeg > SAT_LOOTABLE_THRESHOLD_SEG) {
+            saturadas += 1;
+          }
+        }
+        if (saturadas === aldeas.length) {
+          ciudadesSaturadasHoy.add(codigoCiudad);
+          nuevas += 1;
+          const codigoNum = Number(codigoCiudad);
+          const nombreCiudad = ciudad.nombreCiudad || `ciudad ${codigoCiudad}`;
+          window.dispatchEvent(new CustomEvent("JamBot:ciudadLimiteDiario", {
+            detail: {
+              codigoCiudad: Number.isFinite(codigoNum) ? codigoNum : codigoCiudad,
+              nombreCiudad,
+              ts: Date.now(),
+            },
+          }));
+          core.log(
+            "recoleccion",
+            `saturación/${origenLog}: ${nombreCiudad} cap diario detectado vía lootable_at — evento emitido`,
+            "ok"
+          );
+        }
+      }
+      if (nuevas === 0) {
+        core.log("recoleccion", `saturación/${origenLog}: 0 ciudad(es) nuevas (total saturadas hoy: ${ciudadesSaturadasHoy.size})`);
+      }
+    }
+
+    // Snapshot del estado de saturación de hoy. Devuelve `{ codigoCiudad, nombreCiudad }`
+    // para cada ciudad ya tocada por el cap, para que recoleccionUnidades
+    // pueda enganchar sin tener que parsear `ciclos`. El nombre lo sacamos
+    // del último ciclo si está disponible.
+    function obtenerCiudadesSaturadasHoy() {
+      const hoy = diaActualMadrid();
+      if (hoy !== diaMadridActual) {
+        // Rollover diferido: si el día cambió y todavía no corrió ningún ciclo
+        // hoy, el set quedó stale. Lo limpiamos acá para no devolver basura.
+        diaMadridActual = hoy;
+        ciudadesSaturadasHoy.clear();
+        return [];
+      }
+      const ultimoCiclo = ciclos.length ? ciclos[ciclos.length - 1] : null;
+      const nombresPorCodigo = (ultimoCiclo && ultimoCiclo.ciudades) || {};
+      return Array.from(ciudadesSaturadasHoy).map((codigoCiudad) => {
+        const codigoNum = Number(codigoCiudad);
+        return {
+          codigoCiudad: Number.isFinite(codigoNum) ? codigoNum : codigoCiudad,
+          nombreCiudad: (nombresPorCodigo[codigoCiudad] && nombresPorCodigo[codigoCiudad].nombre) || String(codigoCiudad),
+        };
+      });
+    }
+
     //—— UI ——————————————————————————————————————————————————————————————
     //
     //Una sola "card" arriba de los islotes inferiores: ícono slime + "Jam"
@@ -643,7 +787,7 @@
     //Se cancela al cerrar el panel para no gastar CPU.
 
     const STORAGE_KEY_TAB = "jambotTabActivo";
-    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "construccion", "ataques", "defensa", "mercadoOro"];
+    const TABS_VALIDOS = ["dashboard", "settings", "recoleccion", "unidades", "construccion", "ataques", "defensa", "mercadoOro"];
     let tabActivo = window.localStorage.getItem(STORAGE_KEY_TAB) || "dashboard";
     if (!TABS_VALIDOS.includes(tabActivo)) tabActivo = "dashboard";
 
@@ -819,6 +963,7 @@
         renderConScroll(body, () => {
           if (tabActivo === "dashboard") renderTabDashboard(body);
           else if (tabActivo === "recoleccion") renderTabRecoleccion(body);
+          else if (tabActivo === "unidades") renderTabUnidadesDelegado(body);
           else if (tabActivo === "construccion") renderTabConstruccion(body);
           else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
           else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
@@ -884,6 +1029,7 @@
       tabs.appendChild(crearBotonTab("dashboard", "Dashboard"));
       tabs.appendChild(crearBotonTab("settings", "Settings"));
       tabs.appendChild(crearBotonTab("recoleccion", "Recolección"));
+      tabs.appendChild(crearBotonTab("unidades", "Unidades"));
       tabs.appendChild(crearBotonTab("construccion", "Construcción"));
       tabs.appendChild(crearBotonTab("mercadoOro", "Oro"));
       tabs.appendChild(crearBotonTab("comercio", "Comercio"));
@@ -949,6 +1095,7 @@
       body.innerHTML = "";
       if (tabActivo === "dashboard") renderTabDashboard(body);
       else if (tabActivo === "settings") renderTabSettings(body);
+      else if (tabActivo === "unidades") renderTabUnidadesDelegado(body);
       else if (tabActivo === "construccion") renderTabConstruccion(body);
       else if (tabActivo === "ataques") renderTabAtaquesDelegado(body);
       else if (tabActivo === "defensa") renderTabAtaquesEntrantesDelegado(body);
@@ -1024,6 +1171,19 @@
         body.innerHTML = "";
         const v = document.createElement("div");
         v.textContent = "La feature de hechizos todavía no está cargada.";
+        v.style.cssText = "opacity:0.7;padding:8px 0";
+        body.appendChild(v);
+        return;
+      }
+      api.renderTab(body);
+    }
+
+    function renderTabUnidadesDelegado(body) {
+      const api = JamBot.features.recoleccionUnidades && JamBot.features.recoleccionUnidades.api;
+      if (!api || typeof api.renderTab !== "function") {
+        body.innerHTML = "";
+        const v = document.createElement("div");
+        v.textContent = "La feature de recolección de unidades todavía no está cargada.";
         v.style.cssText = "opacity:0.7;padding:8px 0";
         body.appendChild(v);
         return;
@@ -2977,12 +3137,12 @@
           if (msg.townId != townId) return;
           window.removeEventListener("message", handler);
           clearTimeout(timeoutId);
-          resolve(msg.resources || null);
+          resolve({ resources: msg.resources || null, storage: msg.storage || null });
         };
         window.addEventListener("message", handler);
         const timeoutId = setTimeout(() => {
           window.removeEventListener("message", handler);
-          resolve(null);
+          resolve({ resources: null, storage: null });
         }, 1000);
         window.dispatchEvent(
           new CustomEvent("JamBot:queryTownResources", { detail: { townId } })
@@ -3044,112 +3204,185 @@
       if (core.isPaused() || core.isCaptchaActive()) return true;
       if (!ciudadesConAldeas.length) return true;
 
-      const towns = ciudadesConAldeas.map((c) => Number(c.codigoCiudad));
-      //La ciudad "activa" del cliente — el server la usa como contexto.
-      //Usamos la primera arbitrariamente; el server acepta cualquier town
-      //propia.
-      const activa = towns[0];
-      const jsonPayload = JSON.stringify({
-        towns,
-        time_option_base: 300,   //5min = opción "Recoger" rápida
-        time_option_booty: 600,  //10min cuando la ciudad tiene Botín investigado
-        claim_factor: "normal",
-        town_id: activa,
-        nl_init: true,
-      });
-      const url =
-        `https://${world_id}.grepolis.com/game/farm_town_overviews` +
-        `?town_id=${activa}&action=claim_loads_multiple&h=${csrfToken}`;
-      const form = new URLSearchParams();
-      form.append("town_id", String(activa));
-      form.append("action", "claim_loads_multiple");
-      form.append("h", csrfToken);
-      form.append("json", jsonPayload);
-
-      let body;
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept": "text/plain, */*; q=0.01",
-          },
-          body: form,
-        });
-        if (!res.ok) {
-          core.logWarn("recoleccion", `Capitán: HTTP ${res.status}`);
-          return false;
+      //Pre-detección de almacén lleno: refrescamos recursos + cap de cada
+      //ciudad desde MM. El server claimea cualquier town del payload aunque
+      //esté en cap (gasta el cooldown diario sin entregar nada), así que el
+      //gating tiene que ser en cliente: excluimos esas towns del array antes
+      //de armar el POST. Esto también deja `recursosPrevPorCiudad` con un
+      //baseline fresco para el cálculo de deltas más abajo.
+      const ciudadesLlenas = new Set();
+      let ciudadesSinDataPreCheck = 0;
+      for (const c of ciudadesConAldeas) {
+        const fresco = await queryTownResources(c.codigoCiudad);
+        if (fresco) {
+          if (fresco.resources) recursosPrevPorCiudad[c.codigoCiudad] = fresco.resources;
+          if (fresco.storage) storageCapPorCiudad[c.codigoCiudad] = fresco.storage;
         }
-        body = await res.json();
-      } catch (e) {
-        core.logWarn("recoleccion", `Capitán: fetch falló: ${e.message}`);
-        return false;
-      }
-
-      const j = body && body.json;
-      if (!j) {
-        core.logWarn("recoleccion", "Capitán: respuesta sin .json");
-        return false;
-      }
-      if (j.error) {
-        core.logWarn("recoleccion", `Capitán: server error: ${j.error}`);
-        return false;
-      }
-
-      const notifs = Array.isArray(j.notifications) ? j.notifications : [];
-
-      //Parsear FarmTownPlayerRelation — son las aldeas efectivamente
-      //claimeadas en esta request. Cada una trae last_looted_at (segundos
-      //Unix) — lo persistimos en lastClaimAtPorAldea (ms) para que el
-      //modo aldea respete el cooldown si caemos a él más tarde.
-      const aldeasClaimeadas = new Set();
-      for (const n of notifs) {
-        if (n.subject !== "FarmTownPlayerRelation") continue;
-        try {
-          const obj = JSON.parse(n.param_str)["FarmTownPlayerRelation"];
-          if (obj && obj.farm_town_id != null) {
-            const fid = Number(obj.farm_town_id);
-            aldeasClaimeadas.add(fid);
-            if (obj.last_looted_at) {
-              lastClaimAtPorAldea[fid] = obj.last_looted_at * 1000;
-            }
+        const cap = storageCapPorCiudad[c.codigoCiudad];
+        const r = recursosPrevPorCiudad[c.codigoCiudad];
+        if (!(cap > 0) || !r) {
+          // queryTownResources timeout o nunca cacheamos antes. Sin data no
+          // podemos decidir — loguear para que el usuario sepa que esa
+          // ciudad va a entrar al POST igual (riesgo de gastar cooldown si
+          // estaba llena).
+          ciudadesSinDataPreCheck += 1;
+          core.log(
+            "recoleccion",
+            `Capitán pre-check ${c.nombreCiudad || c.codigoCiudad}: sin datos (cap=${cap || 0}, recursos=${r ? "sí" : "no"}) — entra al POST por defecto`
+          );
+          continue;
+        }
+        const llena = r.wood >= cap && r.stone >= cap && r.iron >= cap;
+        const wRatio = `${r.wood}/${cap}`;
+        const sRatio = `${r.stone}/${cap}`;
+        const iRatio = `${r.iron}/${cap}`;
+        if (llena) {
+          ciudadesLlenas.add(Number(c.codigoCiudad));
+          core.log(
+            "recoleccion",
+            `Capitán pre-check ${c.nombreCiudad || c.codigoCiudad}: LLENA (w ${wRatio}, s ${sRatio}, i ${iRatio}) — skip`,
+            "warn"
+          );
+        } else {
+          // Log compacto solo si alguno está cerca del cap (>= 90%) — sino
+          // sería ruido por ciclo.
+          const algunoAlto = r.wood >= cap * 0.9 || r.stone >= cap * 0.9 || r.iron >= cap * 0.9;
+          if (algunoAlto) {
+            core.log(
+              "recoleccion",
+              `Capitán pre-check ${c.nombreCiudad || c.codigoCiudad}: parcial (w ${wRatio}, s ${sRatio}, i ${iRatio}) — entra al POST`
+            );
           }
-        } catch (_) { /* notif malformada — ignoramos */ }
+        }
       }
-
-      //Diagnóstico: si el server respondió OK pero no claimeó nada, dump
-      //completo del body para que podamos ver qué pasó. Probable causa:
-      //Capitán Premium expirado/inactivo (el endpoint igual responde 200
-      //pero sin notifications de FarmTownPlayerRelation).
-      if (aldeasClaimeadas.size === 0) {
+      if (ciudadesSinDataPreCheck > 0) {
         core.logWarn(
           "recoleccion",
-          `Capitán: response 200 pero 0 aldeas claimeadas — ¿Capitán Premium inactivo? Body:`,
-          body
+          `Capitán pre-check: ${ciudadesSinDataPreCheck} ciudad(es) sin data — pueden gastar cooldown si estaban llenas (revisar bridge queryTownResources)`
         );
       }
 
-      //Re-dispatch al cliente del juego — sin esto, los modelos Backbone
-      //(Town resources, FarmTownPlayerRelation) quedan desactualizados y
-      //la UI nativa muestra valores viejos hasta el próximo navegar.
-      if (notifs.length) {
-        window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
-          detail: { notifications: notifs },
-        }));
-      }
+      const townsAReclamar = ciudadesConAldeas
+        .map((c) => Number(c.codigoCiudad))
+        .filter((id) => !ciudadesLlenas.has(id));
 
-      //Recursos post-claim, por ciudad (de las Town notifications).
+      const aldeasClaimeadas = new Set();
       const recursosPost = {};
-      for (const n of notifs) {
-        if (n.subject !== "Town") continue;
+
+      if (townsAReclamar.length === 0) {
+        //Todas las ciudades en cap — no mandamos request. Cerramos el ciclo
+        //"vacío" con las 6 aldeas de cada ciudad marcadas como recursos-llenos
+        //(el loop de abajo se encarga via `ciudadesLlenas`).
+        core.log(
+          "recoleccion",
+          `Capitán: ${ciudadesLlenas.size} ciudad(es) con almacén lleno — skip POST`,
+          "ok"
+        );
+      } else {
+        //La ciudad "activa" del cliente — el server la usa como contexto.
+        //Usamos la primera del payload filtrado; el server acepta cualquier
+        //town propia.
+        const activa = townsAReclamar[0];
+        const jsonPayload = JSON.stringify({
+          towns: townsAReclamar,
+          time_option_base: 300,   //5min = opción "Recoger" rápida
+          time_option_booty: 600,  //10min cuando la ciudad tiene Botín investigado
+          claim_factor: "normal",
+          town_id: activa,
+          nl_init: true,
+        });
+        const url =
+          `https://${world_id}.grepolis.com/game/farm_town_overviews` +
+          `?town_id=${activa}&action=claim_loads_multiple&h=${csrfToken}`;
+        const form = new URLSearchParams();
+        form.append("town_id", String(activa));
+        form.append("action", "claim_loads_multiple");
+        form.append("h", csrfToken);
+        form.append("json", jsonPayload);
+
+        let body;
         try {
-          const obj = JSON.parse(n.param_str)["Town"];
-          if (obj && obj.id != null && obj.resources) {
-            recursosPost[obj.id] = obj.resources;
+          const res = await fetch(url, {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "Accept": "text/plain, */*; q=0.01",
+            },
+            body: form,
+          });
+          if (!res.ok) {
+            core.logWarn("recoleccion", `Capitán: HTTP ${res.status}`);
+            return false;
           }
-        } catch (_) {}
+          body = await res.json();
+        } catch (e) {
+          core.logWarn("recoleccion", `Capitán: fetch falló: ${e.message}`);
+          return false;
+        }
+
+        const j = body && body.json;
+        if (!j) {
+          core.logWarn("recoleccion", "Capitán: respuesta sin .json");
+          return false;
+        }
+        if (j.error) {
+          core.logWarn("recoleccion", `Capitán: server error: ${j.error}`);
+          return false;
+        }
+
+        const notifs = Array.isArray(j.notifications) ? j.notifications : [];
+
+        //Parsear FarmTownPlayerRelation — son las aldeas efectivamente
+        //claimeadas en esta request. Cada una trae last_looted_at (segundos
+        //Unix) — lo persistimos en lastClaimAtPorAldea (ms) para que el
+        //modo aldea respete el cooldown si caemos a él más tarde.
+        for (const n of notifs) {
+          if (n.subject !== "FarmTownPlayerRelation") continue;
+          try {
+            const obj = JSON.parse(n.param_str)["FarmTownPlayerRelation"];
+            if (obj && obj.farm_town_id != null) {
+              const fid = Number(obj.farm_town_id);
+              aldeasClaimeadas.add(fid);
+              if (obj.last_looted_at) {
+                lastClaimAtPorAldea[fid] = obj.last_looted_at * 1000;
+              }
+            }
+          } catch (_) { /* notif malformada — ignoramos */ }
+        }
+
+        //Diagnóstico: si el server respondió OK pero no claimeó nada, dump
+        //completo del body para que podamos ver qué pasó. Probable causa:
+        //Capitán Premium expirado/inactivo (el endpoint igual responde 200
+        //pero sin notifications de FarmTownPlayerRelation).
+        if (aldeasClaimeadas.size === 0) {
+          core.logWarn(
+            "recoleccion",
+            `Capitán: response 200 pero 0 aldeas claimeadas — ¿Capitán Premium inactivo? Body:`,
+            body
+          );
+        }
+
+        //Re-dispatch al cliente del juego — sin esto, los modelos Backbone
+        //(Town resources, FarmTownPlayerRelation) quedan desactualizados y
+        //la UI nativa muestra valores viejos hasta el próximo navegar.
+        if (notifs.length) {
+          window.dispatchEvent(new CustomEvent("JamBot:dispatchNotifications", {
+            detail: { notifications: notifs },
+          }));
+        }
+
+        //Recursos post-claim, por ciudad (de las Town notifications).
+        for (const n of notifs) {
+          if (n.subject !== "Town") continue;
+          try {
+            const obj = JSON.parse(n.param_str)["Town"];
+            if (obj && obj.id != null && obj.resources) {
+              recursosPost[obj.id] = obj.resources;
+            }
+          } catch (_) {}
+        }
       }
 
       //Snapshot prev ANTES de actualizar el cache global. Sin esto, la
@@ -3192,6 +3425,7 @@
         const cc = cicloActual.ciudades[codigoCiudad];
         const prev = recursosPrev[codigoCiudad];
         const post = recursosPost[codigoCiudad];
+        const esLlena = ciudadesLlenas.has(Number(codigoCiudad));
         let dW = 0, dS = 0, dI = 0;
         if (prev && post) {
           dW = (post.wood || 0) - (prev.wood || 0);
@@ -3206,8 +3440,6 @@
         const notOwned = aldeas.filter((a) =>
           !(data.relacionPorAldea && data.relacionPorAldea[a.id])
         );
-        const claimeadas = owned.filter((a) => aldeasClaimeadas.has(Number(a.id)));
-        const enCooldown = owned.filter((a) => !aldeasClaimeadas.has(Number(a.id)));
 
         //Aldeas no-pertenece: descuentan del esperado (no son fallo).
         if (notOwned.length) {
@@ -3215,6 +3447,31 @@
           cc.bloqueadas = notOwned.length;
           cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - notOwned.length);
         }
+
+        if (esLlena) {
+          //Ciudad excluida del POST por almacén lleno: las owned se registran
+          //como recursos-llenos, descontadas del esperado para no marcar la
+          //tanda como incompleta. Mismo tratamiento que bloqueadas/limiteDiario.
+          for (const a of owned) {
+            registrarClaim({
+              aldeaId: a.id, ciudadId: codigoCiudad,
+              ciudadNombre: ciudad.nombreCiudad || codigoCiudad,
+              aldeaNombre: a.name || `farm_${a.id}`,
+              ciclo: nCiclo, status: "recursos-llenos",
+              errorMsg: "ciudad con almacén lleno",
+            });
+            cc.recursosLlenos += 1;
+            cc.esperado = Math.max(0, cc.esperado - 1);
+            cicloActual.totalAldeas = Math.max(0, cicloActual.totalAldeas - 1);
+          }
+          if (cc.claims + cc.saltadasCooldown >= cc.esperado) {
+            cicloActual.ciudadesCompletadas += 1;
+          }
+          continue;
+        }
+
+        const claimeadas = owned.filter((a) => aldeasClaimeadas.has(Number(a.id)));
+        const enCooldown = owned.filter((a) => !aldeasClaimeadas.has(Number(a.id)));
 
         //Distribuir deltas entre claimeadas (último absorbe el resto).
         const nClaim = claimeadas.length;
@@ -3273,11 +3530,20 @@
       guardarHistorial();
       guardarLastClaimAt();
 
+      const sufijoLlenas = ciudadesLlenas.size
+        ? ` · ${ciudadesLlenas.size} ciudad(es) con almacén lleno (skip)`
+        : "";
       core.log(
         "recoleccion",
-        `Capitán ciclo #${nCiclo} OK · ${aldeasClaimeadas.size} aldea(s) claimeada(s) en ${cicloCerrado.ciudadesCompletadas}/${ciudadesConAldeas.length} ciudades · próximo en 5min`,
+        `Capitán ciclo #${nCiclo} OK · ${aldeasClaimeadas.size} aldea(s) claimeada(s) en ${cicloCerrado.ciudadesCompletadas}/${ciudadesConAldeas.length} ciudades${sufijoLlenas} · próximo en 5min`,
         "ok"
       );
+
+      // Detección de saturación via lootable_at — Capitán no popula
+      // limiteDiario per-ciudad porque el POST es batch, así que necesitamos
+      // esta pasada para que el evento JamBot:ciudadLimiteDiario llegue a
+      // recoleccionUnidades.
+      detectarSaturacionViaLootableAt("capitan-ciclo");
 
       //5 min exactos desde ahora — el server reporta lootable_at =
       //last_looted_at + 300s, así que esta es la próxima ventana real.
@@ -3377,9 +3643,15 @@
         cicloActual.captchaDurante = core.isCaptchaActive();
         ciclos.push(cicloActual);
         while (ciclos.length > CICLOS_MAX) ciclos.shift();
+        emitirEventosCiudadesSaturadas(cicloActual);
         cicloActual = null;
         await guardarHistorialAsync();
         actualizarIndicadorVivo();
+        // Backstop por lootable_at: cubre el caso "ciclo no posteó las
+        // aldeas saturadas porque ya tenían lootable_at lejos" → limiteDiario
+        // queda en 0 → emitirEventos no las detecta. Es 1 GET extra pero
+        // hace que el detector sea robusto y uniforme con Capitán.
+        detectarSaturacionViaLootableAt("aldea-ciclo");
       }
 
       //Si el usuario pausó durante el ciclo, no programamos el siguiente.
@@ -3511,9 +3783,25 @@
       //Refresca el baseline del diff con el estado actual del Town en MM.
       //Sin esto, el primer claim del ciclo arrastra los 5 minutos transcurridos
       //(producción + acciones del jugador) y el diff sale absurdo.
+      //
+      //Además pre-marcamos ciudades con almacén lleno: el modo aldea dispara
+      //las 6 aldeas en fire-and-forget con ~500ms entre fires, así que la
+      //detección reactiva (en la response del primer claim) llega tarde — las
+      //otras 5 ya están in-flight y gastan cooldown contra recursos perdidos.
+      //Acá tenemos `storage` cap fresco + recursos actuales: si los 3 están
+      //al tope, marcamos la ciudad antes del Pass 2 y el gate de la línea
+      //~3774 skipea las 6 aldeas registrándolas como recursos-llenos.
       for (const c of ciudadesConAldeas) {
         const fresco = await queryTownResources(c.codigoCiudad);
-        if (fresco) recursosPrevPorCiudad[c.codigoCiudad] = fresco;
+        if (fresco) {
+          if (fresco.resources) recursosPrevPorCiudad[c.codigoCiudad] = fresco.resources;
+          if (fresco.storage) storageCapPorCiudad[c.codigoCiudad] = fresco.storage;
+        }
+        const cap = storageCapPorCiudad[c.codigoCiudad];
+        const r = recursosPrevPorCiudad[c.codigoCiudad];
+        if (cap > 0 && r && r.wood >= cap && r.stone >= cap && r.iron >= cap) {
+          c.recursosLlenos = true;
+        }
       }
 
       const acumuladoCiclo = {};
@@ -4511,14 +4799,22 @@
 
       const relacionPorAldea = {};
       const cooldownSegPorAldea = {};
+      // lootable_at crudo (epoch seg server) por aldea. Lo usa la detección
+      // de "cap diario pegado" — cuando una aldea agota su cap, el server
+      // empuja su lootable_at a medianoche Madrid (varias horas en el
+      // futuro vs los 5-10min de un cooldown normal). Es la única señal
+      // confiable de cap en modo Capitán, donde el batch POST no devuelve
+      // info per-aldea.
+      const lootableAtPorAldea = {};
       for (const item of items) {
         const rel = item.d || item;
         if (!rel || rel.farm_town_id == null || rel.id == null) continue;
         relacionPorAldea[rel.farm_town_id] = rel.id;
         const cooldown = (rel.lootable_at || 0) - (rel.last_looted_at || 0);
         if (cooldown > 0) cooldownSegPorAldea[rel.farm_town_id] = cooldown;
+        if (rel.lootable_at) lootableAtPorAldea[rel.farm_town_id] = rel.lootable_at;
       }
-      return { relacionPorAldea, cooldownSegPorAldea };
+      return { relacionPorAldea, cooldownSegPorAldea, lootableAtPorAldea };
     }
 
     async function obtenerCiudadesConAldeas() {
@@ -4607,6 +4903,13 @@
         );
       }
     }
+
+    // Cross-feature API. Por ahora solo lo consume recoleccionUnidades para
+    // saber qué ciudades ya están saturadas cuando el usuario prende su
+    // toggle "Auto" después de que el evento ya pasó.
+    JamBot.features.recoleccion = JamBot.features.recoleccion || {};
+    JamBot.features.recoleccion.api = JamBot.features.recoleccion.api || {};
+    JamBot.features.recoleccion.api.ciudadesSaturadasHoy = obtenerCiudadesSaturadasHoy;
   }
 
   JamBot.features.recoleccion = { init };
