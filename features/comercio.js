@@ -47,6 +47,36 @@
   //Jitter del scheduler: ±15% del intervalo para romper patrón exacto.
   const JITTER_FRAC = 0.15;
 
+  //—— Modos de cálculo del payload ————————————————————————————————————
+  //
+  //  "objetivo"     — el usuario fija "cuánto quiero tener en el destino"
+  //                   por recurso (default = cap del almacén). El bot calcula
+  //                   faltante = objetivo - recursos_destino - trades_en_vuelo
+  //                   y reparte la capacidad del mercado del origen entre los
+  //                   recursos PROPORCIONAL al faltante. No usa pesos.
+  //  "proporcional" — modo legacy: pesos por recurso (0-100) deciden cómo
+  //                   se reparte la capacidad del mercado del origen.
+  //                   Mantenido para backwards-compat de grupos existentes.
+  //
+  //Decisión: grupos NUEVOS arrancan en "objetivo" porque es el caso de uso
+  //común (mantener una ciudad llena para que recolección no se desperdicie).
+  //Grupos viejos cargados del storage mantienen su modo si ya lo tenían;
+  //si no tienen el campo (versión previa), `normalizarGrupo` les pone
+  //"proporcional" para preservar exactamente su comportamiento anterior.
+  const MODO_DEFAULT_NUEVO = "objetivo";
+  const MODOS_VALIDOS = ["objetivo", "proporcional"];
+
+  //Saturación del ORIGEN: una fuente cuenta como "saturada" si al menos
+  //SATURACION_MIN_RECURSOS de los 3 recursos están al ≥ SATURACION_PCT del
+  //cap del almacén del origen. Las saturadas se priorizan en modo objetivo
+  //porque mandando lo que ya iba a perderse (cap top-toca → recolección se
+  //desperdicia en esa ciudad), liberamos espacio que la recolección va a
+  //rellenar gratis. Umbrales: 95% (no 100%) captura "casi-llena" donde ya
+  //hay desperdicio; 2 de 3 (no 3 de 3) porque madera siempre satura
+  //primero — esperar a las 3 al tope hace que la heurística nunca dispare.
+  const SATURACION_PCT = 0.95;
+  const SATURACION_MIN_RECURSOS = 2;
+
   function escapeHtml(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -121,6 +151,113 @@
     return enviar;
   }
 
+  /**
+   * Reparte `capacidad` (capacidad libre del mercado origen) entre los 3
+   * recursos PROPORCIONAL al faltante de cada recurso en el destino. Usado
+   * por modo "objetivo".
+   *
+   *   topePorRecurso[r] = max(0, min(stock_origen[r] - reserva_origen[r],
+   *                                  objetivo_dest[r] - resources_dest[r] - incoming[r]))
+   *
+   * Decisión: reparto proporcional al faltante (no por orden fijo ni
+   * equitativo). Razón: si destino necesita 10k madera y 5k piedra y la
+   * capacidad del origen es 6k, queremos mandar 4k madera + 2k piedra
+   * (proporcional 10:5). Esto evita quedar "casi llena" en el recurso que
+   * más falta mientras los otros ya están al objetivo.
+   *
+   * Función pura. Devuelve {wood, stone, iron} enteros con suma ≤ capacidad.
+   */
+  function calcularPayloadObjetivo(capacidad, topePorRecurso) {
+    const enviar = { wood: 0, stone: 0, iron: 0 };
+    if (!Number.isFinite(capacidad) || capacidad <= 0) return enviar;
+    let capRestante = Math.floor(capacidad);
+    const candidatos = RECURSOS.filter((r) => (topePorRecurso[r] || 0) > 0);
+    if (!candidatos.length) return enviar;
+    //Bucle: reparte proporcional al faltante restante, saca los que
+    //tope-toquen y repite. Cap 6 iters por seguridad (converge en ≤ 3).
+    for (let iter = 0; iter < 6 && capRestante > 0; iter++) {
+      const faltantes = {};
+      let sumaFaltante = 0;
+      for (const r of candidatos) {
+        const m = (topePorRecurso[r] || 0) - enviar[r];
+        faltantes[r] = m > 0 ? m : 0;
+        sumaFaltante += faltantes[r];
+      }
+      if (sumaFaltante <= 0) break;
+      let asignado = 0;
+      for (const r of candidatos) {
+        if (faltantes[r] <= 0) continue;
+        const obj = Math.floor(capRestante * faltantes[r] / sumaFaltante);
+        const agrega = Math.min(obj, faltantes[r]);
+        if (agrega > 0) {
+          enviar[r] += agrega;
+          asignado += agrega;
+        }
+      }
+      capRestante -= asignado;
+      if (asignado === 0) break;
+    }
+    //Pulido por redondeo: si sobra capacidad y queda alguien con margen,
+    //llenar en orden de mayor faltante restante.
+    if (capRestante > 0) {
+      const ord = candidatos.slice().sort((a, b) =>
+        ((topePorRecurso[b] || 0) - enviar[b]) -
+        ((topePorRecurso[a] || 0) - enviar[a])
+      );
+      for (const r of ord) {
+        if (capRestante <= 0) break;
+        const margen = (topePorRecurso[r] || 0) - enviar[r];
+        if (margen <= 0) continue;
+        const agrega = Math.min(margen, capRestante);
+        enviar[r] += agrega;
+        capRestante -= agrega;
+      }
+    }
+    return enviar;
+  }
+
+  /**
+   * Suma los recursos de todos los trades con destino `destinoId`. Devuelve
+   * `{wood, stone, iron}` enteros.
+   *
+   * Usado para descontar del espacio libre del destino los recursos que ya
+   * están en vuelo hacia él — sin esto, varios ciclos seguidos disparan
+   * envíos que al llegar todos juntos topan el almacén y se pierde el
+   * excedente. Ejemplo: cap=30k, recurso=13k, 5k en vuelo → el bot
+   * "ve" 17k libres y manda otros 17k; al llegar todos sobran 5k.
+   *
+   * Función pura.
+   */
+  function sumarIncomingPorDestino(trades, destinoId) {
+    const acc = { wood: 0, stone: 0, iron: 0 };
+    if (!Array.isArray(trades) || destinoId == null) return acc;
+    const did = String(destinoId);
+    for (const t of trades) {
+      if (!t || String(t.destinationTownId) !== did) continue;
+      acc.wood  += Number(t.wood)  || 0;
+      acc.stone += Number(t.stone) || 0;
+      acc.iron  += Number(t.iron)  || 0;
+    }
+    return acc;
+  }
+
+  /**
+   * True si el origen está "saturado": al menos SATURACION_MIN_RECURSOS de
+   * los 3 recursos están al ≥ SATURACION_PCT del cap del almacén. Si no
+   * tenemos cap o resources, devuelve false (no hay info → no priorizamos).
+   */
+  function esOrigenSaturado(townInfo) {
+    if (!townInfo || !townInfo.resources || !townInfo.storage) return false;
+    const cap = townInfo.storage;
+    if (cap <= 0) return false;
+    const umbral = cap * SATURACION_PCT;
+    let n = 0;
+    for (const r of RECURSOS) {
+      if ((townInfo.resources[r] || 0) >= umbral) n++;
+    }
+    return n >= SATURACION_MIN_RECURSOS;
+  }
+
   async function init(ctx) {
     const { data, game, core } = ctx;
     const { csrfToken, world_id, townId, player_id } = game;
@@ -176,17 +313,43 @@
       g.fuentes = g.fuentes.filter((f) => f && f.townId);
       if (!g.pesos || typeof g.pesos !== "object") g.pesos = {};
       if (!g.reserva || typeof g.reserva !== "object") g.reserva = {};
+      //objetivo: por recurso, valor absoluto del "cuánto quiero tener en
+      //destino". null = "hasta el cap del almacén del destino" (dinámico,
+      //sigue al cap si el usuario sube el almacén in-game). 0 = "no mandar
+      //este recurso a este destino". Cualquier número > 0 = "llenar hasta
+      //ese valor". Solo aplica si modo === "objetivo".
+      if (!g.objetivo || typeof g.objetivo !== "object") g.objetivo = {};
       for (const r of RECURSOS) {
         const p = Number(g.pesos[r]);
         g.pesos[r] = Number.isFinite(p) && p >= 0 ? Math.min(p, PESO_MAX) : PESO_DEFAULT;
         const rs = Number(g.reserva[r]);
         g.reserva[r] = Number.isFinite(rs) && rs >= 0 ? Math.floor(rs) : 0;
+        //objetivo[r]: null si no está seteado o si vino "" del input vacío.
+        //Number si está seteado a un valor explícito.
+        const obj = g.objetivo[r];
+        if (obj == null || obj === "" || !Number.isFinite(Number(obj))) {
+          g.objetivo[r] = null;
+        } else {
+          g.objetivo[r] = Math.max(0, Math.floor(Number(obj)));
+        }
       }
       const intv = Number(g.intervalSeg);
       g.intervalSeg = Number.isFinite(intv)
         ? Math.min(Math.max(intv, INTERVAL_MIN_SEG), INTERVAL_MAX_SEG)
         : INTERVAL_DEFAULT_SEG;
       if (typeof g.enabled !== "boolean") g.enabled = true;
+      //modo: si no viene del storage, asumir "proporcional" (preserva
+      //comportamiento de grupos pre-objetivo). Grupos nuevos se crean
+      //explícitamente con MODO_DEFAULT_NUEVO desde el botón "Nuevo grupo".
+      if (!MODOS_VALIDOS.includes(g.modo)) g.modo = "proporcional";
+      //viajeMsPorFuente: cache de tiempo de viaje origen→destino, poblado
+      //tras cada envío exitoso (gratis, lo da la response Trade). Lo usa
+      //el orden de fuentes del ciclo "objetivo" como proxy de distancia.
+      //Si una fuente nunca envió a este destino, queda al final del orden
+      //(viajeMs = Infinity) y se desempata por orden de config.
+      if (!g.viajeMsPorFuente || typeof g.viajeMsPorFuente !== "object") {
+        g.viajeMsPorFuente = {};
+      }
     }
 
     let saveTimer = null;
@@ -433,7 +596,8 @@
       ejecutandoCiclo[grupoId] = true;
 
       const ahora = Date.now();
-      const resumen = { ts: ahora, fuentes: [] };
+      const resumen = { ts: ahora, modo: grupo.modo, fuentes: [] };
+      const esModoObjetivo = grupo.modo === "objetivo";
 
       try {
         //Refetch del destino para tener resources/storage frescos.
@@ -445,43 +609,112 @@
           return;
         }
         const storage = destinoInfo.storage;
-        const espacioDestino = {
-          wood:  Math.max(0, storage - (destinoInfo.resources.wood  || 0)),
-          stone: Math.max(0, storage - (destinoInfo.resources.stone || 0)),
-          iron:  Math.max(0, storage - (destinoInfo.resources.iron  || 0)),
-        };
-        const espacioTotal = espacioDestino.wood + espacioDestino.stone + espacioDestino.iron;
-        if (espacioTotal === 0) {
-          resumen.destinoLleno = true;
-          resumen.motivo = "destino sin espacio en almacén — ciclo omitido";
-          data.comercio.ultimoCicloPorGrupo[grupo.id] = resumen;
-          return;
+
+        //Trades en vuelo hacia el destino: hay que descontarlos del espacio
+        //libre, sino ciclos consecutivos disparan envíos que al llegar
+        //topan el almacén y se pierde el excedente. Ejemplo: cap=30k,
+        //recursos=13k, en vuelo=5k → "ve" 17k libres → manda 17k →
+        //llegan 22k → sobran 5k. Con incoming descontado, espacio="12k".
+        //
+        //Aplica a AMBOS modos (proporcional y objetivo). En proporcional
+        //era un bug de siempre que no se descontaba; ahora se corrige.
+        const trades = await queryTrades();
+        const incoming = sumarIncomingPorDestino(trades, grupo.destinoTownId);
+        resumen.incoming = incoming;
+
+        //Calcular "objetivo por recurso" según modo:
+        //  - objetivo:     usa grupo.objetivo[r] || storage (cap). null = "hasta cap".
+        //  - proporcional: usa storage (cap) — equivalente a "llenar hasta cap" pero
+        //                  el peso 0 hace que no se mande nada de ese recurso.
+        const objetivoPorRecurso = {};
+        for (const r of RECURSOS) {
+          if (esModoObjetivo) {
+            const o = grupo.objetivo[r];
+            objetivoPorRecurso[r] = o == null ? storage : o;
+          } else {
+            objetivoPorRecurso[r] = storage;
+          }
         }
-        //Solo recursos con peso > 0 cuentan para el "destino lleno por
-        //recursos relevantes": si todos los pesos > 0 dan 0 espacio, también
-        //salteamos.
+        //Espacio destino: cuánto puedo mandar por recurso sin pasarme del
+        //objetivo. Considera lo que ya hay + lo que está por llegar.
+        const espacioDestino = {};
+        for (const r of RECURSOS) {
+          espacioDestino[r] = Math.max(0,
+            objetivoPorRecurso[r] - (destinoInfo.resources[r] || 0) - incoming[r]
+          );
+        }
+        //Lleno relevante: recursos "activos" en este modo.
+        //  - objetivo: relevante si objetivo[r] > 0 (sea null=cap o explícito > 0).
+        //  - proporcional: relevante si pesos[r] > 0.
         let espacioRelevante = 0;
         for (const r of RECURSOS) {
-          if ((grupo.pesos[r] || 0) > 0) espacioRelevante += espacioDestino[r];
+          const activo = esModoObjetivo
+            ? objetivoPorRecurso[r] > 0
+            : (grupo.pesos[r] || 0) > 0;
+          if (activo) espacioRelevante += espacioDestino[r];
         }
         if (espacioRelevante === 0) {
           resumen.destinoLleno = true;
-          resumen.motivo = "destino sin espacio en los recursos habilitados — ciclo omitido";
+          resumen.motivo = esModoObjetivo
+            ? "destino ya en objetivo (contando trades en vuelo) — ciclo omitido"
+            : "destino sin espacio en los recursos habilitados — ciclo omitido";
           data.comercio.ultimoCicloPorGrupo[grupo.id] = resumen;
           return;
         }
 
-        //Iterar fuentes. Espacio del destino se decrementa localmente con
-        //cada envío exitoso para que la siguiente fuente no se pase
-        //(evita refetchear tras cada envío).
-        for (const fuente of grupo.fuentes) {
+        //Pre-query de info de cada fuente: necesario para ordenarlas por
+        //saturación (modo objetivo) y para calcular el payload. Lo hacemos
+        //paralelo — es lectura barata del cache MM via bridge.
+        const fuentesFiltradas = grupo.fuentes.filter((f) =>
+          f.townId !== grupo.destinoTownId //no enviarse a sí mismo
+        );
+        const infos = await Promise.all(
+          fuentesFiltradas.map((f) => queryTown(f.townId))
+        );
+        const fuentesConInfo = fuentesFiltradas.map((f, i) => ({
+          fuente: f,
+          info: infos[i],
+          idxConfig: i,
+        }));
+
+        //Orden de fuentes:
+        //  - objetivo:     saturadas primero (libera espacio que la
+        //                  recolección va a re-llenar gratis), después por
+        //                  viajeMs ASC (más cercanas primero, menos tiempo
+        //                  con comerciantes ocupados en ruta), tiebreaker
+        //                  orden de config.
+        //  - proporcional: respeta orden de config (no se ordena —
+        //                  preserva comportamiento histórico).
+        if (esModoObjetivo) {
+          fuentesConInfo.sort((a, b) => {
+            const satA = esOrigenSaturado(a.info) ? 1 : 0;
+            const satB = esOrigenSaturado(b.info) ? 1 : 0;
+            if (satA !== satB) return satB - satA; //saturadas primero
+            const vmA = grupo.viajeMsPorFuente[a.fuente.townId];
+            const vmB = grupo.viajeMsPorFuente[b.fuente.townId];
+            const vA = Number.isFinite(vmA) ? vmA : Infinity;
+            const vB = Number.isFinite(vmB) ? vmB : Infinity;
+            if (vA !== vB) return vA - vB; //más cercanas primero
+            return a.idxConfig - b.idxConfig; //tiebreaker estable
+          });
+        }
+
+        //Loop fuentes. El espacio del destino se decrementa localmente con
+        //cada envío exitoso para que la fuente siguiente no se pase
+        //(evita refetchear el destino tras cada envío).
+        for (const { fuente, info: origenInfo } of fuentesConInfo) {
           if (!core.isExtensionContextValid()) break;
           if (core.isCaptchaActive()) break;
           if (!data.comercio.habilitada) break;
+          //Early-exit si ya cubrimos el objetivo en los 3 recursos
+          //(solo modo objetivo — el proporcional manda mientras haya
+          //capacidad porque distribuye su excedente).
+          if (esModoObjetivo) {
+            const totalRestante = espacioDestino.wood + espacioDestino.stone + espacioDestino.iron;
+            if (totalRestante <= 0) break;
+          }
           const origenId = fuente.townId;
-          if (origenId === grupo.destinoTownId) continue; //no enviarse a sí mismo
 
-          const origenInfo = await queryTown(origenId);
           if (!origenInfo || !origenInfo.resources) {
             resumen.fuentes.push({ townId: origenId, motivo: "origen sin datos en MM" });
             continue;
@@ -496,14 +729,21 @@
             continue;
           }
           const stock = origenInfo.resources;
+          //Tope por recurso: lo MÍNIMO entre lo que la fuente puede ceder
+          //(stock - reserva del grupo) y lo que el destino puede recibir
+          //(espacio que queda contando incoming + lo ya mandado en este
+          //ciclo). En modo objetivo además respetamos objetivo[r]=0 como
+          //"no mandar este recurso a este destino".
           const tope = {};
           for (const r of RECURSOS) {
-            tope[r] = Math.max(0, Math.min(
-              (stock[r] || 0) - (grupo.reserva[r] || 0),
-              espacioDestino[r] || 0
-            ));
+            const cedible = (stock[r] || 0) - (grupo.reserva[r] || 0);
+            let tDest = espacioDestino[r] || 0;
+            if (esModoObjetivo && objetivoPorRecurso[r] === 0) tDest = 0;
+            tope[r] = Math.max(0, Math.min(cedible, tDest));
           }
-          const payload = calcularPayload(cap, grupo.pesos, tope);
+          const payload = esModoObjetivo
+            ? calcularPayloadObjetivo(cap, tope)
+            : calcularPayload(cap, grupo.pesos, tope);
           const sumPayload = payload.wood + payload.stone + payload.iron;
           if (sumPayload <= 0) {
             resumen.fuentes.push({
@@ -538,12 +778,16 @@
             continue;
           }
 
-          //Éxito: log + actualizar estado + decrementar espacio local.
+          //Éxito: log + actualizar estado + decrementar espacio local +
+          //cachear viajeMs (proxy de distancia para ordenar el próximo ciclo).
           data.comercio.ultimoPorGrupoFuente[grupo.id] =
             data.comercio.ultimoPorGrupoFuente[grupo.id] || {};
           data.comercio.ultimoPorGrupoFuente[grupo.id][origenId] = {
             ts: Date.now(), sent: payload, viajeMs: r1.viajeMs,
           };
+          if (Number.isFinite(r1.viajeMs) && r1.viajeMs > 0) {
+            grupo.viajeMsPorFuente[origenId] = r1.viajeMs;
+          }
           data.comercio.historial.push({
             ts: Date.now(),
             grupoId: grupo.id,
@@ -560,7 +804,10 @@
           for (const r of RECURSOS) {
             espacioDestino[r] = Math.max(0, espacioDestino[r] - (payload[r] || 0));
           }
-          resumen.fuentes.push({ townId: origenId, sent: payload, cap, viajeMs: r1.viajeMs });
+          resumen.fuentes.push({
+            townId: origenId, sent: payload, cap, viajeMs: r1.viajeMs,
+            saturada: esOrigenSaturado(origenInfo),
+          });
 
           core.log(
             "comercio",
@@ -649,6 +896,16 @@
       return `${m}m ${String(r).padStart(2, "0")}s`;
     }
 
+    //Compacta "1500" → "1.5k", "23000" → "23k" para resumir en el header
+    //del grupo sin que se desborde. Solo > 1000.
+    function fmtMiles(n) {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return "?";
+      if (x < 1000) return String(x);
+      if (x < 10000) return (x / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+      return Math.round(x / 1000) + "k";
+    }
+
     function renderTab(body) {
       //Skip refresh si hay foco en un input/select dentro del tab (el usuario
       //está escribiendo). Mismo patrón que ataques.js.
@@ -700,8 +957,18 @@
           nombre: `Grupo ${data.comercio.grupos.length + 1}`,
           destinoTownId: "",
           fuentes: [],
+          //Modo objetivo es el default — el usuario típicamente quiere
+          //"mantener llena esta ciudad". `objetivo: {null,null,null}` =
+          //"hasta el cap del almacén del destino" (sigue al cap si el
+          //jugador sube el almacén in-game).
+          modo: MODO_DEFAULT_NUEVO,
+          objetivo: { wood: null, stone: null, iron: null },
+          //pesos sigue presente para compatibilidad del shape — en modo
+          //objetivo NO se usa, pero si el usuario cambia a modo
+          //"proporcional", quedan listos para configurar.
           pesos: { wood: PESO_DEFAULT, stone: PESO_DEFAULT, iron: PESO_DEFAULT },
           reserva: { wood: 0, stone: 0, iron: 0 },
+          viajeMsPorFuente: {},
           intervalSeg: INTERVAL_DEFAULT_SEG,
           enabled: true,
         };
@@ -759,11 +1026,13 @@
       const v = document.createElement("div");
       v.innerHTML =
         `Cada <b>grupo</b> manda recursos desde N <b>fuentes</b> a un <b>destino</b>. ` +
-        `Los <b>pesos</b> (0–${PESO_MAX}) deciden qué porcentaje de la capacidad del mercado se usa ` +
-        `para cada recurso (peso 0 = nunca mandar). Si un recurso no alcanza, se ` +
-        `rellena con el siguiente con peso > 0. <b>Reserva</b> es el piso que la ` +
-        `fuente conserva. Si el destino no tiene espacio en almacén el envío se omite ` +
-        `para no desperdiciar recursos.`;
+        `<b>Modo Objetivo</b> (default): fijás cuánto querés tener de cada recurso ` +
+        `en el destino (default: hasta el cap del almacén). El bot calcula el ` +
+        `faltante <b>descontando lo que ya está en vuelo</b> y prioriza las fuentes ` +
+        `saturadas (≥${Math.round(SATURACION_PCT * 100)}% de cap) y las más cercanas. ` +
+        `<b>Modo Proporcional</b>: los <b>pesos</b> (0–${PESO_MAX}) deciden el reparto. ` +
+        `<b>Reserva</b> es el piso que cada fuente conserva. Si el destino ya cubre ` +
+        `el objetivo (contando trades en vuelo), el ciclo se omite.`;
       v.style.cssText =
         "background:#1a232e;border-left:3px solid #3498db;color:#bdc3c7;" +
         "padding:8px 10px;font-size:11.5px;line-height:1.45;border-radius:3px;" +
@@ -808,9 +1077,13 @@
         `<span style="color:#7a8aa0;font-weight:normal">→ ${escapeHtml(destNom)}</span>`;
       const sub = document.createElement("div");
       sub.style.cssText = "color:#7a8aa0;font-size:10.5px;margin-top:1px";
+      const resumenModo = grupo.modo === "objetivo"
+        ? "obj " + RECURSOS
+            .map((r) => grupo.objetivo[r] == null ? "cap" : fmtMiles(grupo.objetivo[r]))
+            .join("/")
+        : `pesos ${grupo.pesos.wood}/${grupo.pesos.stone}/${grupo.pesos.iron}`;
       sub.textContent =
-        `${grupo.fuentes.length} fuente(s) · cada ${grupo.intervalSeg}s · ` +
-        `pesos ${grupo.pesos.wood}/${grupo.pesos.stone}/${grupo.pesos.iron}`;
+        `${grupo.fuentes.length} fuente(s) · cada ${grupo.intervalSeg}s · ${resumenModo}`;
       tit.appendChild(nombre);
       tit.appendChild(sub);
       header.appendChild(tit);
@@ -909,17 +1182,162 @@
 
       cuerpo.appendChild(fila1);
 
-      //Línea 2: pesos + reservas (compactos, en una grilla)
-      cuerpo.appendChild(renderPesosReservas(grupo));
+      //Línea 2: selector de modo (objetivo/proporcional). Lo separamos del
+      //cuerpo de pesos/objetivos para que cambiar el modo sea un re-render
+      //que muestre la UI correspondiente.
+      cuerpo.appendChild(renderSelectorModo(grupo));
 
-      //Línea 3: fuentes
+      //Línea 3: pesos+reservas (modo proporcional) u objetivos+reservas
+      //(modo objetivo). Ambos comparten "reserva por recurso" — lo que
+      //cambia es la columna del medio.
+      cuerpo.appendChild(grupo.modo === "objetivo"
+        ? renderObjetivosReservas(grupo)
+        : renderPesosReservas(grupo));
+
+      //Línea 4: fuentes
       cuerpo.appendChild(renderFuentes(grupo, ciudades));
 
-      //Línea 4: estado por fuente + motivo del último ciclo
+      //Línea 5: estado por fuente + motivo del último ciclo
       cuerpo.appendChild(renderEstadoFuentes(grupo));
 
       card.appendChild(cuerpo);
       return card;
+    }
+
+    function renderSelectorModo(grupo) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:flex;align-items:center;gap:10px;margin-bottom:10px;" +
+        "padding:6px 10px;background:#1a232e;border:1px solid #2c3a4d;border-radius:3px";
+      const lab = document.createElement("div");
+      lab.textContent = "MODO";
+      lab.style.cssText =
+        "color:#7a8aa0;font-size:10.5px;font-weight:bold;text-transform:uppercase;" +
+        "letter-spacing:0.8px;min-width:42px";
+      wrap.appendChild(lab);
+      for (const m of MODOS_VALIDOS) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        const activo = grupo.modo === m;
+        btn.textContent = m === "objetivo" ? "Objetivo" : "Proporcional";
+        btn.title = m === "objetivo"
+          ? "Llenar el destino hasta un valor por recurso (default = cap del almacén). " +
+            "Reparte la capacidad del mercado del origen proporcional a lo que falta."
+          : "Pesos por recurso (0-100) deciden cómo se reparte la capacidad del mercado " +
+            "del origen. Útil cuando solo querés mover excedente sin un objetivo concreto.";
+        btn.style.cssText =
+          `padding:4px 12px;font-size:11px;font-weight:bold;cursor:pointer;border-radius:3px;` +
+          `border:1px solid ${activo ? "#27ae60" : "#2c3a4d"};` +
+          `background:${activo ? "#1e3a2c" : "#0e1620"};` +
+          `color:${activo ? "#27ae60" : "#bdc3c7"}`;
+        btn.addEventListener("click", () => {
+          if (grupo.modo === m) return;
+          grupo.modo = m;
+          persistir();
+          rerenderTab();
+        });
+        wrap.appendChild(btn);
+      }
+      const help = document.createElement("div");
+      help.style.cssText = "color:#7a8aa0;font-size:10.5px;flex:1;text-align:right";
+      help.textContent = grupo.modo === "objetivo"
+        ? "Saturadas primero · cercanas después · descuenta trades en vuelo"
+        : "Reparte por pesos · descuenta trades en vuelo";
+      wrap.appendChild(help);
+      return wrap;
+    }
+
+    function renderObjetivosReservas(grupo) {
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "background:#1a232e;border:1px solid #2c3a4d;border-radius:3px;" +
+        "padding:8px 10px;margin-bottom:10px";
+      const head = document.createElement("div");
+      head.style.cssText =
+        "display:flex;align-items:center;gap:8px;color:#7a8aa0;font-size:10.5px;" +
+        "font-weight:bold;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px";
+      const labelHead = document.createElement("span");
+      labelHead.style.cssText = "flex:1";
+      labelHead.textContent = "Objetivo por recurso (vacío = hasta cap) · Reserva en origen";
+      head.appendChild(labelHead);
+
+      //Atajos: "Hasta cap" pone los 3 objetivos en null (= hasta cap del
+      //destino dinámicamente). "Cero" pone los 3 en 0 (= no mandar nada).
+      const btnCap = document.createElement("button");
+      btnCap.type = "button";
+      btnCap.textContent = "Hasta cap";
+      btnCap.title = "Setear los 3 recursos a 'hasta el cap del almacén' (sigue al cap dinámicamente)";
+      btnCap.style.cssText =
+        "background:#2c3a4d;color:#bdc3c7;border:0;padding:3px 8px;cursor:pointer;" +
+        "border-radius:3px;font-size:10.5px;font-weight:bold";
+      btnCap.addEventListener("click", () => {
+        for (const r of RECURSOS) grupo.objetivo[r] = null;
+        persistir();
+        rerenderTab();
+      });
+      head.appendChild(btnCap);
+      wrap.appendChild(head);
+
+      const grid = document.createElement("div");
+      grid.style.cssText = "display:grid;grid-template-columns:80px 1fr 90px;gap:6px 10px;align-items:center";
+      for (const r of RECURSOS) {
+        const label = document.createElement("div");
+        label.innerHTML = `<span style="color:${COLOR_RECURSO[r]};font-weight:bold">${LABEL_RECURSO[r]}</span>`;
+        label.style.cssText = "font-size:11.5px";
+        grid.appendChild(label);
+
+        //Input numérico para objetivo. Vacío = null = "hasta cap".
+        //0 explícito = "no mandar este recurso a este destino" (case útil
+        //cuando el destino es una ciudad militar que solo quiere madera).
+        const objWrap = document.createElement("div");
+        objWrap.style.cssText = "display:flex;align-items:center;gap:6px";
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.min = "0";
+        inp.placeholder = "cap";
+        inp.value = grupo.objetivo[r] == null ? "" : String(grupo.objetivo[r]);
+        inp.title = `Objetivo de ${LABEL_RECURSO[r]} en el destino — vacío = hasta el cap del almacén. ` +
+                    `0 = no mandar este recurso a este destino.`;
+        inp.style.cssText =
+          "flex:1;background:#0e1620;color:#e6e9ee;border:1px solid #2c3a4d;" +
+          "padding:5px 7px;border-radius:3px;font-size:11.5px;font-family:monospace;" +
+          "height:26px;box-sizing:border-box";
+        inp.addEventListener("change", () => {
+          const raw = inp.value.trim();
+          if (raw === "") {
+            grupo.objetivo[r] = null;
+          } else {
+            const v = Math.max(0, Math.floor(Number(raw) || 0));
+            grupo.objetivo[r] = v;
+            inp.value = String(v);
+          }
+          persistir();
+          rerenderTab();
+        });
+        objWrap.appendChild(inp);
+        grid.appendChild(objWrap);
+
+        //Reserva en origen (mismo control que en modo proporcional —
+        //compartido, no quiero forzar al usuario a re-configurar al
+        //cambiar de modo).
+        const inpRes = document.createElement("input");
+        inpRes.type = "number";
+        inpRes.min = "0";
+        inpRes.value = String(grupo.reserva[r] || 0);
+        inpRes.title = `Reserva mínima de ${LABEL_RECURSO[r]} en la fuente — no se envía si dejaría stock < reserva`;
+        inpRes.style.cssText =
+          "width:90px;background:#0e1620;color:#e6e9ee;border:1px solid #2c3a4d;" +
+          "padding:4px 6px;border-radius:3px;font-size:11px;font-family:monospace";
+        inpRes.addEventListener("change", () => {
+          const v = Math.max(0, Math.floor(Number(inpRes.value) || 0));
+          grupo.reserva[r] = v;
+          inpRes.value = String(v);
+          persistir();
+        });
+        grid.appendChild(inpRes);
+      }
+      wrap.appendChild(grid);
+      return wrap;
     }
 
     function renderPesosReservas(grupo) {

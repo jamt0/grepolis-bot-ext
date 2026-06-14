@@ -1,32 +1,58 @@
 # Comercio — envío automático de recursos entre ciudades propias
 
-Esta feature manda recursos entre ciudades propias en ciclo. El usuario define **grupos**: cada grupo tiene 1 destino, N fuentes, pesos por recurso, reserva por recurso e intervalo propio. Cada grupo tiene su propio scheduler — independiente entre sí y del resto del bot.
+Esta feature manda recursos entre ciudades propias en ciclo. El usuario define **grupos**: cada grupo tiene 1 destino, N fuentes, **un modo** (objetivo o proporcional), parámetros del modo, reserva por recurso e intervalo propio. Cada grupo tiene su propio scheduler — independiente entre sí y del resto del bot.
 
 ---
 
 ## 1. Concepto rápido
 
+Dos modos por grupo:
+
+**Modo Objetivo (default para grupos nuevos)** — el usuario fija "cuánto quiero tener en el destino" por recurso. El bot calcula el faltante y reparte la capacidad de cada fuente.
+
 ```
-Grupo "Refuerzo capital"
-  destino:  001 Jam M54
-  fuentes:  002 Jam M55, 011 Jam M43, 015 Jam M51
-  pesos:    wood=3  stone=1  iron=0
-  reserva:  wood=0  stone=500 iron=0
+Grupo "Mantener capital llena"
+  modo:      objetivo
+  destino:   001 Jam M54
+  fuentes:   002 Jam M55, 011 Jam M43, 015 Jam M51
+  objetivo:  wood=cap  stone=cap  iron=0     (vacío en UI = "hasta cap del almacén")
+  reserva:   wood=0    stone=500  iron=0
   intervalo: 15s
-  enabled: ON
+  enabled:   ON
 ```
 
-Cada 15s (± jitter 15%), por cada fuente:
+**Modo Proporcional (legacy)** — el usuario fija pesos por recurso (0–100) y el bot reparte la capacidad de cada fuente proporcional a esos pesos. Útil cuando uno mueve excedente sin un objetivo concreto.
 
-1. Lee del modelo `Town` (en MM) la `available_trade_capacity` del origen y la `resources` del destino.
-2. Si el destino no tiene espacio para los recursos con peso > 0 → **omite el envío** (no se desperdicia).
-3. Si la fuente no tiene comerciantes libres → saltea esa fuente este ciclo.
-4. Reparte la capacidad libre del mercado de la fuente entre los 3 recursos según los pesos, respetando:
-   - `stock - reserva` del origen,
-   - `storage - resources[r]` del destino (espacio libre en almacén),
-   - peso 0 = nunca mandar.
-5. Si un recurso tope-toca antes de llegar a su objetivo proporcional, la capacidad sobrante se reparte entre los demás con peso > 0.
-6. POST al endpoint del juego. Logea, persiste, decrementa localmente el espacio del destino para que la siguiente fuente no se pase, y sigue.
+```
+Grupo "Excedente al frente"
+  modo:      proporcional
+  pesos:     wood=3  stone=1  iron=0   (peso 0 = nunca mandar)
+  reserva:   wood=0  stone=500 iron=0
+  ...
+```
+
+### Algoritmo del ciclo (cada `intervalSeg` ± 15% jitter)
+
+1. `refetchTowns()` para tener `resources/storage` frescos en MM.
+2. `queryTown(destino)` y `queryTrades()` → `incoming = Σ trades.destinoTownId == destino`.
+3. Calcular **objetivo por recurso**:
+   - Modo objetivo: `grupo.objetivo[r] ?? storage_cap` (null = "hasta cap").
+   - Modo proporcional: `storage_cap` (siempre — los pesos controlan el reparto).
+4. **Espacio libre** efectivo: `max(0, objetivo[r] - resources_dest[r] - incoming[r])`.
+   - Descontar `incoming` es crítico: sin esto, ciclos consecutivos disparan envíos que al llegar topan el almacén y se pierde el excedente. Aplica a ambos modos.
+5. Si el espacio relevante (recursos activos en este modo) es 0 → **omite el ciclo**, reagenda.
+6. Pre-query `queryTown` paralelo de todas las fuentes (lectura barata del cache MM).
+7. **Orden de fuentes** (solo modo objetivo):
+   - Saturadas primero — `≥ SATURACION_MIN_RECURSOS` recursos al `≥ SATURACION_PCT * storage_cap`. Libera espacio que recolección va a re-llenar gratis.
+   - Después por `viajeMs` cacheado ASC (más cercanas primero, menos tiempo con comerciantes ocupados en ruta).
+   - Tiebreaker: orden de config.
+   - Modo proporcional preserva orden de config (no se ordena).
+8. Loop fuentes:
+   - `tope[r] = max(0, min(stock - reserva_origen, espacio_destino))`.
+   - Modo objetivo: `calcularPayloadObjetivo(cap_mercado, tope)` — reparte proporcional al faltante.
+   - Modo proporcional: `calcularPayload(cap_mercado, pesos, tope)` — reparte por pesos.
+   - Si payload > 0 → POST `trade`, log, **cachea `viajeMs` por fuente**, decrementa espacio del destino local.
+   - Modo objetivo: si el faltante total llega a 0 → `break` (no procesa fuentes restantes).
 
 ---
 
@@ -108,8 +134,18 @@ La feature usa dos handlers del bridge — ambos ya están instalados en `js/gam
       nombre: "Refuerzo capital",
       destinoTownId: 91,
       fuentes: [{ townId: 95 }, { townId: 102 }],
-      pesos:   { wood: 3, stone: 1, iron: 0 },   // 0..100 por recurso
-      reserva: { wood: 0, stone: 500, iron: 0 }, // piso mínimo en origen
+      modo: "objetivo",                          // "objetivo" | "proporcional"
+                                                 // grupos sin campo (pre-v3.8) → "proporcional" (backwards-compat)
+      objetivo: { wood: null, stone: null, iron: 0 },  // por recurso: null = "hasta cap del almacén",
+                                                       // 0 = "no mandar este recurso", N = "hasta N"
+                                                       // solo aplica si modo === "objetivo"
+      pesos:   { wood: 3, stone: 1, iron: 0 },   // 0..100 — solo aplica si modo === "proporcional"
+      reserva: { wood: 0, stone: 500, iron: 0 }, // piso mínimo en origen (ambos modos)
+      viajeMsPorFuente: { 95: 12000, 102: 47000 }, // cache de viajeMs origen→destino,
+                                                   // poblado tras cada envío OK.
+                                                   // Usado como proxy de distancia para ordenar
+                                                   // fuentes en modo objetivo. Fuentes sin cache
+                                                   // van al final (Infinity).
       intervalSeg: 15,                          // 10..300
       enabled: true,
     },
@@ -121,7 +157,11 @@ La feature usa dos handlers del bridge — ambos ya están instalados en `js/gam
     }
   },
   ultimoCicloPorGrupo: {
-    [grupoId]: { ts, motivo?, destinoLleno?, fuentes:[{townId, sent?, cap?, motivo?}] }
+    [grupoId]: {
+      ts, modo, motivo?, destinoLleno?,
+      incoming?: {wood,stone,iron},   // trades en vuelo hacia destino al inicio del ciclo
+      fuentes: [{ townId, sent?, cap?, motivo?, saturada? }]
+    }
   },
   historial: [
     { ts, grupoId, grupoNombre, origenId, origenNombre,
@@ -133,6 +173,8 @@ La feature usa dos handlers del bridge — ambos ya están instalados en `js/gam
 ```
 
 Solo `habilitada`, `grupos`, `ultimoPorGrupoFuente` y `historial` se persisten. El resto es runtime.
+
+**Decisión de default por modo:** grupos nuevos se crean en `"objetivo"` porque el caso de uso típico es "mantener llena esta ciudad". Grupos cargados del storage sin campo `modo` (versión anterior) caen a `"proporcional"` para preservar exactamente su comportamiento anterior — `normalizarGrupo` no migra entre modos.
 
 ---
 
@@ -152,30 +194,72 @@ Cada grupo activo tiene su propio `setTimeout`. `timersPorGrupo[grupoId]` guarda
 
 ## 6. Cálculo del payload
 
-`calcularPayload(capacidad, pesos, topePorRecurso)` (función pura, dentro del feature):
+Dos funciones puras dentro del feature, una por modo. El tope se calcula fuera y se les pasa idéntico:
 
 ```
-tope[r] = max(0, min(stock[r] - reserva[r], espacioDestino[r]))   // calculado fuera
+tope[r] = max(0, min(stock_origen[r] - reserva_origen[r],
+                     espacioDestino[r]))   // ver §6.1
+```
 
-bucle distribución:
-  sumaPesos = sum(pesos[r] for r in candidatos)
+### 6.1. Espacio del destino (común a ambos modos)
+
+```
+trades   = queryTrades()
+incoming = Σ trades.wood/stone/iron donde destinationTownId == grupo.destinoTownId
+
+objetivoPorRecurso[r] = grupo.modo === "objetivo"
+                          ? (grupo.objetivo[r] ?? storage_cap)
+                          : storage_cap
+
+espacioDestino[r] = max(0, objetivoPorRecurso[r] - resources_destino[r] - incoming[r])
+```
+
+El descuento de `incoming` evita el overshoot clásico: sin él, cap=30k + recursos=13k + en_vuelo=5k → bot "ve" 17k libres → manda 17k → llegan 22k → sobran 5k. Con descuento: espacio efectivo = 12k.
+
+### 6.2. `calcularPayloadObjetivo(capacidad, topePorRecurso)` — modo objetivo
+
+Reparte la capacidad del mercado **proporcional al faltante** de cada recurso (no por pesos ni equitativo):
+
+```
+candidatos = {r : tope[r] > 0}
+
+bucle distribución (cap 6 iters):
   para cada r en candidatos:
-    objetivo[r] = floor(capRestante * pesos[r] / sumaPesos)
-    agrega[r]   = min(objetivo[r], tope[r] - enviar[r])
+    faltante[r] = tope[r] - enviar[r]
+  sumaFaltante = Σ faltante
+  para cada r en candidatos:
+    obj         = floor(capRestante * faltante[r] / sumaFaltante)
+    agrega[r]   = min(obj, faltante[r])
     enviar[r] += agrega[r]
-    si enviar[r] >= tope[r]: candidatos.delete(r)
-  capRestante -= sum(agrega)
-  repetir hasta capRestante=0 o candidatos=∅ (cap 6 iters)
+  capRestante -= Σ agrega
+  cortar si capRestante=0 o nadie cambió
 
-pulido: si queda capRestante y candidatos con margen, llenar en orden
-        de peso descendente (corrige redondeos)
+pulido: si sobra capacidad, llenar en orden de mayor faltante restante
 ```
 
 Garantías:
-- `enviar.wood + enviar.stone + enviar.iron <= capacidad`
-- `enviar[r] <= topePorRecurso[r]` siempre
-- `enviar[r] = 0` si `pesos[r] = 0`
-- Función pura → puede testearse en aislamiento
+- `Σ enviar <= capacidad`, `enviar[r] <= tope[r]`.
+- Si `tope[r] = 0` (incluyendo `objetivo[r] = 0`), `enviar[r] = 0`.
+
+### 6.3. `calcularPayload(capacidad, pesos, topePorRecurso)` — modo proporcional
+
+Sin cambios respecto a v3.7. Reparte la capacidad **proporcional a los pesos**, `peso 0` excluye el recurso, redistribución cuando alguien tope-toca, pulido final por peso descendente.
+
+### 6.4. Orden de fuentes
+
+Solo modo objetivo ordena fuentes. Modo proporcional preserva orden de config (comportamiento histórico).
+
+```
+sort(fuentes, por:
+  1. esOrigenSaturado(info) DESC      // saturadas primero (libera espacio que recolección re-llena)
+  2. viajeMsPorFuente[id] ASC          // cercanas primero (cache poblada tras cada envío OK)
+  3. idxConfig ASC                     // tiebreaker estable
+)
+```
+
+`esOrigenSaturado(townInfo)` = `≥ SATURACION_MIN_RECURSOS (2)` recursos al `≥ SATURACION_PCT (95%)` del cap del almacén. Umbrales conservadores: 95% (no 100%) porque ya hay desperdicio por encima; 2-de-3 (no 3-de-3) porque madera satura primero — esperar a los 3 al tope hace que la heurística nunca dispare.
+
+Modo objetivo además hace **early-exit** del loop cuando `Σ espacioDestino = 0` (faltante cubierto). No procesa fuentes restantes — minimiza la cantidad de envíos.
 
 ---
 
@@ -187,9 +271,15 @@ Estructura:
 
 - **Header master:** estado + botón Iniciar/Detener global.
 - **Lista de grupos** (colapsables):
-  - Header con nombre, destino, resumen, toggle ON/OFF, expand/collapse.
-  - Body expandido: nombre / destino / intervalo / eliminar; pesos (sliders 0–100) + reserva por recurso; selector de fuentes (checkboxes multi-select con shortcut "Todas"/"Ninguna"); tabla de estado por fuente (capacidad libre actual, último envío, hace cuánto).
-- **Botón "Nuevo grupo"** al final de la lista.
+  - Header con nombre, destino, resumen (cantidad de fuentes · intervalo · resumen del modo `obj wood/stone/iron` o `pesos w/s/i`), toggle ON/OFF, expand/collapse.
+  - Body expandido:
+    1. nombre / destino / intervalo / eliminar.
+    2. **Selector de modo** (Objetivo / Proporcional) con tooltip de cada modo.
+    3. **Si modo Objetivo**: 3 inputs de objetivo por recurso (vacío = "hasta cap del almacén", 0 = "no mandar este recurso") + reserva por recurso. Atajo "Hasta cap" que pone los 3 en `null`.
+    4. **Si modo Proporcional**: sliders de peso 0–100 por recurso + reserva por recurso (UI legacy sin cambios).
+    5. Selector de fuentes (checkboxes multi-select con shortcuts "Todas"/"Ninguna").
+    6. Tabla de estado por fuente (capacidad libre actual, último envío, hace cuánto).
+- **Botón "Nuevo grupo"** al final de la lista (grupos nuevos arrancan en modo Objetivo con `objetivo = {null, null, null}` — "hasta cap en los 3").
 - **Tabla de comercios en vuelo** (modelo `Trade` desde MM, refresh cada 5s).
 - **Historial** (FIFO, cap 100, toggle mostrar/ocultar + limpiar).
 
@@ -200,7 +290,9 @@ El renderTab respeta foco en inputs/selects (mismo skip-on-focus que ataques.js)
 ## 8. Casos manejados
 
 - **Origen sin comerciantes libres** (`available_trade_capacity ≤ 0`): salta esa fuente este ciclo, log "sin comerciantes libres", reagenda normal.
-- **Destino lleno** en los recursos con peso > 0: omite el ciclo entero, log "destino sin espacio en los recursos habilitados — ciclo omitido", reagenda normal.
+- **Destino en objetivo** (modo objetivo): si después de descontar `incoming` el espacio de cada recurso activo es 0, omite el ciclo entero, log "destino ya en objetivo (contando trades en vuelo) — ciclo omitido". El próximo ciclo evalúa de nuevo cuando recursos se gastan o los trades llegan.
+- **Destino lleno** (modo proporcional): mismo flujo que arriba, log "destino sin espacio en los recursos habilitados — ciclo omitido".
+- **Faltante cubierto en mid-ciclo** (modo objetivo): el loop hace early-exit cuando `Σ espacioDestino = 0` y skipea las fuentes restantes del orden — minimiza la cantidad de envíos.
 - **Origen sin info en MM** (modelo Town no cargado, y tras refetch siguió sin venir): salta esa fuente. La ciudad se va a cargar al primer paseo del usuario o cuando llegue una notification.
 - **CAPTCHA:** se detecta por response sin notifications `Trade`/`Town`. Dispara `core.onCaptchaDetectado`. El listener de `core.onCaptcha(true)` cancela todos los timers. Al `core.onCaptcha(false)` se reagendan.
 - **Extensión recargada:** `core.isExtensionContextValid()` se chequea al inicio de cada `ciclo()` y antes de `refetchTowns()`. Si falló, el `setPaused(true)` del core ya detuvo el bot.
