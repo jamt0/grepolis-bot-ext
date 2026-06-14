@@ -77,6 +77,14 @@
   const SATURACION_PCT = 0.95;
   const SATURACION_MIN_RECURSOS = 2;
 
+  //Mercado nivel mínimo para enviar a OTRA isla. Por debajo, el server
+  //rechaza el envío con error y se gasta el intento. Lo pre-filtramos en
+  //cliente cuando podemos detectar el nivel (gameBridge lee el modelo Town).
+  //Si el nivel viene null (modelo no expuesto en esta versión del juego),
+  //no pre-filtramos — el server hará el gating y veremos el error en el log.
+  //Envíos a la misma isla NO requieren este nivel (mercado nivel ≥1 alcanza).
+  const MARKET_LEVEL_INTER_ISLA = 5;
+
   function escapeHtml(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -717,6 +725,24 @@
 
           if (!origenInfo || !origenInfo.resources) {
             resumen.fuentes.push({ townId: origenId, motivo: "origen sin datos en MM" });
+            continue;
+          }
+          //Gating inter-isla: mercados nivel <5 solo pueden enviar dentro de
+          //la misma isla. Si el nivel del mercado no se pudo detectar
+          //(marketLevel==null), no pre-filtramos — el server hará el gating.
+          //Si destinoInfo.islandId también es null, asumimos mismo isla y
+          //dejamos pasar (no podemos comparar).
+          if (
+            destinoInfo.islandId != null &&
+            origenInfo.islandId != null &&
+            destinoInfo.islandId !== origenInfo.islandId &&
+            origenInfo.marketLevel != null &&
+            origenInfo.marketLevel < MARKET_LEVEL_INTER_ISLA
+          ) {
+            resumen.fuentes.push({
+              townId: origenId,
+              motivo: `mercado nivel ${origenInfo.marketLevel} — no puede enviar entre islas (requiere ≥${MARKET_LEVEL_INTER_ISLA})`,
+            });
             continue;
           }
           const cap = origenInfo.availableTradeCapacity;

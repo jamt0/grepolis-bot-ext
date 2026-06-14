@@ -135,6 +135,16 @@
    *   - maxTradeCapacity: tope del mercado del origen (available_traders ×
    *     load_per_trader cuando todos los comerciantes están en casa).
    *   - availableTradeCapacity: capacidad libre AHORA del mercado del origen.
+   *   - islandId: id de la isla del Town — comercio lo usa para detectar
+   *     envíos inter-isla (que requieren mercado ≥ 5).
+   *   - marketLevel: nivel actual del mercado de la ciudad, o null si no
+   *     pudimos detectarlo. El modelo Town suele exponer los niveles de
+   *     buildings via método (`getBuildingLevel`) o como dict en attributes
+   *     (`buildings.market` / `building_market`); probamos varios shapes
+   *     defensivamente porque la API interna del cliente puede cambiar
+   *     entre versiones del juego. Si todo falla, queda `null` y el caller
+   *     decide qué hacer (típicamente no pre-filtrar y dejar que el server
+   *     rechace si corresponde).
    *
    * Si el modelo Town no está cargado en MM (la ciudad nunca fue abierta en
    * la sesión y no llegó por notification), los campos vienen como null —
@@ -146,6 +156,8 @@
     let storage = null;
     let maxTradeCapacity = null;
     let availableTradeCapacity = null;
+    let islandId = null;
+    let marketLevel = null;
     if (window.MM && typeof window.MM.getModels === "function") {
       const towns = window.MM.getModels().Town;
       const town = towns && (towns[townId] || towns[String(townId)]);
@@ -156,10 +168,29 @@
         if (typeof a.storage === "number") storage = a.storage;
         if (typeof a.max_trade_capacity === "number") maxTradeCapacity = a.max_trade_capacity;
         if (typeof a.available_trade_capacity === "number") availableTradeCapacity = a.available_trade_capacity;
+        if (a.island_id != null) islandId = Number(a.island_id);
+        //marketLevel: probamos en orden los shapes que vimos / suelen usarse.
+        try {
+          if (town && typeof town.getBuildingLevel === "function") {
+            const lvl = town.getBuildingLevel("market");
+            if (typeof lvl === "number") marketLevel = lvl;
+          }
+          if (marketLevel == null && a.buildings && typeof a.buildings.market === "number") {
+            marketLevel = a.buildings.market;
+          }
+          if (marketLevel == null && typeof a.building_market === "number") {
+            marketLevel = a.building_market;
+          }
+        } catch (_) { /* defensivo — si el método tira, seguimos con null */ }
       }
     }
     window.postMessage(
-      { type: "JamBot:townResources", townId, resources, storage, maxTradeCapacity, availableTradeCapacity },
+      {
+        type: "JamBot:townResources",
+        townId, resources, storage,
+        maxTradeCapacity, availableTradeCapacity,
+        islandId, marketLevel,
+      },
       "*"
     );
   });

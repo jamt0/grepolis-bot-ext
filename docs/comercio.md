@@ -105,9 +105,13 @@ La feature usa dos handlers del bridge — ambos ya están instalados en `js/gam
   postMessage({
     type: "JamBot:townResources",
     townId, resources, storage, maxTradeCapacity, availableTradeCapacity,
+    islandId, marketLevel,
   })
   ```
   Lee del modelo `Town` en MM. Si el modelo no está cargado (ciudad no abierta y sin notifications recientes), los campos vienen como `null` — el feature hace 1 refetch de la collection `Towns` al inicio de cada ciclo para forzar la carga.
+
+  - `islandId`: id de la isla. Lo usa el gating inter-isla del comercio.
+  - `marketLevel`: nivel actual del mercado, o `null` si no pudimos detectarlo. El bridge prueba varios shapes (`town.getBuildingLevel("market")`, `attributes.buildings.market`, `attributes.building_market`) porque la API interna del cliente puede variar entre versiones del juego. Si todos fallan queda `null` y comercio NO pre-filtra (deja al server rechazar).
 
 - **`JamBot:queryTrades`**:
   ```js
@@ -289,6 +293,7 @@ El renderTab respeta foco en inputs/selects (mismo skip-on-focus que ataques.js)
 
 ## 8. Casos manejados
 
+- **Origen con mercado <5 enviando a otra isla**: el server rechaza el envío inter-isla si el mercado del origen es nivel <5. El feature pre-filtra cuando puede leer `marketLevel` del bridge — salta la fuente con motivo `mercado nivel N — no puede enviar entre islas (requiere ≥5)`. Si `marketLevel` viene `null` (versión del cliente que no expone el shape esperado), no pre-filtra y el server hace el gating (queda registrado como error en el log de esa fuente).
 - **Origen sin comerciantes libres** (`available_trade_capacity ≤ 0`): salta esa fuente este ciclo, log "sin comerciantes libres", reagenda normal.
 - **Destino en objetivo** (modo objetivo): si después de descontar `incoming` el espacio de cada recurso activo es 0, omite el ciclo entero, log "destino ya en objetivo (contando trades en vuelo) — ciclo omitido". El próximo ciclo evalúa de nuevo cuando recursos se gastan o los trades llegan.
 - **Destino lleno** (modo proporcional): mismo flujo que arriba, log "destino sin espacio en los recursos habilitados — ciclo omitido".
