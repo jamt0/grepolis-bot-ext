@@ -18,6 +18,7 @@
  */
 
 const ALARM_POLL_ATAQUES = "ataquesEntrantesPoll";
+const ALARM_POLL_ORO = "mercadoOroPoll";
 const POLL_PERIOD_MIN = 0.5; // 30s — mínimo permitido por chrome.alarms.
 
 // id de notif → tab id, para que al apretarla podamos enfocar la pestaña.
@@ -27,6 +28,7 @@ const notifIdToTabId = new Map();
 // arranca (install, browser start, suspend/wake). create() es idempotente.
 function asegurarAlarma() {
   chrome.alarms.create(ALARM_POLL_ATAQUES, { periodInMinutes: POLL_PERIOD_MIN });
+  chrome.alarms.create(ALARM_POLL_ORO, { periodInMinutes: POLL_PERIOD_MIN });
 }
 
 chrome.runtime.onInstalled.addListener(asegurarAlarma);
@@ -34,19 +36,29 @@ chrome.runtime.onStartup.addListener(asegurarAlarma);
 asegurarAlarma();
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== ALARM_POLL_ATAQUES) return;
-  // Pegarle a TODAS las pestañas de Grepolis (puede haber varias abiertas
-  // con distintos mundos). Cada content script decide si reacciona o no.
-  chrome.tabs.query({ url: "*://*.grepolis.com/*" }, (tabs) => {
-    for (const tab of tabs) {
-      if (tab.id == null) continue;
-      chrome.tabs.sendMessage(tab.id, { type: "JamBot:pollAtaques" }, () => {
-        // Swallow errors: tabs sin content script (subdominios excluidos)
-        // o tabs viejas tiran "Receiving end does not exist". No es fallo.
-        void chrome.runtime.lastError;
-      });
-    }
-  });
+  if (alarm.name === ALARM_POLL_ATAQUES) {
+    chrome.tabs.query({ url: "*://*.grepolis.com/*" }, (tabs) => {
+      for (const tab of tabs) {
+        if (tab.id == null) continue;
+        chrome.tabs.sendMessage(tab.id, { type: "JamBot:pollAtaques" }, () => {
+          void chrome.runtime.lastError;
+        });
+      }
+    });
+    return;
+  }
+
+  if (alarm.name === ALARM_POLL_ORO) {
+    chrome.tabs.query({ url: "*://*.grepolis.com/*" }, (tabs) => {
+      for (const tab of tabs) {
+        if (tab.id == null) continue;
+        chrome.tabs.sendMessage(tab.id, { type: "JamBot:pollMercadoOro" }, () => {
+          void chrome.runtime.lastError;
+        });
+      }
+    });
+    return;
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender) => {

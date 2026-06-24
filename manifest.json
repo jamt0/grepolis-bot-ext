@@ -42,7 +42,7 @@
     },
     "web_accessible_resources": [
         {
-          "resources": [ "data.json", "/js/saveToken.js", "/js/gameBridge.js", "icon-alerta.png" ],
+          "resources": [ "data.json", "/js/saveToken.js", "/js/gameBridge.js", "/js/pollWorker.js", "icon-alerta.png" ],
           "matches": ["*://*.grepolis.com/*"]
         }
     ]

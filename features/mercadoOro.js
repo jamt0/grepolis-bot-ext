@@ -28,7 +28,7 @@
   const JamBot = (window.JamBot = window.JamBot || {});
   JamBot.features = JamBot.features || {};
 
-  const POLL_INTERVAL_MS = 5 * 1000;
+  const POLL_INTERVAL_MS = 1 * 1000;
   const REDESCUBRIR_INTERVAL_MS = 30 * 60 * 1000;
   const UMBRAL = 100;
   const BEEP_INTERVAL_MS = 700;
@@ -697,7 +697,8 @@
       if (!core.isExtensionContextValid()) return;
       if (core.isCaptchaActive()) return;
       if (!habilitada) return; //toggle Iniciar/Detener del header del tab Oro
-      if (cicloEnCurso) return;
+      if (cicloEnCurso) return; //evitar solapamiento entre Worker/setInterval/SW
+      core.log("mercadoOro", `ciclo iniciado — ${Object.keys(mapaSeaIdToTown).length} mar(es)`);
       cicloEnCurso = true;
       try {
         const ahora = Date.now();
@@ -708,24 +709,31 @@
           return;
         }
 
-        const acumulado = [];
+        const entries = Object.entries(mapaSeaIdToTown);
         const ts = Date.now();
-        for (const [seaId, repTown] of Object.entries(mapaSeaIdToTown)) {
-          if (!core.isExtensionContextValid()) return;
-          if (core.isCaptchaActive()) return;
-          try {
-            const data = await leerPremiumExchange(repTown.id);
-            acumulado.push(...procesarPayload(seaId, repTown, data && data.json, ts));
-            await core.delaySeconds(0.3 + Math.random() * 0.3);
-          } catch (e) {
-            core.logWarn("mercadoOro", `poll mar ${seaId} (town ${repTown.id}): ${e.message}`);
-          }
+
+        //Fetch paralelo: todos los mares se pollan simultáneamente.
+        //Promise.allSettled garantiza que un fetch fallido no bloquee a los demás.
+        const fetchPromises = entries.map(([seaId, repTown]) =>
+          leerPremiumExchange(repTown.id)
+            .then((data) => ({ seaId, repTown, data, error: null }))
+            .catch((e) => {
+              core.logWarn("mercadoOro", `poll mar ${seaId} (town ${repTown.id}): ${e.message}`);
+              return { seaId, repTown, data: null, error: e };
+            })
+        );
+        const results = await Promise.all(fetchPromises);
+
+        const acumulado = [];
+        for (const { seaId, repTown, data } of results) {
+          if (data) acumulado.push(...procesarPayload(seaId, repTown, data && data.json, ts));
         }
         //dispararAlarma es idempotente por mar (agrega solo seaIds nuevos al
         //Set), así que lo llamamos sin chequear hayAlarma. Si no hay acumulado
         //pero la alarma sigue, solo refrescamos el label/beep desde estado.
         if (acumulado.length) dispararAlarma(acumulado);
         else if (hayAlarma()) { sincronizarBeep(); actualizarBotonFlotante(); }
+        core.log("mercadoOro", `ciclo completado en ${Date.now() - ts}ms`);
       } finally {
         cicloEnCurso = false;
       }
@@ -1093,12 +1101,35 @@
     }
 
     //—— Arranque ———————————————————————————————————————————————————————
-    //El setInterval corre siempre; el ciclo retorna temprano si `habilitada`
-    //es false. Eso permite al usuario activar/desactivar desde el botón sin
-    //tener que iniciar/detener el timer.
+    //3 mecanismos de polling, de mayor a menor prioridad:
+    //  1. Worker (thread separado, no throttled teóricamente)
+    //  2. setInterval de respaldo (funciona en foreground)
+    //  3. chrome.alarms del SW cada 30s (funciona en background tabs)
+    //
+    //El ciclo tiene guard `cicloEnCurso` para no solapar — si uno dispara
+    //mientras otro ya está corriendo, se descarta silenciosamente.
+
+    //SW alarm — ping cada 30s para background tabs
+    let ultimoCicloPorPing = Date.now();
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.type !== "JamBot:pollMercadoOro") return;
+      const ahora = Date.now();
+      if (ahora - ultimoCicloPorPing < 5000) return;
+      ultimoCicloPorPing = ahora;
+      core.log("mercadoOro", "ciclo (ping SW)");
+      ciclo().catch((e) => core.logError("mercadoOro", "ciclo (ping SW) falló", e));
+    });
+
+    //Worker — timer en thread separado
+    core.registerPollTimer("mercadoOro", POLL_INTERVAL_MS, () => {
+      ciclo().catch((e) => core.logError("mercadoOro", "ciclo (worker) falló", e));
+    });
+
+    //setInterval — respaldo para foreground (el Worker podría no funcionar)
     setInterval(() => {
-      ciclo().catch((e) => core.logError("mercadoOro", "ciclo falló", e));
+      ciclo().catch((e) => core.logError("mercadoOro", "ciclo (setInterval) falló", e));
     }, POLL_INTERVAL_MS);
+
     if (habilitada) {
       ciclo().catch((e) => core.logError("mercadoOro", "ciclo inicial falló", e));
     }

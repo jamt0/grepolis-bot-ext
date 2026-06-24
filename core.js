@@ -584,6 +584,52 @@
     };
   }
 
+  //—— Poll Worker (timers sin throttling) —————————————————————————————
+  //
+  //Chrome throttea setInterval/setTimeout en pestañas background. El Worker
+  //corre en su propio thread y sus timers NO son throttled. Un solo Worker
+  //maneja timers de todas las features (mercadoOro, futuras, etc).
+  let pollWorker = null;
+  const pollCallbacks = new Map(); // feature → callback
+
+  function initPollWorker() {
+    try {
+      const workerUrl = chrome.runtime.getURL("/js/pollWorker.js");
+      pollWorker = new Worker(workerUrl);
+      pollWorker.onmessage = function (e) {
+        const msg = e.data;
+        if (!msg || msg.type !== "JamBot:workerTick") return;
+        const cb = pollCallbacks.get(msg.feature);
+        if (cb) {
+          try { cb(); } catch (err) { logError("core", `pollWorker tick '${msg.feature}' falló`, err); }
+        }
+      };
+      pollWorker.onerror = function (e) {
+        logError("core", `pollWorker error: ${e.message || e.filename || "unknown"}`);
+      };
+      log("core", "pollWorker iniciado", "ok");
+    } catch (e) {
+      logError("core", `pollWorker no disponible: ${e.message}`);
+      pollWorker = null;
+    }
+  }
+
+  function registerPollTimer(feature, intervalMs, callback) {
+    if (!pollWorker) { logWarn("core", `registerPollTimer('${feature}'): pollWorker no disponible`); return; }
+    pollCallbacks.set(feature, callback);
+    pollWorker.postMessage({ action: "register", feature, intervalMs });
+  }
+
+  function unregisterPollTimer(feature) {
+    pollCallbacks.delete(feature);
+    if (pollWorker) pollWorker.postMessage({ action: "unregister", feature });
+  }
+
+  function unregisterAllPollTimers() {
+    pollCallbacks.clear();
+    if (pollWorker) pollWorker.postMessage({ action: "unregisterAll" });
+  }
+
   //—— Inicialización compartida ——————————————————————————————————————————
 
   /**
@@ -596,6 +642,8 @@
     //warnings/errores recientes quedan visibles en JamBot.errores() y en el
     //panel "Errores recientes" aunque hayas recargado la pestaña.
     await cargarErroresBuffer();
+
+    initPollWorker();
 
     injectScript(chrome.runtime.getURL("/js/saveToken.js"), "body");
     injectScript(chrome.runtime.getURL("/js/gameBridge.js"), "body");
@@ -661,6 +709,9 @@
         logError,
         logCiclo,
         sonarAdvertencia,
+        registerPollTimer,
+        unregisterPollTimer,
+        unregisterAllPollTimers,
       },
     };
   }
@@ -691,6 +742,9 @@
     getErrores,
     clearErrores,
     sonarAdvertencia,
+    registerPollTimer,
+    unregisterPollTimer,
+    unregisterAllPollTimers,
   };
 
   //Atajo para que el usuario pueda invocar desde DevTools:
