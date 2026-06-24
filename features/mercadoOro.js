@@ -1130,6 +1130,16 @@
       ciclo().catch((e) => core.logError("mercadoOro", "ciclo (setInterval) falló", e));
     }, POLL_INTERVAL_MS);
 
+    //Cuando la pestaña vuelve a foreground, poll inmediato para datos frescos.
+    //En background Chrome throttlea Worker/setInterval — al volver, el usuario
+    //ve datos viejos. Este listener garantiza poll al instante al volver.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && habilitada && !cicloEnCurso) {
+        core.log("mercadoOro", "ciclo (visibilitychange → visible)");
+        ciclo().catch((e) => core.logError("mercadoOro", "ciclo (visibilitychange) falló", e));
+      }
+    });
+
     if (habilitada) {
       ciclo().catch((e) => core.logError("mercadoOro", "ciclo inicial falló", e));
     }
