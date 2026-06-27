@@ -92,6 +92,8 @@
   const POWERS_FALLBACK = [
     { id: "effort_of_the_huntress", name: "Esfuerzo de la cazadora", god: "artemis", favor: 100, target: "command" },
     { id: "strength_of_heroes", name: "Fuerza sobrehumana", god: "athena", favor: 200, target: "command" },
+    { id: "bloodlust", name: "Sed de sangre", god: "ares", favor: 100, target: "command" },
+    { id: "cap_of_invisibility", name: "Yelmo de la invisibilidad", god: "hades", favor: 120, target: "command" },
   ];
 
   //Whitelist de poderes visibles en la UI. NO afecta al catálogo en memoria
@@ -101,6 +103,8 @@
   const POWERS_VISIBLES = new Set([
     "effort_of_the_huntress",
     "strength_of_heroes",
+    "bloodlust",
+    "cap_of_invisibility",
   ]);
 
   //—— Helpers ————————————————————————————————————————————————————————————
